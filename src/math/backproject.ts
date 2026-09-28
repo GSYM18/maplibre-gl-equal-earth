@@ -68,10 +68,17 @@ function fromWebMercator(point: PointTuple): LngLatTuple {
  *
  * Every overlay coordinate — deck.gl accessors, GeoJSON, marker positions, `flyTo` targets —
  * must pass through here while Equal Earth is active.
+ *
+ * `blend` selects a zoom band of the adaptive projection (see {@link geographicToMapWorld});
+ * at 1 map space *is* geographic space and this is the identity.
  */
-export function geographicToMap(lngLat: LngLatTuple): LngLatTuple {
-  const equalEarth = toEqualEarth(lngLat);
-  return fromWebMercator([equalEarth[0] * GRID_FACTOR, equalEarth[1] * GRID_FACTOR]);
+export function geographicToMap(lngLat: LngLatTuple, blend = 0): LngLatTuple {
+  if (blend === 0) {
+    const equalEarth = toEqualEarth(lngLat);
+    return fromWebMercator([equalEarth[0] * GRID_FACTOR, equalEarth[1] * GRID_FACTOR]);
+  }
+  if (blend === 1) return [lngLat[0], lngLat[1]];
+  return worldToMercatorLngLat(geographicToMapWorld(lngLat, blend));
 }
 
 /**
@@ -79,19 +86,29 @@ export function geographicToMap(lngLat: LngLatTuple): LngLatTuple {
  * MapLibre reports (`map.getCenter()`, `map.unproject()`, `queryRenderedFeatures` geometry)
  * while Equal Earth is active.
  */
-export function mapToGeographic(lngLat: LngLatTuple): LngLatTuple {
-  const mercator = toWebMercator(lngLat);
-  return fromEqualEarth([mercator[0] / GRID_FACTOR, mercator[1] / GRID_FACTOR]);
+export function mapToGeographic(lngLat: LngLatTuple, blend = 0): LngLatTuple {
+  if (blend === 0) {
+    const mercator = toWebMercator(lngLat);
+    return fromEqualEarth([mercator[0] / GRID_FACTOR, mercator[1] / GRID_FACTOR]);
+  }
+  if (blend === 1) return [lngLat[0], lngLat[1]];
+  return mapWorldToGeographic(mercatorWorld(lngLat), blend);
 }
 
 /**
- * The map-space latitude corresponding to the geographic pole — the top edge of the Equal
- * Earth world once it sits on the Mercator grid (≈ ±65.46°).
+ * The map-space latitude of the geographic pole — the top edge of the world once it sits
+ * on the Mercator grid. ≈ ±65.54° for pure Equal Earth, rising to Mercator's ±85.05° as the
+ * blend approaches 1.
  *
  * Useful for constraining the camera: there is nothing to show beyond it, whereas Mercator
  * itself would happily pan on to ±85°.
  */
-export const MAP_SPACE_MAX_LATITUDE = geographicToMap([0, 90])[1];
+export function mapSpaceMaxLatitude(blend = 0): number {
+  return Math.min(geographicToMap([0, 90], blend)[1], MERCATOR_MAX_LATITUDE);
+}
+
+/** {@link mapSpaceMaxLatitude} for pure Equal Earth (≈ ±65.54°). */
+export const MAP_SPACE_MAX_LATITUDE = mapSpaceMaxLatitude(0);
 
 /**
  * A point in normalised Mercator world space: `[0,1]²`, origin at the top-left
@@ -101,39 +118,115 @@ export const MAP_SPACE_MAX_LATITUDE = geographicToMap([0, 90])[1];
 export type WorldTuple = [number, number];
 
 /**
- * Geographic coordinates straight to normalised Mercator world space, for the tile pipeline.
+ * Geographic coordinates straight to normalised world space, for the tile pipeline.
  *
- * This deliberately skips the inverse-Mercator step that {@link geographicToMap} ends with:
- * world coordinates are an *affine* function of Mercator metres, which the Equal Earth warp
- * has already produced. So where `geographicToMap` costs a `log`/`tan` pair to express the
- * result as fabricated lng/lat for MapLibre's camera API, this costs two multiplies — and
- * avoids a needless round trip through a transcendental function.
+ * `blend` mixes Equal Earth (0) and Web Mercator (1) *world positions* linearly — the zoom
+ * bands of the adaptive `equal` projection each render one fixed blend:
  *
- * Use this for every tile vertex; use {@link geographicToMap} only at the camera boundary.
+ *     world_t(p) = (1 − t) · equalEarthWorld(p) + t · mercatorWorld(p)
+ *
+ * The mix is continuous in p, so warped geometry never tears. And because in both
+ * projections northing depends on latitude alone and easting is linear in longitude for a
+ * fixed latitude, so does the mix — which is what makes {@link mapWorldToGeographic} cheap.
+ *
+ * At blend 0 this skips the inverse-Mercator step that {@link geographicToMap} ends with:
+ * world coordinates are an *affine* function of Equal Earth metres, so it costs two
+ * multiplies instead of a `log`/`tan` pair. Use this for every tile vertex; use
+ * {@link geographicToMap} only at the camera boundary.
  */
-export function geographicToMapWorld(lngLat: LngLatTuple): WorldTuple {
+export function geographicToMapWorld(lngLat: LngLatTuple, blend = 0): WorldTuple {
+  if (blend === 0) return equalEarthWorld(lngLat);
+  const mercator = mercatorWorld(lngLat);
+  if (blend === 1) return mercator;
+  const equalEarth = equalEarthWorld(lngLat);
+  return [
+    equalEarth[0] + blend * (mercator[0] - equalEarth[0]),
+    equalEarth[1] + blend * (mercator[1] - equalEarth[1]),
+  ];
+}
+
+/** Bisection steps for the blended inverse: 64 halvings of 180° exhaust double precision. */
+const BLEND_INVERSE_STEPS = 64;
+
+/** Slack for points on the world edge that round to just outside it. */
+const WORLD_EDGE_EPSILON = 1e-12;
+
+/**
+ * Inverse of {@link geographicToMapWorld}. Returns `[NaN, NaN]` for a point above or below
+ * the world band — there is no geographic location there.
+ *
+ * For an intermediate blend, latitude is found by bisection: the blended northing depends on
+ * latitude alone and strictly decreases with it. Newton would converge faster, but its
+ * derivative vanishes at the poles, where Equal Earth's northing flattens and Mercator's is
+ * clamped; bisection is immune to both. That same flattening limits accuracy near the poles
+ * to ~1e-6° — about 0.1 m, and inherent to the projection, not the solver.
+ */
+export function mapWorldToGeographic(world: WorldTuple, blend = 0): LngLatTuple {
+  if (blend === 0) {
+    const inverseScale = (2 * WEB_MERCATOR_MAX) / GRID_FACTOR;
+    return fromEqualEarth([(world[0] - 0.5) * inverseScale, (0.5 - world[1]) * inverseScale]);
+  }
+  if (blend === 1) return worldToMercatorLngLat(world);
+
+  const [north, south] = worldYRange(blend);
+  if (!(world[1] >= north - WORLD_EDGE_EPSILON && world[1] <= south + WORLD_EDGE_EPSILON)) {
+    return [Number.NaN, Number.NaN];
+  }
+  const y = clamp(world[1], north, south);
+
+  let low = -90;
+  let high = 90;
+  for (let i = 0; i < BLEND_INVERSE_STEPS; i++) {
+    const mid = (low + high) / 2;
+    // World y grows southward: a point south of the target means the latitude is higher.
+    if (geographicToMapWorld([0, mid], blend)[1] > y) low = mid;
+    else high = mid;
+  }
+  const lat = (low + high) / 2;
+
+  // Easting is linear in longitude for a fixed latitude: x = 0.5 + lng · slope(lat).
+  const slope = geographicToMapWorld([1, lat], blend)[0] - 0.5;
+  return [(world[0] - 0.5) / slope, lat];
+}
+
+/**
+ * World-space y of the north and south edges of the world at a blend.
+ *
+ * Equal Earth has a ~2.05:1 aspect ratio, so once stretched to fill the Mercator grid
+ * horizontally it occupies only the middle ~49% of it vertically; the band widens to the
+ * whole grid as the blend approaches Mercator. Tiles wholly outside it contain no map at all
+ * and can be skipped outright.
+ */
+export function worldYRange(blend = 0): [north: number, south: number] {
+  return [geographicToMapWorld([0, 90], blend)[1], geographicToMapWorld([0, -90], blend)[1]];
+}
+
+/** World-space y of the north edge of the Equal Earth world (≈0.2566). */
+export const WORLD_Y_MIN = worldYRange(0)[0];
+
+/** World-space y of the south edge of the Equal Earth world (≈0.7434). */
+export const WORLD_Y_MAX = worldYRange(0)[1];
+
+function equalEarthWorld(lngLat: LngLatTuple): WorldTuple {
   const equalEarth = toEqualEarth(lngLat);
   const scale = GRID_FACTOR / (2 * WEB_MERCATOR_MAX);
   return [0.5 + equalEarth[0] * scale, 0.5 - equalEarth[1] * scale];
 }
 
-/** Inverse of {@link geographicToMapWorld}. */
-export function mapWorldToGeographic(world: WorldTuple): LngLatTuple {
-  const inverseScale = (2 * WEB_MERCATOR_MAX) / GRID_FACTOR;
-  return fromEqualEarth([(world[0] - 0.5) * inverseScale, (0.5 - world[1]) * inverseScale]);
+function mercatorWorld(lngLat: LngLatTuple): WorldTuple {
+  const mercator = toWebMercator(lngLat);
+  return [
+    0.5 + mercator[0] / (2 * WEB_MERCATOR_MAX),
+    0.5 - mercator[1] / (2 * WEB_MERCATOR_MAX),
+  ];
 }
 
-/**
- * World-space y of the north edge of the Equal Earth world (≈0.2566).
- *
- * Equal Earth has a ~2.05:1 aspect ratio, so once stretched to fill the Mercator grid
- * horizontally it occupies only the middle ~49% of it vertically. Tiles wholly above this
- * (or below {@link WORLD_Y_MAX}) contain no map at all and can be skipped outright.
- */
-export const WORLD_Y_MIN = geographicToMapWorld([0, 90])[1];
-
-/** World-space y of the south edge of the Equal Earth world (≈0.7434). */
-export const WORLD_Y_MAX = geographicToMapWorld([0, -90])[1];
+function worldToMercatorLngLat(world: WorldTuple): LngLatTuple {
+  return fromWebMercator([
+    (world[0] - 0.5) * 2 * WEB_MERCATOR_MAX,
+    (0.5 - world[1]) * 2 * WEB_MERCATOR_MAX,
+  ]);
+}
 
 function clamp(value: number, min: number, max: number): number {
   return value < min ? min : value > max ? max : value;
