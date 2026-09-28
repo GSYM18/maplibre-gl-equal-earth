@@ -1,38 +1,87 @@
 {
-  "name": "maplibre-gl-equal-earth",
-  "version": "0.2.1",
+  "name": "@yellowmap/maplibre-gl-equal-earth",
+  "version": "1.0.0-alpha.1",
   "type": "module",
-  "main": "dist/maplibre-gl-equal-earth.js",
-  "description": "MapLibre GL JS plugin for basic Equal Earth projection support.",
+  "description": "Equal Earth projection for MapLibre GL JS — a polyfill for the pending style-spec projection values.",
+  "keywords": [
+    "maplibre",
+    "maplibre-gl-js",
+    "plugin",
+    "projection",
+    "equal-earth",
+    "equal-area",
+    "cartography"
+  ],
+  "license": "MIT",
+  "author": "YellowMap",
+  "contributors": [
+    "Pirmin Kalberer (original maplibre-gl-equal-earth)"
+  ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/pka/maplibre-gl-equal-earth.git"
+    "url": "git+https://github.com/GSYM18/maplibre-gl-equal-earth.git"
   },
-  "keywords": [
-    "MapLibre GL JS",
-    "plugin"
-  ],
-  "author": "Pirmin Kalberer",
-  "license": "MIT",
   "bugs": {
-    "url": "https://github.com/pka/maplibre-gl-equal-earth/issues"
+    "url": "https://github.com/GSYM18/maplibre-gl-equal-earth/issues"
   },
-  "homepage": "https://github.com/pka/maplibre-gl-equal-earth#readme",
+  "homepage": "https://github.com/GSYM18/maplibre-gl-equal-earth#readme",
+  "sideEffects": false,
+  "types": "./dist/index.d.ts",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/tiles/worker-entry.d.ts",
+      "import": "./dist/worker.js",
+      "default": "./dist/worker.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
   "scripts": {
     "dev": "vite",
-    "build": "vite build",
-    "tsbuild": "tsc && vite build",
-    "preview": "vite preview"
-  },
-  "devDependencies": {
-    "typescript": "^5.5.3",
-    "vite": "^5.4.1",
-    "deck.gl": "^9.0.27"
-  },
-  "dependencies": {
-    "proj4": "^2.11.0"
+    "build": "npm run build:js && npm run build:types",
+    "build:js": "vite build",
+    "build:types": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "preview": "vite preview",
+    "check:exports": "node scripts/check-exports.mjs",
+    "verify": "npm run lint && npm run typecheck && npm test && npm run build && npm run check:exports",
+    "prepublishOnly": "npm run verify"
   },
   "peerDependencies": {
-    "maplibre-gl": ">=1"
+    "maplibre-gl": ">=6"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@types/geojson-vt": "^3.2.5",
+    "eslint": "^10.9.1",
+    "globals": "^17.11.0",
+    "maplibre-gl": "^6.6.0",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.68.0",
+    "vite": "^8.2.2",
+    "vitest": "^4.1.11"
+  },
+  "dependencies": {
+    "@mapbox/vector-tile": "^3.0.0",
+    "geojson-vt": "^4.0.3",
+    "pbf": "^5.1.2",
+    "vt-pbf": "^3.1.3"
   }
 }
