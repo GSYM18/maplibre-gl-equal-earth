@@ -37,9 +37,10 @@
     },
     "./worker": {
       "types": "./dist/tiles/worker-entry.d.ts",
-      "import": "./dist/worker.js",
-      "default": "./dist/worker.js"
+      "import": "./dist/worker.mjs",
+      "default": "./dist/worker.mjs"
     },
+    "./worker.iife.js": "./dist/worker.iife.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -53,14 +54,14 @@
   "scripts": {
     "dev": "vite",
     "build": "npm run build:js && npm run build:types",
-    "build:js": "vite build",
+    "build:js": "vite build && vite build --config vite.worker.config.ts",
     "build:types": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
     "preview": "vite preview",
-    "check:exports": "node scripts/check-exports.mjs",
+    "check:exports": "node scripts/check-exports.mjs && node scripts/check-worker-bundles.mjs",
     "verify": "npm run lint && npm run typecheck && npm test && npm run build && npm run check:exports",
     "prepublishOnly": "npm run verify"
   },
