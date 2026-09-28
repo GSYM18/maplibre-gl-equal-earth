@@ -51,6 +51,8 @@ export interface WarpTileOptions {
   simplifyTolerance?: number;
   /** Restrict to these source layers. Omit to keep all. */
   layers?: readonly string[];
+  /** Blend of the zoom band this tile is built for: 0 Equal Earth … 1 Mercator. @defaultValue 0 */
+  blend?: number;
 }
 
 /** One decoded source tile: GeoJSON features in true geographic coordinates, by layer. */
@@ -109,18 +111,19 @@ export function warpFeature(
   feature: GeoJSON.Feature,
   tolerance: number,
   maxDepth: number,
+  blend = 0,
 ): GeoJSON.Feature | null {
   const geometry = feature.geometry;
   if (!geometry || geometry.type === 'GeometryCollection') return null;
 
   const warpPosition = (p: GeoJSON.Position): GeoJSON.Position =>
-    geographicToMap([p[0]!, p[1]!]);
+    geographicToMap([p[0]!, p[1]!], blend);
 
   const warpLine = (line: GeoJSON.Position[]): GeoJSON.Position[] =>
     densify(
       line.map((p) => [p[0]!, p[1]!] as LngLatTuple),
-      { tolerance, maxDepth },
-    ).map((p) => geographicToMap(p) as GeoJSON.Position);
+      { tolerance, maxDepth, blend },
+    ).map((p) => geographicToMap(p, blend) as GeoJSON.Position);
 
   let warped: GeoJSON.Geometry;
   switch (geometry.type) {
@@ -165,13 +168,14 @@ export function buildTile(
   const buffer = options.buffer ?? 64;
   const maxDepth = options.maxDepth ?? 8;
   const tolerance = toleranceForZoom(output.z, options.toleranceTileUnits ?? 1);
+  const blend = options.blend ?? 0;
 
   const encoded: Record<string, GeoJSONVTTile> = {};
 
   for (const [name, features] of sourceLayers) {
     const warped: GeoJSON.Feature[] = [];
     for (const feature of features) {
-      const result = warpFeature(feature, tolerance, maxDepth);
+      const result = warpFeature(feature, tolerance, maxDepth, blend);
       if (result) warped.push(result);
     }
     if (warped.length === 0) continue;

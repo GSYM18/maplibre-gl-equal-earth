@@ -17,18 +17,17 @@ import { sourceTilesFor, type TileId, type TileCoverOptions } from './tile-cover
 
 export const PROTOCOL_SCHEME = 'eqearth';
 
-/** Everything the handler needs, encoded into the tile URL. */
+/**
+ * Everything the handler needs, encoded into the tile URL.
+ *
+ * `blend` (from both option interfaces) fixes the zoom band this source serves. Blend 1 is
+ * plain Mercator and is passed through byte for byte; every lower blend warps at every zoom
+ * — pure Equal Earth has no switch zoom, it simply never changes band.
+ */
 export interface EqualEarthSourceConfig extends TileCoverOptions, WarpTileOptions {
   /** Upstream Mercator tile template, e.g. `https://…/{z}/{x}/{y}.pbf`. */
   url: string;
-  /**
-   * Zoom at or above which tiles are passed through unwarped, because the map has switched
-   * back to Mercator. Warping above this is wasted work — and wrong.
-   */
-  switchZoom?: number;
 }
-
-const DEFAULT_SWITCH_ZOOM = 6;
 
 /** Build the `tiles` entry for a rewritten source. */
 export function encodeSourceUrl(config: EqualEarthSourceConfig): string {
@@ -121,11 +120,11 @@ export function createEqualEarthProtocol(options: ProtocolOptions = {}): Protoco
 
   return async (params, abortController) => {
     const { config, tile } = parseTileUrl(params.url);
-    const switchZoom = config.switchZoom ?? DEFAULT_SWITCH_ZOOM;
 
-    // At and above the switch zoom the map is plain Mercator again, so the upstream tile
-    // is already correct. Pass the bytes through untouched rather than warping them.
-    if (tile.z >= switchZoom) {
+    // Blend 1 is plain Mercator: the upstream tile is already correct, so pass its bytes
+    // through untouched rather than warping them. The polyfill routes its Mercator band to
+    // the original source and never asks for this, but a hand-built URL may.
+    if ((config.blend ?? 0) === 1) {
       const passthrough = await loadSource(config.url, tile, abortController.signal);
       return { data: passthrough ?? new ArrayBuffer(0) };
     }
@@ -169,6 +168,12 @@ function decodeConfig(encoded: string): EqualEarthSourceConfig {
   const parsed: unknown = JSON.parse(base64UrlDecode(encoded));
   if (typeof parsed !== 'object' || parsed === null || typeof (parsed as { url?: unknown }).url !== 'string') {
     throw new Error('Equal Earth: tile URL carries no upstream template.');
+  }
+  // Reject rather than clamp: a blend outside [0, 1] means the URL was built wrongly, and
+  // silently clamping it would render a plausible-looking but wrong map.
+  const blend = (parsed as { blend?: unknown }).blend;
+  if (blend !== undefined && !(typeof blend === 'number' && blend >= 0 && blend <= 1)) {
+    throw new Error(`Equal Earth: tile URL carries blend ${JSON.stringify(blend)}; expected a number in [0, 1].`);
   }
   return parsed as EqualEarthSourceConfig;
 }

@@ -37,6 +37,15 @@ export interface SubdivideOptions {
    * @defaultValue 8
    */
   maxDepth?: number;
+  /**
+   * Blend between Equal Earth (0) and Web Mercator (1) that deviation is measured in. Each
+   * zoom band of the adaptive projection warps with its own blend, so it subdivides with it
+   * too. Refinement stays a pure function of the endpoints *and* the blend, so tiles of the
+   * same band still meet exactly.
+   *
+   * @defaultValue 0
+   */
+  blend?: number;
 }
 
 const DEFAULT_MAX_DEPTH = 8;
@@ -70,16 +79,27 @@ export function densifyAndWarp(
 ): WorldTuple[] {
   const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
   const toleranceSquared = options.tolerance * options.tolerance;
+  const blend = options.blend ?? 0;
 
   if (points.length === 0) return [];
 
   const first = points[0]!;
-  const output: WorldTuple[] = [geographicToMapWorld(first)];
+  const output: WorldTuple[] = [geographicToMapWorld(first, blend)];
 
   for (let i = 1; i < points.length; i++) {
     const a = points[i - 1]!;
     const b = points[i]!;
-    refine(a, output[output.length - 1]!, b, geographicToMapWorld(b), 0, maxDepth, toleranceSquared, output);
+    refine(
+      a,
+      output[output.length - 1]!,
+      b,
+      geographicToMapWorld(b, blend),
+      0,
+      maxDepth,
+      toleranceSquared,
+      blend,
+      output,
+    );
   }
 
   return output;
@@ -99,6 +119,7 @@ export function densify(
 ): LngLatTuple[] {
   const maxDepth = options.maxDepth ?? DEFAULT_MAX_DEPTH;
   const toleranceSquared = options.tolerance * options.tolerance;
+  const blend = options.blend ?? 0;
 
   if (points.length === 0) return [];
 
@@ -109,12 +130,13 @@ export function densify(
     const b = points[i]!;
     refineGeographic(
       a,
-      geographicToMapWorld(a),
+      geographicToMapWorld(a, blend),
       b,
-      geographicToMapWorld(b),
+      geographicToMapWorld(b, blend),
       0,
       maxDepth,
       toleranceSquared,
+      blend,
       output,
     );
   }
@@ -130,6 +152,7 @@ function refineGeographic(
   depth: number,
   maxDepth: number,
   toleranceSquared: number,
+  blend: number,
   output: LngLatTuple[],
 ): void {
   if (depth >= maxDepth) {
@@ -138,7 +161,7 @@ function refineGeographic(
   }
 
   const mid: LngLatTuple = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-  const midWorld = geographicToMapWorld(mid);
+  const midWorld = geographicToMapWorld(mid, blend);
 
   const dx = midWorld[0] - (aWorld[0] + bWorld[0]) / 2;
   const dy = midWorld[1] - (aWorld[1] + bWorld[1]) / 2;
@@ -148,8 +171,8 @@ function refineGeographic(
     return;
   }
 
-  refineGeographic(a, aWorld, mid, midWorld, depth + 1, maxDepth, toleranceSquared, output);
-  refineGeographic(mid, midWorld, b, bWorld, depth + 1, maxDepth, toleranceSquared, output);
+  refineGeographic(a, aWorld, mid, midWorld, depth + 1, maxDepth, toleranceSquared, blend, output);
+  refineGeographic(mid, midWorld, b, bWorld, depth + 1, maxDepth, toleranceSquared, blend, output);
 }
 
 /**
@@ -164,6 +187,7 @@ function refine(
   depth: number,
   maxDepth: number,
   toleranceSquared: number,
+  blend: number,
   output: WorldTuple[],
 ): void {
   if (depth >= maxDepth) {
@@ -174,7 +198,7 @@ function refine(
   // Geographic midpoint — a plain arithmetic mean, which is what makes the decision
   // reproducible from the endpoints alone.
   const mid: LngLatTuple = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
-  const midWorld = geographicToMapWorld(mid);
+  const midWorld = geographicToMapWorld(mid, blend);
 
   // How far the true warped midpoint sits from the chord's midpoint.
   const chordX = (aWorld[0] + bWorld[0]) / 2;
@@ -187,11 +211,11 @@ function refine(
     return;
   }
 
-  refine(a, aWorld, mid, midWorld, depth + 1, maxDepth, toleranceSquared, output);
-  refine(mid, midWorld, b, bWorld, depth + 1, maxDepth, toleranceSquared, output);
+  refine(a, aWorld, mid, midWorld, depth + 1, maxDepth, toleranceSquared, blend, output);
+  refine(mid, midWorld, b, bWorld, depth + 1, maxDepth, toleranceSquared, blend, output);
 }
 
 /** Warp a ring or line without densifying — for point geometry, or when detail is irrelevant. */
-export function warpOnly(points: readonly LngLatTuple[]): WorldTuple[] {
-  return points.map(geographicToMapWorld);
+export function warpOnly(points: readonly LngLatTuple[], blend = 0): WorldTuple[] {
+  return points.map((point) => geographicToMapWorld(point, blend));
 }
