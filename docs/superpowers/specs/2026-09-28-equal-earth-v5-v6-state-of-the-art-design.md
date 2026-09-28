@@ -118,7 +118,7 @@ are already loaded and are drawn overzoomed in the correct geometry.
 
 | Module | Status | Responsibility |
 |---|---|---|
-| `math/backproject.ts` | extend | `geographicToMapWorld(p, t = 0)`; inverse `mapWorldToGeographic(w, t = 0)`, closed form at t ∈ {0, 1}, 2-D Newton otherwise (seeded from the Mercator inverse) |
+| `math/backproject.ts` | extend | `geographicToMapWorld(p, t = 0)`; inverse `mapWorldToGeographic(w, t = 0)`, closed form at t ∈ {0, 1}, 1-D bisection on latitude otherwise (northing depends on latitude alone); `worldYRange(t)`, `mapSpaceMaxLatitude(t)` |
 | `math/subdivide.ts` | extend | densify/warp take `t` |
 | `tiles/protocol.ts` | extend | `t` encoded in the source config; pole snapping (§5) during decode |
 | `tiles/tile-cover.ts` | extend | pre-image under `world_t`; relative `sourceZoomOffset` |
@@ -168,8 +168,7 @@ are crossed in one update (`flyTo` z3 → z10), it converts once, directly from 
 - **Known residual.** With scroll-zoom the anchor is the pointer, which `transformCameraUpdate`
   cannot see, so the point under the pointer drifts by about (step difference × distance from
   centre). The 1 px criterion applies to the centre; the spike measures pointer drift.
-- **Inverse accuracy.** The Newton inverse must round-trip to < 1e-9° over a global grid that
-  includes ±90° latitude and ±180° longitude. Non-convergence goes to `onConversionFailure`.
+- **Inverse accuracy.** Measured and tested: < 1e-9° for |lat| ≤ 82.5°, < 1e-5° (≈1 m) at the poles, where the northing's derivative vanishes and precision is limited by the projection itself. Out-of-band points return NaN; the camera clamps before converting.
 
 **Visual spike (the first task of the plan, throwaway code).** Hard-code the three `equal`
 steps on the Liberty demo; fly to Tokyo, San Francisco, Anchorage and Zürich; record a screen
