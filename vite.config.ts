@@ -10,12 +10,11 @@ export default defineConfig({
     lib: {
       // ESM only: maplibre-gl v6 dropped CJS, so a UMD/CJS build of a plugin
       // whose peer dependency is ESM-only would have no valid consumer.
-      entry: {
-        index: resolveFromRoot('src/index.ts'),
-        // Built separately because `importScriptInWorkers` loads it by URL into
-        // MapLibre's worker pool; no closure can cross that boundary.
-        worker: resolveFromRoot('src/tiles/worker-entry.ts'),
-      },
+      //
+      // The worker bundles are *not* a second entry here: a multi-entry build hoists
+      // shared code into chunks, and a worker script cannot import a chunk. They have
+      // their own build, vite.worker.config.ts.
+      entry: { index: resolveFromRoot('src/index.ts') },
       formats: ['es'],
     },
     rollupOptions: {

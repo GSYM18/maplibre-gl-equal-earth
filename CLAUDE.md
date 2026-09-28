@@ -18,9 +18,11 @@ Single test file: `npx vitest run tests/camera.test.ts`.
 Single test by name: `npx vitest run tests/camera.test.ts -t "crossing upward"`.
 
 `npm run build` is two steps because Vite emits the bundle and `tsc -p tsconfig.build.json`
-emits declarations separately. `npm run check:exports` (`scripts/check-exports.mjs`) diffs the
-built bundle's runtime exports against the value exports declared in `src/index.ts`; it exists
-solely to make the 0.2.1 drift bug impossible to reintroduce, and `prepublishOnly` runs it.
+emits declarations separately. `npm run check:exports` runs two guards over the build. `scripts/check-exports.mjs` diffs the
+built bundle's runtime exports against the value exports declared in `src/index.ts` (it exists
+solely to make the 0.2.1 drift bug impossible to reintroduce). `scripts/check-worker-bundles.mjs`
+asserts both worker bundles are self-contained and actually register `eqearth` when loaded the
+way MapLibre v5 (`importScripts`) and v6 (`import()`) load them. `prepublishOnly` runs both.
 
 ESLint's type-aware rules are confined to `**/*.ts`. `no-undef` is off there (tsc covers it),
 which is why `scripts/*.mjs` needs an explicit `globals.node` block.
@@ -78,7 +80,10 @@ affects the absolute metre values from `toEqualEarth`.
 - `src/tiles/tile-cover.ts` — output tile → covering source Mercator tiles.
 - `src/tiles/mvt.ts` — decode → densify → warp → reslice → encode.
 - `src/tiles/protocol.ts` — the `eqearth://` handler and its URL codec.
-- `src/tiles/worker-entry.ts` — separate bundle, loaded via `importScriptInWorkers`.
+- `src/tiles/worker-entry.ts` — built twice by `vite.worker.config.ts`, as `dist/worker.mjs`
+  (v6, dynamic `import()`) and `dist/worker.iife.js` (v5, classic `importScripts`). Both must be
+  self-contained: v5 cannot parse `import`, and v6 imports non-`.mjs` scripts via a `blob:` URL
+  where relative specifiers cannot resolve.
 - `src/tiles/cache.ts` — byte-bounded LRU + in-flight request coalescing.
 - `demo/` + root `index.html` — Vite demo pages, not part of the published package.
 - `scripts/check-exports.mjs` — build-artifact drift guard.
