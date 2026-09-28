@@ -9,12 +9,7 @@
  * this module exists rather than the pipeline just warping in place.
  */
 
-import {
-  MERCATOR_MAX_LATITUDE,
-  WORLD_Y_MAX,
-  WORLD_Y_MIN,
-  mapWorldToGeographic,
-} from '../math/backproject.js';
+import { MERCATOR_MAX_LATITUDE, mapWorldToGeographic, worldYRange } from '../math/backproject.js';
 
 /** An XYZ tile address. */
 export interface TileId {
@@ -46,6 +41,8 @@ export interface TileCoverOptions {
   buffer?: number;
   /** Boundary samples per tile edge when estimating the pre-image. @defaultValue 8 */
   samplesPerEdge?: number;
+  /** Blend of the zoom band the output tile belongs to. @defaultValue 0 */
+  blend?: number;
 }
 
 const DEFAULT_BUFFER = 64;
@@ -54,7 +51,7 @@ const DEFAULT_SOURCE_MAX_ZOOM = 14;
 const TILE_EXTENT = 4096;
 
 /**
- * The geographic bounding box of an output tile's pre-image under the warp.
+ * The geographic bounding box of an output tile's pre-image under the warp at `options.blend`.
  *
  * Returns `null` when the tile lies entirely outside the Equal Earth world — the empty bands
  * above and below it, which at low zoom is a meaningful share of the grid.
@@ -77,12 +74,15 @@ export function preimageBBox(output: TileId, options: TileCoverOptions = {}): BB
   const north = output.y / scale - pad;
   const south = (output.y + 1) / scale + pad;
 
-  // Wholly outside the Equal Earth world's vertical band.
-  if (south <= WORLD_Y_MIN || north >= WORLD_Y_MAX) return null;
+  const blend = options.blend ?? 0;
+  const [worldTop, worldBottom] = worldYRange(blend);
+
+  // Wholly outside the world's vertical band at this blend.
+  if (south <= worldTop || north >= worldBottom) return null;
 
   // Clamp to the world band so the inverse warp stays in domain.
-  const top = Math.max(north, WORLD_Y_MIN);
-  const bottom = Math.min(south, WORLD_Y_MAX);
+  const top = Math.max(north, worldTop);
+  const bottom = Math.min(south, worldBottom);
 
   let minLng = Infinity;
   let minLat = Infinity;
@@ -90,7 +90,7 @@ export function preimageBBox(output: TileId, options: TileCoverOptions = {}): BB
   let maxLat = -Infinity;
 
   const consider = (wx: number, wy: number): void => {
-    const [lng, lat] = mapWorldToGeographic([wx, wy]);
+    const [lng, lat] = mapWorldToGeographic([wx, wy], blend);
     if (!Number.isFinite(lng) || !Number.isFinite(lat)) return;
     if (lng < minLng) minLng = lng;
     if (lng > maxLng) maxLng = lng;

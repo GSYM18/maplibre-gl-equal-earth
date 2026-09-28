@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { RequestCoalescer, TileCache } from '../src/tiles/cache.js';
+import { sourceTilesFor } from '../src/tiles/tile-cover.js';
 import {
   createEqualEarthProtocol,
   encodeSourceUrl,
@@ -13,7 +14,7 @@ const UPSTREAM = 'https://tiles.openfreemap.org/planet/latest/{z}/{x}/{y}.pbf';
 
 describe('tile URL codec', () => {
   it('round-trips a config through the URL', () => {
-    const url = encodeSourceUrl({ url: UPSTREAM, switchZoom: 6, sourceZoom: 3 });
+    const url = encodeSourceUrl({ url: UPSTREAM, blend: 1 / 3, sourceZoom: 3 });
     expect(url.startsWith(`${PROTOCOL_SCHEME}://`)).toBe(true);
     expect(url.endsWith('/{z}/{x}/{y}')).toBe(true);
 
@@ -21,7 +22,7 @@ describe('tile URL codec', () => {
     const { config, tile } = parseTileUrl(resolved);
 
     expect(config.url).toBe(UPSTREAM);
-    expect(config.switchZoom).toBe(6);
+    expect(config.blend).toBe(1 / 3);
     expect(config.sourceZoom).toBe(3);
     expect(tile).toEqual({ z: 2, x: 1, y: 3 });
   });
@@ -47,6 +48,16 @@ describe('tile URL codec', () => {
       .replace(/\//g, '_')
       .replace(/=+$/, '');
     expect(() => parseTileUrl(`eqearth://${encoded}/0/0/0`)).toThrow(/upstream template/);
+  });
+
+  it('rejects a blend outside [0, 1] rather than clamping it', () => {
+    for (const blend of [-0.1, 1.5, 'half', null]) {
+      const encoded = btoa(JSON.stringify({ url: UPSTREAM, blend }))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+      expect(() => parseTileUrl(`eqearth://${encoded}/0/0/0`)).toThrow(/blend/);
+    }
   });
 
   it('expands templates', () => {
@@ -144,13 +155,13 @@ describe('RequestCoalescer', () => {
 });
 
 describe('protocol handler', () => {
-  const tileUrl = (z: number, x: number, y: number, switchZoom = 6) =>
-    encodeSourceUrl({ url: UPSTREAM, switchZoom })
+  const tileUrl = (z: number, x: number, y: number, blend = 0) =>
+    encodeSourceUrl({ url: UPSTREAM, blend })
       .replace('{z}', String(z))
       .replace('{x}', String(x))
       .replace('{y}', String(y));
 
-  it('passes tiles through unwarped at and above the switch zoom', async () => {
+  it('passes tiles through unwarped at blend 1', async () => {
     const payload = new Uint8Array([1, 2, 3]).buffer;
     const requested: string[] = [];
     const fetchImpl = vi.fn(async (url: string) => {
@@ -159,11 +170,28 @@ describe('protocol handler', () => {
     });
     const handler = createEqualEarthProtocol({ fetchImpl: fetchImpl as unknown as typeof fetch });
 
-    const result = await handler({ url: tileUrl(8, 3, 4) }, new AbortController());
+    const result = await handler({ url: tileUrl(8, 3, 4, 1) }, new AbortController());
 
     expect(fetchImpl).toHaveBeenCalledOnce();
     expect(requested[0]).toContain('/8/3/4.pbf');
     expect(new Uint8Array(result.data)).toEqual(new Uint8Array([1, 2, 3]));
+  });
+
+  it('warps pure Equal Earth at any zoom — there is no switch zoom any more', async () => {
+    const tile = { z: 8, x: 130, y: 126 };
+    const requested: string[] = [];
+    const fetchImpl = vi.fn(async (url: string) => {
+      requested.push(url);
+      return new Response(null, { status: 404 });
+    });
+    const handler = createEqualEarthProtocol({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    await handler({ url: tileUrl(tile.z, tile.x, tile.y) }, new AbortController());
+
+    const cover = sourceTilesFor(tile).map((source) => expandTemplate(UPSTREAM, source));
+    expect(cover.length).toBeGreaterThan(0);
+    expect([...requested].sort()).toEqual([...cover].sort());
+    expect(requested).not.toEqual([expandTemplate(UPSTREAM, tile)]);
   });
 
   it('returns an empty tile outside the Equal Earth world without fetching', async () => {

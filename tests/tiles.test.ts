@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { WORLD_Y_MAX, WORLD_Y_MIN } from '../src/math/backproject.js';
+import { geographicToMap, WORLD_Y_MAX, WORLD_Y_MIN } from '../src/math/backproject.js';
+import { densify, toleranceForZoom } from '../src/math/subdivide.js';
 import {
   buildTile,
   decodeToGeographic,
@@ -15,7 +16,6 @@ import {
   tileWorldBounds,
   type TileId,
 } from '../src/tiles/tile-cover.js';
-import { toleranceForZoom } from '../src/math/subdivide.js';
 import { VectorTile } from '@mapbox/vector-tile';
 import { PbfReader } from 'pbf';
 
@@ -343,5 +343,50 @@ describe('mergeLayers', () => {
     const a: GeographicLayers = new Map([['x', [1 as unknown as GeoJSON.Feature]]]);
     mergeLayers([a, new Map([['x', [2 as unknown as GeoJSON.Feature]]])]);
     expect(a.get('x')).toHaveLength(1);
+  });
+});
+
+describe('blended warp in the tile pipeline', () => {
+  it('warps a point to its blended map-space position', () => {
+    const feature: GeoJSON.Feature = {
+      type: 'Feature',
+      properties: {},
+      geometry: { type: 'Point', coordinates: [139.7, 35.7] },
+    };
+    const warped = warpFeature(feature, toleranceForZoom(5), 8, 1 / 3)!;
+    const expected = geographicToMap([139.7, 35.7], 1 / 3);
+    const coordinates = (warped.geometry as GeoJSON.Point).coordinates;
+    expect(coordinates[0]).toBeCloseTo(expected[0], 12);
+    expect(coordinates[1]).toBeCloseTo(expected[1], 12);
+  });
+
+  it('covers grid rows that are empty in pure Equal Earth once blended towards Mercator', () => {
+    expect(sourceTilesFor({ z: 2, x: 0, y: 0 })).toEqual([]);
+    expect(sourceTilesFor({ z: 2, x: 0, y: 0 }, { blend: 2 / 3 }).length).toBeGreaterThan(0);
+  });
+
+  it('keeps every pre-image a valid geographic box at intermediate blends', () => {
+    for (const blend of [1 / 3, 2 / 3]) {
+      for (let y = 0; y < 8; y++) {
+        for (let x = 0; x < 8; x++) {
+          const bbox = preimageBBox({ z: 3, x, y }, { blend });
+          if (!bbox) continue;
+          const [west, south, east, north] = bbox;
+          expect(west).toBeLessThanOrEqual(east);
+          expect(south).toBeLessThanOrEqual(north);
+          expect(south).toBeGreaterThanOrEqual(-90 - 1e-9);
+          expect(north).toBeLessThanOrEqual(90 + 1e-9);
+        }
+      }
+    }
+  });
+
+  it('subdivides against the blend it will be drawn with', () => {
+    const meridian: [number, number][] = [
+      [150, -60],
+      [150, 60],
+    ];
+    const options = { tolerance: toleranceForZoom(4) };
+    expect(densify(meridian, { ...options, blend: 2 / 3 })).not.toEqual(densify(meridian, options));
   });
 });
