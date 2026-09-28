@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+      # Guards the failure mode that broke 0.2.1: the published artifact drifting from
+      # source. `npm pack` is run against the freshly built dist, and the export names are
+      # compared with what src/index.ts declares.
+      - name: Verify built bundle exports match source
+        run: node scripts/check-exports.mjs
