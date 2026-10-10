@@ -14,6 +14,7 @@ import geojsonvt, { type GeoJSONVTTile } from 'geojson-vt';
 import { PbfReader } from 'pbf';
 import { fromGeojsonVt } from 'vt-pbf';
 
+import { clipLineToWorld, clipPointsToWorld, clipPolygonToWorld } from '../math/antimeridian.js';
 import { geographicToMap } from '../math/backproject.js';
 import type { LngLatTuple } from '../math/equal-earth.js';
 import { densify, TILE_EXTENT, toleranceForZoom } from '../math/subdivide.js';
@@ -103,7 +104,12 @@ export function mergeLayers(tiles: readonly GeographicLayers[]): GeographicLayer
 }
 
 /**
- * Densify and warp a feature's geometry from geographic into map space.
+ * Clip, densify and warp a feature's geometry from geographic into map space.
+ *
+ * Geometry is first clipped to longitude [-180, 180]. Equal Earth is not periodic in
+ * longitude, so world copies cannot be warped faithfully, and `geojson-vt` would fold them
+ * back into the map at the wrong place (see `antimeridian.ts`). Returns `null` when nothing
+ * is left.
  *
  * Points are warped without densification — there is nothing between a point and itself.
  */
@@ -127,27 +133,51 @@ export function warpFeature(
 
   let warped: GeoJSON.Geometry;
   switch (geometry.type) {
-    case 'Point':
+    case 'Point': {
+      if (clipPointsToWorld([geometry.coordinates]).length === 0) return null;
       warped = { type: 'Point', coordinates: warpPosition(geometry.coordinates) };
       break;
-    case 'MultiPoint':
-      warped = { type: 'MultiPoint', coordinates: geometry.coordinates.map(warpPosition) };
+    }
+    case 'MultiPoint': {
+      const points = clipPointsToWorld(geometry.coordinates);
+      if (points.length === 0) return null;
+      warped = { type: 'MultiPoint', coordinates: points.map(warpPosition) };
       break;
-    case 'LineString':
-      warped = { type: 'LineString', coordinates: warpLine(geometry.coordinates) };
+    }
+    case 'LineString': {
+      const parts = clipLineToWorld(geometry.coordinates);
+      if (parts.length === 0) return null;
+      warped =
+        parts.length === 1
+          ? { type: 'LineString', coordinates: warpLine(parts[0]!) }
+          : { type: 'MultiLineString', coordinates: parts.map(warpLine) };
       break;
-    case 'MultiLineString':
-      warped = { type: 'MultiLineString', coordinates: geometry.coordinates.map(warpLine) };
+    }
+    case 'MultiLineString': {
+      const parts = geometry.coordinates.flatMap(clipLineToWorld);
+      if (parts.length === 0) return null;
+      warped = { type: 'MultiLineString', coordinates: parts.map(warpLine) };
       break;
-    case 'Polygon':
-      warped = { type: 'Polygon', coordinates: geometry.coordinates.map(warpLine) };
+    }
+    case 'Polygon': {
+      const rings = clipPolygonToWorld(geometry.coordinates);
+      if (!rings) return null;
+      warped = { type: 'Polygon', coordinates: rings.map(warpLine) };
       break;
-    case 'MultiPolygon':
+    }
+    case 'MultiPolygon': {
+      const polygons: GeoJSON.Position[][][] = [];
+      for (const polygon of geometry.coordinates) {
+        const rings = clipPolygonToWorld(polygon);
+        if (rings) polygons.push(rings);
+      }
+      if (polygons.length === 0) return null;
       warped = {
         type: 'MultiPolygon',
-        coordinates: geometry.coordinates.map((polygon) => polygon.map(warpLine)),
+        coordinates: polygons.map((polygon) => polygon.map(warpLine)),
       };
       break;
+    }
   }
 
   return { type: 'Feature', id: feature.id, properties: feature.properties, geometry: warped };
