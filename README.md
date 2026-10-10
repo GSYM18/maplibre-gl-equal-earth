@@ -88,6 +88,27 @@ camera.destroy();   // restores any transformCameraUpdate the app had installed
 It chains to an existing `transformCameraUpdate` rather than overwriting it, so bbox constraints
 and map synchronisation keep working.
 
+For the adaptive projection's intermediate steps, `BandCamera` takes a list of zoom bands,
+each with a fixed blend between Equal Earth (0) and Mercator (1), and converts once per band
+crossing:
+
+```js
+import { LngLat } from 'maplibre-gl';
+import { BandCamera } from '@yellowmap/maplibre-gl-equal-earth';
+
+const camera = new BandCamera(map, {
+  bands: [
+    { minZoom: 0, blend: 0 },
+    { minZoom: 5, blend: 1 / 3 },
+    { minZoom: 6, blend: 2 / 3 },
+    { minZoom: 7, blend: 1 },
+  ],
+  lngLatFactory: (lng, lat) => new LngLat(lng, lat),
+});
+```
+
+Both cameras work on MapLibre v5 and v6: v6 moved the hook behind `setTransformCameraUpdate()`.
+
 ### Keeping the world in view
 
 On the Mercator grid the Equal Earth world only reaches map-space latitude ±65.46°, but Mercator

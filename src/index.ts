@@ -26,11 +26,15 @@ export {
   WEB_MERCATOR_MAX,
   WEB_MERCATOR_RADIUS,
   geographicToMap,
+  mapSpaceMaxLatitude,
   mapToGeographic,
+  worldYRange,
 } from './math/backproject.js';
 
 export {
+  BandCamera,
   ThresholdCamera,
+  type BandCameraOptions,
   type CameraHost,
   type CameraUpdate,
   type CameraUpdateFn,
@@ -38,6 +42,8 @@ export {
   type LngLatFactory,
   type ThresholdCameraOptions,
 } from './map/camera.js';
+
+export { bandIndexForZoom, validateBands, type Band } from './map/bands.js';
 
 export {
   createEqualEarthConstrain,
