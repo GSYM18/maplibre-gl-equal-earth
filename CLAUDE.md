@@ -116,11 +116,16 @@ mechanism, with line references:
   on the `moveend` that deletes `R`. On v6 that is only the **Camera's own** `moveend`
   (`host._camera`). A `moveend` the Map fires itself (a gesture ending without inertia, which
   includes every scroll zoom) does not bubble down, so `R` survives it.
+- **Closing that v6 gap.** v5 deletes `R` on every `moveend`, v6 only on Camera-fired ones. A
+  surviving `R` keeps the old band's space, so an app's `jumpTo({ center })` in the rendered
+  band was misread (Guadalajara 1.74° off). So on a Map-fired `moveend` the camera deletes `R`
+  itself, unless an ease is running (`_camera.isEasing()`; a v6 `Map` has no `isEasing`).
 - **A gesture interrupting an ease.** The HandlerManager takes `R` *before* `stop(true)`, and
   that `stop` fires the Camera's `moveend`, which deletes `R`. So the interrupting frame renders
   a detached `R`, still in the space of the baseline the reset replaced. The hook spots this
-  because `_requestedCameraState` is absent at hook time, which otherwise never happens with
-  our hook installed. It converts that frame from the previous baseline.
+  because `_requestedCameraState` is absent at hook time. It converts that frame from the
+  previous baseline. The same applies to an ease whose `R` a mid-ease `moveend` deletes: on v6
+  through `setVerticalFieldOfView`, on v5 through any Map `moveend`.
 - **History.** The original compared against a zoom frozen at `movestart` and re-converted every
   frame (a Zürich pinch landed 24° off). The first rewrite compared against the previous frame's
   band, and so converted only on the crossing frame: the next frame rendered the unconverted `R`
@@ -130,8 +135,8 @@ mechanism, with line references:
   event handler, so it was `undefined` until first interaction. `undefined` fails *both* `<` and
   `>=`, so an initial `flyTo` across the threshold was silently left unconverted. Measured ~4° off.
 
-One `moveend` listener is required: on the Camera on v6, and on the Map on v5. `destroy()`
-removes it. It also restores the host's prior `transformCameraUpdate` rather than nulling it,
+`moveend` listeners are required: one on v5 (the Map), two on v6 (the Camera and the Map).
+`destroy()` removes them. It also restores the host's prior `transformCameraUpdate` rather than nulling it,
 unless the application replaced ours after we installed.
 
 For clamping the camera to the Equal Earth world, prefer **`transformConstrain`** over

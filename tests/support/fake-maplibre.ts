@@ -82,6 +82,8 @@ export class FakeCamera extends Emitter {
   /** `R`: the requested state, absent between moves. Named as in MapLibre. */
   _requestedCameraState?: CameraState;
   transformCameraUpdate: CameraUpdateFn | null = null;
+  /** Stands in for `_easeFrameId`: set while an ease is running. */
+  #ease: object | undefined;
 
   constructor(center: readonly [number, number], zoom: number) {
     super();
@@ -106,9 +108,39 @@ export class FakeCamera extends Emitter {
     if (typeof result['zoom'] === 'number') final.zoom = result['zoom'];
     this.transform = final;
   }
+
+  /** v6 22611: `!!this._easeFrameId`. */
+  isEasing(): boolean {
+    return this.#ease !== undefined;
+  }
+
+  /** Mark an ease as running; returns its token. */
+  startEase(): object {
+    this.#ease = {};
+    return this.#ease;
+  }
+
+  isCurrentEase(token: object): boolean {
+    return this.#ease === token;
+  }
+
+  /**
+   * `stop()` (v6 22617): ending a running ease runs `_afterEase`, which fires the Camera's
+   * `moveend` (v6 22478-22495). With no ease running it does nothing.
+   */
+  stop(): void {
+    if (this.#ease === undefined) return;
+    this.#ease = undefined;
+    this.fire('moveend');
+  }
 }
 
 export interface Frame {
+  /**
+   * Absolute centre in map space, as `jumpTo`/`easeTo` options give it: it overwrites
+   * `R.center` (v6 `handleJumpToCenterZoom`, 22258-22265, and the ease interpolation).
+   */
+  center?: readonly [number, number];
   /** Absolute zoom, as an animation frame interpolates it. */
   zoom?: number;
   /** Zoom change, as a scroll or pinch frame produces it. */
@@ -118,6 +150,7 @@ export interface Frame {
 }
 
 function applyTo(state: CameraState, frame: Frame): void {
+  if (frame.center) state.center = { lng: frame.center[0], lat: frame.center[1] };
   if (frame.zoom !== undefined) state.zoom = frame.zoom;
   if (frame.zoomDelta !== undefined) state.zoom += frame.zoomDelta;
   if (frame.panDelta) {
@@ -139,7 +172,6 @@ export interface FakeEase {
 /** Driving logic shared by the v5 and v6 shapes; they differ only in their event wiring. */
 export abstract class FakeMapBase {
   protected readonly camera: FakeCamera;
-  #ease: object | undefined;
 
   constructor(center: readonly [number, number], zoom: number) {
     this.camera = new FakeCamera(center, zoom);
@@ -172,7 +204,7 @@ export abstract class FakeMapBase {
    */
   applyFrame(frame: Frame): void {
     const requested = this.camera.getTransformForUpdate();
-    this.#stop();
+    this.camera.stop();
     applyTo(requested, frame);
     this.camera.applyUpdatedTransform(requested);
   }
@@ -184,12 +216,21 @@ export abstract class FakeMapBase {
    */
   endGesture({ inertia = false }: { inertia?: boolean } = {}): void {
     if (inertia) this.camera.fire('moveend');
-    else this.fireOnMap('moveend');
+    else this.fireMapMoveEnd();
+  }
+
+  /**
+   * A `moveend` the Map fires itself: a gesture ending without inertia (v6 22022), `resize`
+   * (v6 24099), `setMinZoom` and friends (v6 24243). On v5 the Map is the Camera, so this
+   * deletes `R`; on v6 it does not reach the Camera.
+   */
+  fireMapMoveEnd(): void {
+    this.fireOnMap('moveend');
   }
 
   /** `jumpTo` (v6 22257): `stop()` first, then one frame, then the Camera's own `moveend`. */
   jumpTo(frame: Frame): void {
-    this.#stop();
+    this.camera.stop();
     const requested = this.camera.getTransformForUpdate();
     applyTo(requested, frame);
     this.camera.applyUpdatedTransform(requested);
@@ -198,12 +239,11 @@ export abstract class FakeMapBase {
 
   /** `easeTo`/`flyTo` (v6 22321-22330): `stop()` first, then capture `R` for every frame. */
   easeTo(): FakeEase {
-    this.#stop();
+    this.camera.stop();
     const requested = this.camera.getTransformForUpdate();
-    const ease = {};
-    this.#ease = ease;
+    const ease = this.camera.startEase();
     const assertRunning = () => {
-      if (this.#ease !== ease) throw new Error('This ease was stopped.');
+      if (!this.camera.isCurrentEase(ease)) throw new Error('This ease was stopped.');
     };
     return {
       frame: (frame) => {
@@ -213,16 +253,9 @@ export abstract class FakeMapBase {
       },
       finish: () => {
         assertRunning();
-        this.#stop();
+        this.camera.stop();
       },
     };
-  }
-
-  /** `Camera.stop()` (v6 22617): ending a running ease fires the Camera's `moveend`. */
-  #stop(): void {
-    if (this.#ease === undefined) return;
-    this.#ease = undefined;
-    this.camera.fire('moveend');
   }
 
   /** Fire an event on the Map itself, not the Camera. */
@@ -242,6 +275,11 @@ export class FakeV5Map extends FakeMapBase {
   /** On v5 the requested state lives on the Map, which is the Camera. */
   get _requestedCameraState(): object | undefined {
     return this.camera._requestedCameraState;
+  }
+
+  /** v5 `Map` inherits it from `Camera`. (A v6 `Map` has no `isEasing`; its `_camera` does.) */
+  isEasing(): boolean {
+    return this.camera.isEasing();
   }
 
   on(type: string, listener: Listener): this {
@@ -325,6 +363,11 @@ export class OpaqueV6Map extends FakeMapBase {
   off(type: string, listener: Listener): this {
     this.#events.off(type, listener);
     return this;
+  }
+
+  /** Listeners on the Map's own emitter. */
+  listenerCount(type: string): number {
+    return this.#events.listenerCount(type);
   }
 
   protected fireOnMap(type: string): void {
