@@ -14,7 +14,12 @@ import geojsonvt, { type GeoJSONVTTile } from 'geojson-vt';
 import { PbfReader } from 'pbf';
 import { fromGeojsonVt } from 'vt-pbf';
 
-import { clipLineToWorld, clipPointsToWorld, clipPolygonToWorld } from '../math/antimeridian.js';
+import {
+  clipLinesToWorld,
+  clipLineToWorld,
+  clipPointsToWorld,
+  clipPolygonToWorld,
+} from '../math/antimeridian.js';
 import { geographicToMap } from '../math/backproject.js';
 import type { LngLatTuple } from '../math/equal-earth.js';
 import { densify, TILE_EXTENT, toleranceForZoom } from '../math/subdivide.js';
@@ -134,7 +139,7 @@ export function warpFeature(
   let warped: GeoJSON.Geometry;
   switch (geometry.type) {
     case 'Point': {
-      if (clipPointsToWorld([geometry.coordinates]).length === 0) return null;
+      if (Math.abs(geometry.coordinates[0]!) > 180) return null;
       warped = { type: 'Point', coordinates: warpPosition(geometry.coordinates) };
       break;
     }
@@ -154,7 +159,7 @@ export function warpFeature(
       break;
     }
     case 'MultiLineString': {
-      const parts = geometry.coordinates.flatMap(clipLineToWorld);
+      const parts = clipLinesToWorld(geometry.coordinates);
       if (parts.length === 0) return null;
       warped = { type: 'MultiLineString', coordinates: parts.map(warpLine) };
       break;
