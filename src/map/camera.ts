@@ -83,6 +83,17 @@ export interface CameraHookAccess {
    * itself; `undefined` when this MapLibre version offers no way to reach it.
    */
   readonly requestOwner: MoveEndEmitter | undefined;
+  /**
+   * Whether MapLibre currently holds a requested camera state; `undefined` when this MapLibre
+   * version offers no way to tell (and whenever {@link requestOwner} is unknown).
+   */
+  hasRequestedState(): boolean | undefined;
+}
+
+/** The private fields this module reads, wherever they live. */
+interface CameraInternals {
+  transformCameraUpdate?: CameraUpdateFn | null;
+  _requestedCameraState?: unknown;
 }
 
 type V6Host = CameraHost & { setTransformCameraUpdate(value: CameraUpdateFn | null): void };
@@ -104,29 +115,33 @@ function hasHookSetter(host: CameraHost): host is V6Host {
  * bubble up to the Map but never down: a `moveend` the Map fires itself (a gesture ending
  * without inertia, which includes every scroll zoom) leaves that state in place. On v5 the
  * Map *is* the Camera, so every `moveend` deletes it.
+ *
+ * The requested state itself is `_requestedCameraState`, on the same object as
+ * `requestOwner`: the v6 `_camera`, or the v5 Map.
  */
 export function cameraHookAccess(host: CameraHost): CameraHookAccess {
   if (hasHookSetter(host)) {
-    const camera = (
-      host as unknown as {
-        _camera?: Partial<MoveEndEmitter> & { transformCameraUpdate?: CameraUpdateFn | null };
-      }
-    )._camera;
+    const camera = (host as unknown as { _camera?: Partial<MoveEndEmitter> & CameraInternals })
+      ._camera;
+    const owner =
+      typeof camera?.on === 'function' && typeof camera.off === 'function'
+        ? (camera as MoveEndEmitter & CameraInternals)
+        : undefined;
     return {
       get: () => (camera ? (camera.transformCameraUpdate ?? null) : undefined),
       set: (hook) => host.setTransformCameraUpdate(hook),
-      requestOwner:
-        typeof camera?.on === 'function' && typeof camera.off === 'function'
-          ? (camera as MoveEndEmitter)
-          : undefined,
+      requestOwner: owner,
+      hasRequestedState: () => (owner ? owner._requestedCameraState !== undefined : undefined),
     };
   }
+  const internals = host as unknown as CameraInternals;
   return {
     get: () => host.transformCameraUpdate ?? null,
     set: (hook) => {
       host.transformCameraUpdate = hook;
     },
     requestOwner: host,
+    hasRequestedState: () => internals._requestedCameraState !== undefined,
   };
 }
 
@@ -182,6 +197,19 @@ export class BandCamera {
    */
   #baseline: number;
 
+  /**
+   * The baseline the last reset replaced. A gesture that interrupts an ease renders, once,
+   * the requested state that reset was for — see {@link handleCameraUpdate}.
+   */
+  #previousBaseline: number;
+
+  /**
+   * Set once a hook call has seen the requested state present, proving it is readable. Until
+   * then an absent one proves nothing (MapLibre may have renamed the field), and the camera
+   * keeps to the `moveend` baseline alone.
+   */
+  #requestedStateSeen = false;
+
   /** The host's own hook, chained rather than clobbered. */
   #previousHook: CameraUpdateFn | null;
 
@@ -211,6 +239,7 @@ export class BandCamera {
 
     this.#host = host;
     this.#baseline = bandIndexForZoom(this.#bands, host.getZoom());
+    this.#previousBaseline = this.#baseline;
     this.#access = cameraHookAccess(host);
 
     const previous = this.#access.get();
@@ -260,10 +289,26 @@ export class BandCamera {
     const upstreamZoom = upstream['zoom'];
     const zoom = typeof upstreamZoom === 'number' ? upstreamZoom : next.zoom;
 
-    // Deliberately no state change here: the baseline moves only on `moveend`, so every frame
-    // of a move converts its requested state the same way.
-    const fromBlend = this.#bands[this.#baseline]!.blend;
-    const toBlend = this.#bands[bandIndexForZoom(this.#bands, zoom)]!.blend;
+    const current = bandIndexForZoom(this.#bands, zoom);
+
+    // With this hook installed, `getTransformForUpdate()` always creates the requested state
+    // before `applyUpdatedTransform` runs us, so its absence means this frame carries one that
+    // was just deleted: the HandlerManager takes it *before* calling `stop(true)` (v6
+    // 21867/21873, v5 67195/67202), and stopping a running ease fires the Camera's `moveend`.
+    // That state is in the space of the baseline the reset replaced. The next one is cloned
+    // from what this frame renders, so this frame's band becomes the baseline.
+    const present = this.#access.hasRequestedState();
+    if (present === true) this.#requestedStateSeen = true;
+    let baseline = this.#baseline;
+    if (present === false && this.#requestedStateSeen) {
+      baseline = this.#previousBaseline;
+      this.#baseline = current;
+    }
+
+    // Otherwise no state change here: the baseline moves only on `moveend`, so every frame of
+    // a move converts its requested state the same way.
+    const fromBlend = this.#bands[baseline]!.blend;
+    const toBlend = this.#bands[current]!.blend;
 
     // Still in the baseline band (or one sharing its blend), including after a move crossed
     // out and back: the requested centre is already in the right space.
@@ -290,6 +335,7 @@ export class BandCamera {
 
   /** The requested state is gone; the next one is cloned from what is rendered. */
   readonly #onMoveEnd = (): void => {
+    this.#previousBaseline = this.#baseline;
     this.#baseline = bandIndexForZoom(this.#bands, this.#host.getZoom());
   };
 
