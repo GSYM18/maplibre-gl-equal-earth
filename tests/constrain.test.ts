@@ -5,7 +5,8 @@ import {
   installEqualEarthConstrain,
   type TransformConstrainFn,
 } from '../src/map/constrain.js';
-import { MAP_SPACE_MAX_LATITUDE } from '../src/math/backproject.js';
+import { MAP_SPACE_MAX_LATITUDE, mapSpaceMaxLatitude } from '../src/math/backproject.js';
+import type { Band } from '../src/map/bands.js';
 
 const lngLatFactory = (lng: number, lat: number) => ({ lng, lat });
 
@@ -127,5 +128,41 @@ describe('installEqualEarthConstrain', () => {
 
   it('rejects a map without setTransformConstrain (maplibre-gl < 6)', () => {
     expect(() => installEqualEarthConstrain({} as never, { lngLatFactory })).toThrow(TypeError);
+  });
+});
+
+describe('createEqualEarthConstrain with bands', () => {
+  const EQUAL: Band[] = [
+    { minZoom: 0, blend: 0 },
+    { minZoom: 5, blend: 1 / 3 },
+    { minZoom: 6, blend: 2 / 3 },
+    { minZoom: 7, blend: 1 },
+  ];
+
+  it('uses the world edge of the band the requested zoom falls in', () => {
+    const constrain = createEqualEarthConstrain({ lngLatFactory, bands: EQUAL });
+
+    expect(constrain({ lng: 0, lat: 80 }, 4).center.lat).toBeCloseTo(MAP_SPACE_MAX_LATITUDE, 9);
+    expect(constrain({ lng: 0, lat: 80 }, 5.5).center.lat).toBeCloseTo(mapSpaceMaxLatitude(1 / 3), 9);
+    // 80° is inside the ⅔ band's edge (≈81.5°), so it passes through untouched.
+    const inside = { lng: 0, lat: 80 };
+    expect(constrain(inside, 6.5).center).toBe(inside);
+  });
+
+  it('leaves the Mercator band unconstrained, starting exactly at its minZoom', () => {
+    const constrain = createEqualEarthConstrain({ lngLatFactory, bands: EQUAL });
+    const input = { lng: 0, lat: 84 };
+
+    expect(constrain(input, 7).center).toBe(input);
+    expect(constrain(input, 12).center).toBe(input);
+  });
+
+  it('treats a zoom exactly on a boundary as the upper band, like BandCamera', () => {
+    const constrain = createEqualEarthConstrain({ lngLatFactory, bands: EQUAL });
+    expect(constrain({ lng: 0, lat: 80 }, 5).center.lat).toBeCloseTo(mapSpaceMaxLatitude(1 / 3), 9);
+  });
+
+  it('rejects malformed bands when the constraint is built', () => {
+    expect(() => createEqualEarthConstrain({ lngLatFactory, bands: [] })).toThrow(TypeError);
   });
 });
