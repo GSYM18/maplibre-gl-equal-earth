@@ -69,8 +69,9 @@ fromEqualEarth([0, 8392929.69]);   // → [0, 90]
 ### Camera continuity across a zoom threshold
 
 An adaptive Equal Earth map shows warped coordinates at low zoom and true geographic coordinates
-once it switches to plain Mercator tiles. `ThresholdCamera` converts the camera centre exactly
-once per crossing, in either direction:
+once it switches to plain Mercator tiles. `ThresholdCamera` converts the camera centre so the
+place under it stays put across the switch, in either direction, on every frame of a gesture or
+animation:
 
 ```js
 import { LngLat } from 'maplibre-gl';
@@ -89,8 +90,8 @@ It chains to an existing `transformCameraUpdate` rather than overwriting it, so 
 and map synchronisation keep working.
 
 For the adaptive projection's intermediate steps, `BandCamera` takes a list of zoom bands,
-each with a fixed blend between Equal Earth (0) and Mercator (1), and converts once per band
-crossing:
+each with a fixed blend between Equal Earth (0) and Mercator (1), and does the same across every
+band boundary:
 
 ```js
 import { LngLat } from 'maplibre-gl';

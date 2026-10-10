@@ -102,22 +102,32 @@ and the derived form.
 
 ## ThresholdCamera: why it looks the way it does
 
-Two P0 bugs in the original motivated the rewrite, both now pinned by `tests/camera.test.ts`:
+`ThresholdCamera` is a two-band `BandCamera`. Both are pinned by `tests/band-camera.test.ts`
+and `tests/camera.test.ts`, whose fakes in `tests/support/fake-maplibre.ts` model the real
+mechanism, with line references:
 
-- **Edge-triggered, not level-triggered.** The original compared `next.zoom` against a
-  `_zoomstart` captured on `movestart`, which stays frozen for a whole gesture. "Started below,
-  now above" therefore stayed true for *every remaining frame*, re-converting an already-converted
-  centre once per frame — and because MapLibre's handler loop feeds the returned centre back in
-  as the next frame's baseline, the error compounded. Measured: a pinch-zoom through the threshold
-  from Zürich landed 24° of latitude away. We now compare against the zoom seen on the previous
-  camera update.
-- **State initialised in the constructor.** `_zoomstart` was only assigned in an event handler,
-  so it was `undefined` until first interaction — and `undefined` fails *both* `<` and `>=`, so an
-  initial `flyTo` across the threshold was silently unconverted with no error. Measured ~4° off.
+- **How MapLibre feeds the hook.** Gestures and animations apply each frame's delta to a
+  *requested* state `R` (`_requestedCameraState`). `getTransformForUpdate()` clones `R` from the
+  rendered transform `T` and keeps it. `applyUpdatedTransform` runs the hook on a copy of `R` and
+  writes the result to `T` **only**. So the hook never sees its own previous output. Every frame
+  hands it `R`, whose centre is still in the map space of the band `R` was created in.
+- **Convert relative to a baseline band.** The hook converts from that *baseline* band to the
+  frame's band, and is a pure function of the two. The baseline is reset from the rendered zoom
+  on the `moveend` that deletes `R`. On v6 that is only the **Camera's own** `moveend`
+  (`host._camera`). A `moveend` the Map fires itself (a gesture ending without inertia, which
+  includes every scroll zoom) does not bubble down, so `R` survives it.
+- **History.** The original compared against a zoom frozen at `movestart` and re-converted every
+  frame (a Zürich pinch landed 24° off). The first rewrite compared against the previous frame's
+  band, and so converted only on the crossing frame: the next frame rendered the unconverted `R`
+  again, a ~217 px jump at Guadalajara at z6. A one-shot `jumpTo` hid this, because its own
+  `moveend` deletes `R`.
+- **State initialised in the constructor.** The original's `_zoomstart` was only assigned in an
+  event handler, so it was `undefined` until first interaction. `undefined` fails *both* `<` and
+  `>=`, so an initial `flyTo` across the threshold was silently left unconverted. Measured ~4° off.
 
-Being edge-triggered removes the need for `movestart`/`moveend` listeners entirely, which also
-removes the leak the original had. `destroy()` restores the host's prior `transformCameraUpdate`
-rather than nulling it, and declines to do so if the application replaced it after we installed.
+One `moveend` listener is required: on the Camera on v6, and on the Map on v5. `destroy()`
+removes it. It also restores the host's prior `transformCameraUpdate` rather than nulling it,
+unless the application replaced ours after we installed.
 
 For clamping the camera to the Equal Earth world, prefer **`transformConstrain`** over
 `transformCameraUpdate`: it is threaded into `createProjectionFromName` and survives projection
