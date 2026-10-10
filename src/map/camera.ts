@@ -88,12 +88,19 @@ export interface CameraHookAccess {
    * version offers no way to tell (and whenever {@link requestOwner} is unknown).
    */
   hasRequestedState(): boolean | undefined;
+  /**
+   * Delete the requested state if there is one and no ease is running, as v5 does on every
+   * `moveend`; returns whether it did. Only v6 needs this (see {@link cameraHookAccess}). It
+   * does nothing, and returns `false`, on v5 or when the internals cannot be read.
+   */
+  discardRequestedState(): boolean;
 }
 
-/** The private fields this module reads, wherever they live. */
+/** The private members this module reads, wherever they live. */
 interface CameraInternals {
   transformCameraUpdate?: CameraUpdateFn | null;
   _requestedCameraState?: unknown;
+  isEasing?(): boolean;
 }
 
 type V6Host = CameraHost & { setTransformCameraUpdate(value: CameraUpdateFn | null): void };
@@ -118,6 +125,12 @@ function hasHookSetter(host: CameraHost): host is V6Host {
  *
  * The requested state itself is `_requestedCameraState`, on the same object as
  * `requestOwner`: the v6 `_camera`, or the v5 Map.
+ *
+ * `discardRequestedState` closes that v6 gap from the Map's own `moveend`. Without it, an `R`
+ * left behind by a scroll keeps the old band's map space, and a centre the application then
+ * passes to `jumpTo`/`easeTo` (in the rendered band's space) would be read in the wrong one.
+ * A running ease is left alone: its `R` is still in use. A v6 `Map` has no `isEasing()`; its
+ * Camera does.
  */
 export function cameraHookAccess(host: CameraHost): CameraHookAccess {
   if (hasHookSetter(host)) {
@@ -132,6 +145,12 @@ export function cameraHookAccess(host: CameraHost): CameraHookAccess {
       set: (hook) => host.setTransformCameraUpdate(hook),
       requestOwner: owner,
       hasRequestedState: () => (owner ? owner._requestedCameraState !== undefined : undefined),
+      discardRequestedState: () => {
+        if (owner?._requestedCameraState === undefined) return false;
+        if (typeof owner.isEasing !== 'function' || owner.isEasing()) return false;
+        delete owner._requestedCameraState;
+        return true;
+      },
     };
   }
   const internals = host as unknown as CameraInternals;
@@ -142,6 +161,8 @@ export function cameraHookAccess(host: CameraHost): CameraHookAccess {
     },
     requestOwner: host,
     hasRequestedState: () => internals._requestedCameraState !== undefined,
+    // MapLibre v5 already deletes it on every `moveend`.
+    discardRequestedState: () => false,
   };
 }
 
@@ -187,6 +208,8 @@ export class BandCamera {
   readonly #host: CameraHost;
   readonly #access: CameraHookAccess;
   readonly #moveEndSource: MoveEndEmitter;
+  /** v6 only: the Map, whose own `moveend`s the Camera never hears. */
+  readonly #mapMoveEndSource: MoveEndEmitter | undefined;
   readonly #bands: readonly Band[];
   readonly #lngLatFactory: LngLatFactory;
   readonly #onConversionFailure: (reason: string, input: LngLatTuple) => void;
@@ -198,17 +221,10 @@ export class BandCamera {
   #baseline: number;
 
   /**
-   * The baseline the last reset replaced. A gesture that interrupts an ease renders, once,
-   * the requested state that reset was for — see {@link handleCameraUpdate}.
+   * The baseline the last reset replaced: the space of a requested state that was deleted
+   * while still in use — see {@link handleCameraUpdate}.
    */
   #previousBaseline: number;
-
-  /**
-   * Set once a hook call has seen the requested state present, proving it is readable. Until
-   * then an absent one proves nothing (MapLibre may have renamed the field), and the camera
-   * keeps to the `moveend` baseline alone.
-   */
-  #requestedStateSeen = false;
 
   /** The host's own hook, chained rather than clobbered. */
   #previousHook: CameraUpdateFn | null;
@@ -263,6 +279,10 @@ export class BandCamera {
     // Without the Camera, the Map's `moveend` is the closest available approximation.
     this.#moveEndSource = owner ?? host;
     this.#moveEndSource.on('moveend', this.#onMoveEnd);
+    // v5 deletes the requested state on every `moveend`; v6 only on Camera-fired ones. Close
+    // that gap, so a centre the application supplies is always read in the rendered band.
+    this.#mapMoveEndSource = owner !== undefined && owner !== host ? host : undefined;
+    this.#mapMoveEndSource?.on('moveend', this.#onMapMoveEnd);
     this.#access.set(this.handleCameraUpdate);
     this.#installed = true;
   }
@@ -291,16 +311,17 @@ export class BandCamera {
 
     const current = bandIndexForZoom(this.#bands, zoom);
 
-    // With this hook installed, `getTransformForUpdate()` always creates the requested state
-    // before `applyUpdatedTransform` runs us, so its absence means this frame carries one that
-    // was just deleted: the HandlerManager takes it *before* calling `stop(true)` (v6
-    // 21867/21873, v5 67195/67202), and stopping a running ease fires the Camera's `moveend`.
-    // That state is in the space of the baseline the reset replaced. The next one is cloned
-    // from what this frame renders, so this frame's band becomes the baseline.
-    const present = this.#access.hasRequestedState();
-    if (present === true) this.#requestedStateSeen = true;
+    // With this hook installed, `getTransformForUpdate()` creates the requested state before
+    // anything applies a change to it, so an absent one means this frame renders a state that
+    // a `moveend` deleted while it was still in use. That happens when a gesture interrupts
+    // an ease: the HandlerManager takes the state *before* calling `stop(true)` (v6
+    // 21867/21873, v5 67195/67202), and stopping the ease fires the Camera's `moveend`. It
+    // also happens to an ease whose state a mid-ease `moveend` deleted: on v6 from
+    // `setVerticalFieldOfView` (22131), on v5 from any Map `moveend`. Either way the state is
+    // in the space of the baseline that reset replaced, and the next one will be cloned from
+    // what this frame renders, so this frame's band becomes the baseline.
     let baseline = this.#baseline;
-    if (present === false && this.#requestedStateSeen) {
+    if (this.#access.hasRequestedState() === false) {
       baseline = this.#previousBaseline;
       this.#baseline = current;
     }
@@ -340,6 +361,14 @@ export class BandCamera {
   };
 
   /**
+   * v6: a `moveend` reached the Map. Camera-fired ones have already deleted the requested
+   * state and re-based through {@link #onMoveEnd}; for the Map's own, do what v5 would.
+   */
+  readonly #onMapMoveEnd = (): void => {
+    if (this.#access.discardRequestedState()) this.#onMoveEnd();
+  };
+
+  /**
    * Uninstall. Restores the host's previous `transformCameraUpdate` rather than leaving
    * it null, so a map that had its own hook keeps working, and stops listening for `moveend`.
    *
@@ -349,6 +378,7 @@ export class BandCamera {
     if (!this.#installed) return;
     this.#installed = false;
     this.#moveEndSource.off('moveend', this.#onMoveEnd);
+    this.#mapMoveEndSource?.off('moveend', this.#onMapMoveEnd);
     // Only hand the hook back if it is still ours; if the application replaced it after we
     // installed, stomping on that would be worse than leaving it alone. When the host gives
     // no way to read the hook, restoring is the better guess.

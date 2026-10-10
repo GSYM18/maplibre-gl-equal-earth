@@ -22,6 +22,7 @@ const EQUAL: Band[] = [
 const GUADALAJARA: [number, number] = [-103.35, 20.67];
 const TOKYO: [number, number] = [139.69, 35.69];
 const ANCHORAGE: [number, number] = [-149.9, 61.22];
+const SAN_FRANCISCO: [number, number] = [-122.42, 37.77];
 
 const blendAt = (zoom: number) => (zoom < 5 ? 0 : zoom < 6 ? 1 / 3 : zoom < 7 ? 2 / 3 : 1);
 
@@ -207,17 +208,84 @@ describe.each(SHAPES)('BandCamera on a MapLibre $shape-shaped host', ({ shape, c
     expectHeldThrough(map, zoomFrames(5.3, 6.3, 0.2), GUADALAJARA);
   });
 
+  it('reads an app-supplied centre in the rendered band after a scroll ends without inertia', () => {
+    // The reviewer's case. On v6 the scroll's Map-fired moveend never reached the Camera, so
+    // `R` survived with a band-0 baseline while the app's `jumpTo` centre was in band ⅓.
+    const map = mapAt(create, TOKYO, 4.8);
+    const camera = new BandCamera(map, { bands: EQUAL });
+    expectHeldThrough(map, zoomFrames(4.8, 5.6, 0.2), TOKYO);
+    map.endGesture({ inertia: false });
+
+    map.jumpTo({ center: geographicToMap(GUADALAJARA, camera.blend), zoom: map.getZoom() });
+    expectGeographic(map, GUADALAJARA);
+
+    expectHeldThrough(map, zoomFrames(map.zoom, 6.4, 0.2), GUADALAJARA);
+  });
+
+  it('keeps San Francisco through the spike: scroll, stop, city button, then the z7 cross', () => {
+    // The human's browser case, replaying demo/spike/bands.ts: the city button jumps to
+    // `geographicToMap(city, blendNow())` at the current zoom; `crossing(7)` jumps to 7 -/+ 1e-4.
+    const map = mapAt(create, TOKYO, 4.6);
+    const camera = new BandCamera(map, { bands: EQUAL });
+    expectHeldThrough(map, zoomFrames(4.6, 5.4, 0.2), TOKYO);
+    map.endGesture({ inertia: false });
+
+    map.jumpTo({ center: geographicToMap(SAN_FRANCISCO, camera.blend), zoom: map.getZoom() });
+    expectGeographic(map, SAN_FRANCISCO);
+    map.jumpTo({ zoom: 7 - 1e-4 });
+    expectGeographic(map, SAN_FRANCISCO);
+    map.jumpTo({ zoom: 7 + 1e-4 });
+    expectGeographic(map, SAN_FRANCISCO);
+  });
+
+  it('reads an eased-to centre in the rendered band after a scroll ends without inertia', () => {
+    const map = mapAt(create, TOKYO, 4.8);
+    const camera = new BandCamera(map, { bands: EQUAL });
+    expectHeldThrough(map, zoomFrames(4.8, 5.6, 0.2), TOKYO);
+    map.endGesture({ inertia: false });
+
+    const ease = map.easeTo();
+    ease.frame({ center: geographicToMap(GUADALAJARA, camera.blend), zoom: map.getZoom() });
+    expectGeographic(map, GUADALAJARA);
+    ease.finish();
+  });
+
+  it('holds the centre, and keeps an ease running, through a Map-level moveend mid-ease', () => {
+    // A resize (v6 24099) during a flyTo. On v6 the ease's `R` must survive it.
+    const map = mapAt(create, GUADALAJARA, 4.6);
+    new BandCamera(map, { bands: EQUAL });
+    const ease = map.easeTo();
+    for (const zoom of [4.8, 5.1]) {
+      ease.frame({ zoom });
+      expectGeographic(map, GUADALAJARA);
+    }
+
+    map.fireMapMoveEnd();
+
+    // On v5 every moveend deletes `R` (and the ease renders it detached); never on v6 mid-ease.
+    expect(map.requestedCenter === undefined).toBe(shape === 'v5');
+    for (const zoom of [5.4, 5.8, 6.2, 6.6, 7.2]) {
+      ease.frame({ zoom });
+      expectGeographic(map, GUADALAJARA);
+    }
+    ease.finish();
+    expectHeldThrough(map, zoomFrames(map.zoom, 6.2, 0.2), GUADALAJARA);
+  });
+
   it('stops listening for moveend on destroy, and destroys idempotently', () => {
     const map = mapAt(create, GUADALAJARA, 4.8);
-    const emitter = map instanceof FakeV6Map ? map._camera : map;
-    const before = emitter.listenerCount('moveend');
+    // v5: one emitter. v6: the Camera's (deletes `R`) and the Map's (closes the v6 gap).
+    const total = () =>
+      map.listenerCount('moveend') +
+      (map instanceof FakeV6Map ? map._camera.listenerCount('moveend') : 0);
+    const before = total();
     const camera = new BandCamera(map, { bands: EQUAL });
-    expect(emitter.listenerCount('moveend')).toBe(before + 1);
+    expect(total()).toBe(before + (shape === 'v6' ? 2 : 1));
 
     camera.destroy();
     camera.destroy();
 
-    expect(emitter.listenerCount('moveend')).toBe(before);
+    expect(total()).toBe(before);
     const getZoom = vi.spyOn(map, 'getZoom');
     map.endGesture({ inertia: true });
     map.endGesture({ inertia: false });
@@ -275,28 +343,37 @@ describe.each(SHAPES)('BandCamera on a MapLibre $shape-shaped host', ({ shape, c
     expect(onConversionFailure).toHaveBeenCalledOnce();
   });
 
-  it(`keeps ${shape === 'v6' ? 'the requested state' : 'nothing'} across a Map-fired moveend`, () => {
+  it(`fake: ${shape === 'v6' ? 'keeps' : 'deletes'} R across a Map-fired moveend, unaided`, () => {
     // Pins the fake to the real model: only the Camera's own moveend deletes `R`.
     const map = mapAt(create, GUADALAJARA, 4.8);
-    new BandCamera(map, { bands: EQUAL });
     map.applyFrame({ zoomDelta: 0.4 });
 
     map.endGesture({ inertia: false });
 
     expect(map.requestedCenter === undefined).toBe(shape === 'v5');
   });
+
+  it('deletes R on a Map-fired moveend outside an ease, as v5 itself does', () => {
+    const map = mapAt(create, GUADALAJARA, 4.8);
+    new BandCamera(map, { bands: EQUAL });
+    map.applyFrame({ zoomDelta: 0.4 });
+
+    map.endGesture({ inertia: false });
+
+    expect(map.requestedCenter).toBeUndefined();
+  });
 });
 
 describe('BandCamera', () => {
-  it('scrolls across z5, stops without inertia, then scrolls across z6 (v6 keeps R)', () => {
-    // Scroll zoom is `noInertia`, so its moveend is fired on the Map and never deletes the
-    // requested state. The second scroll continues from that stale, band-0 `R`.
+  it('scrolls across z5, stops without inertia, then scrolls across z6 (v6)', () => {
+    // Scroll zoom is `noInertia`, so its moveend is fired on the Map, which on its own would
+    // leave a band-0 `R` behind. The camera deletes it there, as v5 does.
     const map = mapAt(SHAPES[1].create, GUADALAJARA, 4.6);
     new BandCamera(map, { bands: EQUAL });
 
     expectHeldThrough(map, zoomFrames(4.6, 5.4, 0.2), GUADALAJARA);
     map.endGesture({ inertia: false });
-    expect(map.requestedCenter).toBeDefined();
+    expect(map.requestedCenter).toBeUndefined();
     expectHeldThrough(map, zoomFrames(5.4, 6.4, 0.2), GUADALAJARA);
   });
 
@@ -367,8 +444,8 @@ describe('BandCamera', () => {
     });
 
     it('still holds ordinary gestures when the requested state cannot be read', () => {
-      // As if MapLibre had renamed the field: it never reads as present, so the camera falls
-      // back to the moveend baseline alone.
+      // As if MapLibre had renamed the field: it reads as absent on every frame, and the
+      // Map's moveend cannot delete it. Ordinary gestures must still hold.
       class RenamedV6Map extends FakeV6Map {
         override get _camera(): FakeCamera {
           return new Proxy(super._camera, {
@@ -399,6 +476,24 @@ describe('BandCamera', () => {
       // Tokyo, not the map-space start: proves the hook was installed and converted.
       expectAt(map, TOKYO);
       camera.destroy();
+      warn.mockRestore();
+    });
+
+    it('falls back to the Map moveend when the camera internals cannot be read', () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const map = new OpaqueV6Map(geographicToMap(TOKYO, 0), 4);
+      const before = map.listenerCount('moveend');
+      const camera = new BandCamera(map, { bands: EQUAL });
+      expect(map.listenerCount('moveend')).toBe(before + 1);
+
+      // A jump re-bases through that listener: the second converts from band 2/3, not band 0.
+      map.jumpTo({ zoom: 6.5 });
+      map.jumpTo({ zoom: 8 });
+      expectAt(map, TOKYO);
+
+      camera.destroy();
+      camera.destroy();
+      expect(map.listenerCount('moveend')).toBe(before);
       warn.mockRestore();
     });
   });
