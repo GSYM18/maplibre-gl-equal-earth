@@ -11,7 +11,8 @@
  * `transformCameraUpdate`'s requested-camera state stale.
  */
 
-import { MAP_SPACE_MAX_LATITUDE } from '../math/backproject.js';
+import { mapSpaceMaxLatitude } from '../math/backproject.js';
+import { bandIndexForZoom, validateBands, type Band } from './bands.js';
 import type { LngLatFactory } from './camera.js';
 
 /** Structural view of `maplibregl.LngLat`. */
@@ -51,6 +52,13 @@ export interface EqualEarthConstrainOptions {
    * @defaultValue 0
    */
   latitudeMargin?: number;
+  /**
+   * Zoom bands, for the adaptive projection. The world edge then depends on the band the
+   * requested zoom falls in, and the Mercator band (blend 1) is left unconstrained.
+   *
+   * @defaultValue a single Equal Earth band — the world edge at ≈ ±65.54° at every zoom
+   */
+  bands?: readonly Band[];
 }
 
 /**
@@ -71,12 +79,21 @@ export function createEqualEarthConstrain(
   const { lngLatFactory } = options;
   const isActive = options.isActive ?? (() => true);
   const margin = options.latitudeMargin ?? 0;
-  const limit = MAP_SPACE_MAX_LATITUDE + margin;
+  const bands = options.bands ?? [{ minZoom: 0, blend: 0 }];
+  validateBands(bands);
+  // Constrain runs on every camera change; the edge is a transcendental function of the
+  // blend, so compute it once per band.
+  const limits = bands.map((band) => mapSpaceMaxLatitude(band.blend) + margin);
 
   return (lngLat, zoom) => {
     if (!isActive()) {
       return { center: lngLat, zoom };
     }
+    const index = bandIndexForZoom(bands, zoom);
+    if (bands[index]!.blend === 1) {
+      return { center: lngLat, zoom };
+    }
+    const limit = limits[index]!;
     const clamped = lngLat.lat < -limit ? -limit : lngLat.lat > limit ? limit : lngLat.lat;
     if (clamped === lngLat.lat) {
       return { center: lngLat, zoom };
@@ -98,7 +115,7 @@ export function installEqualEarthConstrain(
   if (!host || typeof host.setTransformConstrain !== 'function') {
     throw new TypeError(
       'installEqualEarthConstrain requires a map exposing setTransformConstrain() ' +
-        '(maplibre-gl >= 6).',
+        '(maplibre-gl >= 5.24).',
     );
   }
   host.setTransformConstrain(createEqualEarthConstrain(options));
