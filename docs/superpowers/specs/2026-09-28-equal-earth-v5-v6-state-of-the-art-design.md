@@ -155,10 +155,15 @@ tile request           → eqearth://<config incl. t>/{z}/{x}/{y} → worker
 
 ## 4. Transition and camera
 
-**`BandCamera`** replaces `ThresholdCamera`. It keeps the edge-triggered design, the state
-seeded in the constructor, the chaining to the host's previous hook and the careful
-`destroy()`. It accepts a list of band boundaries instead of one `switchZoom`. On any update
-whose zoom falls in a different band from the previous update's zoom:
+**`BandCamera`** replaces `ThresholdCamera`. It converts relative to a *baseline* band: the
+band of the rendered zoom when MapLibre's requested camera state was created. That baseline
+is reset on the `moveend` that deletes the state. This is needed because every frame of a
+gesture or animation hands the hook the unconverted requested state, not its own previous
+output. On v6, only the Camera's own `moveend` deletes that state, so the baseline follows
+that event and not the Map's. It keeps the state seeded in the constructor, the chaining to
+the host's previous hook and the careful `destroy()`, and accepts a list of band boundaries
+instead of one `switchZoom`. On any update whose zoom falls in a different band from the
+baseline:
 
 ```
 geographic = mapToGeographic(centre, tOld)     // leave the old band's map space

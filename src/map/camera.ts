@@ -5,6 +5,12 @@
  * with a fixed blend between Equal Earth and Mercator. The camera centre is expressed in the
  * current band's map space, so it means something different on either side of every band
  * boundary and must be converted whenever the camera crosses one — otherwise the view jumps.
+ *
+ * MapLibre does not feed the hook its own previous output. Gestures and animations accumulate
+ * into a *requested* camera state, cloned from the rendered one and kept until the Camera's
+ * own `moveend`; every frame runs the hook on a copy of it and renders only the result. So
+ * within one move the hook keeps seeing an unconverted centre, in the map space of the band
+ * the move started in — see {@link BandCamera}.
  */
 
 import { geographicToMap, mapSpaceMaxLatitude, mapToGeographic } from '../math/backproject.js';
@@ -40,6 +46,12 @@ export type CameraUpdateFn = {
   bivarianceHack(next: CameraUpdate): CameraUpdateResult;
 }['bivarianceHack'];
 
+/** Something that emits `moveend`: a v5 `Map`, or the `Camera` inside a v6 `Map`. */
+export interface MoveEndEmitter {
+  on(type: 'moveend', listener: () => void): unknown;
+  off(type: 'moveend', listener: () => void): unknown;
+}
+
 /**
  * Minimal structural view of the bits of `Map` this module touches.
  *
@@ -48,7 +60,7 @@ export type CameraUpdateFn = {
  * assigning that property on a v6 map does nothing, and the hook can only be set through
  * `setTransformCameraUpdate()`. Both shapes are accepted — see {@link cameraHookAccess}.
  */
-export interface CameraHost {
+export interface CameraHost extends MoveEndEmitter {
   getZoom(): number;
   /** MapLibre v5, and test doubles: the hook is a plain property. */
   transformCameraUpdate?: CameraUpdateFn | null;
@@ -66,6 +78,11 @@ export interface CameraHookAccess {
   /** The installed hook; `undefined` when this MapLibre version offers no way to read it. */
   get(): CameraUpdateFn | null | undefined;
   set(hook: CameraUpdateFn | null): void;
+  /**
+   * The emitter whose `moveend` deletes MapLibre's requested camera state, i.e. the Camera
+   * itself; `undefined` when this MapLibre version offers no way to reach it.
+   */
+  readonly requestOwner: MoveEndEmitter | undefined;
 }
 
 type V6Host = CameraHost & { setTransformCameraUpdate(value: CameraUpdateFn | null): void };
@@ -81,15 +98,27 @@ function hasHookSetter(host: CameraHost): host is V6Host {
  * `_camera` the setter writes to, because without it an application's own hook could only
  * be silently replaced rather than chained. If a future release moves that field, `get()`
  * reports `undefined` ("unknown") rather than guessing.
+ *
+ * The same `_camera` is the v6 {@link CameraHookAccess.requestOwner}. The requested camera
+ * state is deleted only by the Camera's own `moveend` listener, and a v6 Camera's events
+ * bubble up to the Map but never down: a `moveend` the Map fires itself (a gesture ending
+ * without inertia, which includes every scroll zoom) leaves that state in place. On v5 the
+ * Map *is* the Camera, so every `moveend` deletes it.
  */
 export function cameraHookAccess(host: CameraHost): CameraHookAccess {
   if (hasHookSetter(host)) {
-    const internals = host as unknown as {
-      _camera?: { transformCameraUpdate?: CameraUpdateFn | null };
-    };
+    const camera = (
+      host as unknown as {
+        _camera?: Partial<MoveEndEmitter> & { transformCameraUpdate?: CameraUpdateFn | null };
+      }
+    )._camera;
     return {
-      get: () => (internals._camera ? (internals._camera.transformCameraUpdate ?? null) : undefined),
+      get: () => (camera ? (camera.transformCameraUpdate ?? null) : undefined),
       set: (hook) => host.setTransformCameraUpdate(hook),
+      requestOwner:
+        typeof camera?.on === 'function' && typeof camera.off === 'function'
+          ? (camera as MoveEndEmitter)
+          : undefined,
     };
   }
   return {
@@ -97,6 +126,7 @@ export function cameraHookAccess(host: CameraHost): CameraHookAccess {
     set: (hook) => {
       host.transformCameraUpdate = hook;
     },
+    requestOwner: host,
   };
 }
 
@@ -122,27 +152,35 @@ export interface ThresholdCameraOptions {
 }
 
 /**
- * Installs a `transformCameraUpdate` hook that converts the camera centre exactly once per
- * band crossing.
+ * Installs a `transformCameraUpdate` hook that keeps the geographic point under the camera
+ * centre fixed across band crossings.
  *
- * Two bugs in the original implementation motivate the design here, and both are covered
- * by tests in `tests/camera.test.ts`:
- *
- * - **Edge-triggered, not level-triggered.** The original compared against a zoom frozen at
- *   `movestart`, so "started below, now above" stayed true for every remaining frame of a
- *   gesture and re-converted an already-converted centre each frame. Here the comparison is
- *   against the band seen on the previous camera update.
+ * - **Relative to a baseline band.** Every frame of a move hands the hook the requested
+ *   state, whose centre is still in the map space of the band that state was created in: the
+ *   *baseline*. The hook converts from the baseline's blend to the blend of the frame's zoom
+ *   and is a pure function of the two, so the same requested state converts the same way on
+ *   every frame, and a move that crosses up and back down returns to the identity. The
+ *   baseline is reset from the rendered zoom on the `moveend` that deletes the requested
+ *   state, because the next one is cloned from what is rendered. On v6 that is the Camera's
+ *   own `moveend`, not the Map's — see {@link cameraHookAccess}.
  * - **State initialised in the constructor**, from the live camera, so an initial `flyTo`
  *   across a boundary is converted even before any interaction.
+ *
+ * Both are covered by `tests/band-camera.test.ts` and `tests/camera.test.ts`.
  */
 export class BandCamera {
+  readonly #host: CameraHost;
   readonly #access: CameraHookAccess;
+  readonly #moveEndSource: MoveEndEmitter;
   readonly #bands: readonly Band[];
   readonly #lngLatFactory: LngLatFactory;
   readonly #onConversionFailure: (reason: string, input: LngLatTuple) => void;
 
-  /** Band of the zoom observed on the previous camera update. Seeded from the live camera. */
-  #lastBand: number;
+  /**
+   * Band whose map space the requested camera state is in: the rendered band when that state
+   * was created. Seeded from the live camera, reset on the `moveend` that deletes the state.
+   */
+  #baseline: number;
 
   /** The host's own hook, chained rather than clobbered. */
   #previousHook: CameraUpdateFn | null;
@@ -150,8 +188,13 @@ export class BandCamera {
   #installed = false;
 
   constructor(host: CameraHost, options: BandCameraOptions) {
-    if (!host || typeof host.getZoom !== 'function') {
-      throw new TypeError('BandCamera requires a map-like host exposing getZoom().');
+    if (
+      !host ||
+      typeof host.getZoom !== 'function' ||
+      typeof host.on !== 'function' ||
+      typeof host.off !== 'function'
+    ) {
+      throw new TypeError('BandCamera requires a map-like host exposing getZoom(), on() and off().');
     }
     validateBands(options.bands);
 
@@ -166,17 +209,31 @@ export class BandCamera {
         );
       });
 
-    this.#lastBand = bandIndexForZoom(this.#bands, host.getZoom());
+    this.#host = host;
+    this.#baseline = bandIndexForZoom(this.#bands, host.getZoom());
     this.#access = cameraHookAccess(host);
 
     const previous = this.#access.get();
+    const owner = this.#access.requestOwner;
+    const consequences: string[] = [];
     if (previous === undefined) {
+      consequences.push(
+        'a transformCameraUpdate installed before the camera will be replaced, not chained',
+      );
+    }
+    if (owner === undefined) {
+      consequences.push('the view may jump when a gesture follows a scroll zoom');
+    }
+    if (consequences.length > 0) {
       console.warn(
-        '[equal-earth] Cannot read the existing transformCameraUpdate on this MapLibre ' +
-          'version; a hook installed before the camera will be replaced, not chained.',
+        '[equal-earth] Cannot reach the camera internals of this MapLibre version; ' +
+          `${consequences.join(', and ')}.`,
       );
     }
     this.#previousHook = previous ?? null;
+    // Without the Camera, the Map's `moveend` is the closest available approximation.
+    this.#moveEndSource = owner ?? host;
+    this.#moveEndSource.on('moveend', this.#onMoveEnd);
     this.#access.set(this.handleCameraUpdate);
     this.#installed = true;
   }
@@ -185,14 +242,15 @@ export class BandCamera {
     return this.#bands;
   }
 
-  /** Blend of the band the camera was in at the last update. */
+  /** Blend of the band the rendered camera is in. */
   get blend(): number {
-    return this.#bands[this.#lastBand]!.blend;
+    return this.#bands[bandIndexForZoom(this.#bands, this.#host.getZoom())]!.blend;
   }
 
   /**
    * The `transformCameraUpdate` implementation. Exposed for testing; MapLibre calls it
-   * once per camera change, including every frame of an animation or gesture.
+   * once per camera change, including every frame of an animation or gesture, each time with
+   * the requested state rather than with what this returned the time before.
    */
   readonly handleCameraUpdate: CameraUpdateFn = (next) => {
     // Chain to whatever the host had installed, so we cooperate with bbox constraints,
@@ -202,15 +260,13 @@ export class BandCamera {
     const upstreamZoom = upstream['zoom'];
     const zoom = typeof upstreamZoom === 'number' ? upstreamZoom : next.zoom;
 
-    const previous = this.#lastBand;
-    const current = bandIndexForZoom(this.#bands, zoom);
-    this.#lastBand = current;
+    // Deliberately no state change here: the baseline moves only on `moveend`, so every frame
+    // of a move converts its requested state the same way.
+    const fromBlend = this.#bands[this.#baseline]!.blend;
+    const toBlend = this.#bands[bandIndexForZoom(this.#bands, zoom)]!.blend;
 
-    const fromBlend = this.#bands[previous]!.blend;
-    const toBlend = this.#bands[current]!.blend;
-
-    // No crossing (or adjacent bands sharing a blend). Critically, this is the common case
-    // during a gesture that has already crossed — the original code re-converted here.
+    // Still in the baseline band (or one sharing its blend), including after a move crossed
+    // out and back: the requested centre is already in the right space.
     if (fromBlend === toBlend) return upstream;
 
     const source: LngLatTuple = [center.lng, center.lat];
@@ -220,8 +276,8 @@ export class BandCamera {
       wrapLongitude(center.lng),
       clampLatitude(center.lat, mapSpaceMaxLatitude(fromBlend)),
     ];
-    // One conversion straight from the old band to the new, however many bands a single
-    // update skipped — chaining through each would accumulate error.
+    // One conversion straight from the baseline band to the current one, however many bands
+    // lie between — chaining through each would accumulate error.
     const converted = geographicToMap(mapToGeographic(inWorld, fromBlend), toBlend);
 
     if (!Number.isFinite(converted[0]) || !Number.isFinite(converted[1])) {
@@ -232,15 +288,21 @@ export class BandCamera {
     return { ...upstream, center: this.#lngLatFactory(converted[0], converted[1]) };
   };
 
+  /** The requested state is gone; the next one is cloned from what is rendered. */
+  readonly #onMoveEnd = (): void => {
+    this.#baseline = bandIndexForZoom(this.#bands, this.#host.getZoom());
+  };
+
   /**
    * Uninstall. Restores the host's previous `transformCameraUpdate` rather than leaving
-   * it null, so a map that had its own hook keeps working.
+   * it null, so a map that had its own hook keeps working, and stops listening for `moveend`.
    *
    * Safe to call more than once.
    */
   destroy(): void {
     if (!this.#installed) return;
     this.#installed = false;
+    this.#moveEndSource.off('moveend', this.#onMoveEnd);
     // Only hand the hook back if it is still ours; if the application replaced it after we
     // installed, stomping on that would be worse than leaving it alone. When the host gives
     // no way to read the hook, restoring is the better guess.
