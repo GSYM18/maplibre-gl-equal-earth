@@ -78,6 +78,12 @@ of `geographicToMapWorld` against Web Mercator (scratch script, decomposed via 2
 A hard switch is acceptable in central Europe and clearly jarring across much of the world.
 The table is the baseline the transition spike (§4) must beat.
 
+**The camera hook moved in v6.** v6's `Map` no longer extends `Camera`; `transformCameraUpdate`
+lives on a private `map._camera` and is set through `map.setTransformCameraUpdate()`, with no
+public getter. Assigning `map.transformCameraUpdate` — what `ThresholdCamera` did — is a no-op
+on v6. Fixed in Plan 1 via `cameraHookAccess`, pinned by a compile-time test against both
+majors' `Map` types.
+
 **The Liberty style.** 111 layers: 1 background, 1 raster (`ne2_shaded`, maxzoom 6), 16 fill,
 67 line, 25 symbol, 1 fill-extrusion. Sources: `openmaptiles` (vector) and `ne2_shaded`
 (raster). The background, `#f8f4f0`, is the land colour; oceans come from the OMT `water`
@@ -123,7 +129,7 @@ are already loaded and are drawn overzoomed in the correct geometry.
 | `tiles/protocol.ts` | extend | `t` encoded in the source config; pole snapping (§5) during decode |
 | `tiles/tile-cover.ts` | extend | pre-image under `world_t`; relative `sourceZoomOffset` |
 | `tiles/cache.ts` | extend | persistent tier (§6) |
-| `map/camera.ts` | generalise | `ThresholdCamera` → `BandCamera` (§4) |
+| `map/camera.ts` | generalise | `ThresholdCamera` → `BandCamera` (§4); `cameraHookAccess` bridges v5's property and v6's setter |
 | `map/constrain.ts` | extend | world bounds per band |
 | `map/bands.ts` | new | pure: projection spec → band list |
 | `map/style-rewrite.ts` | new | pure: (style, bands, options) → rewritten style (sources, layer copies, prefetch layers, raster suppression, world polygon, outline, graticule) |
