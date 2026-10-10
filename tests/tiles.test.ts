@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
-import { geographicToMap, WORLD_Y_MAX, WORLD_Y_MIN } from '../src/math/backproject.js';
+import {
+  geographicToMap,
+  mapToGeographic,
+  WORLD_Y_MAX,
+  WORLD_Y_MIN,
+} from '../src/math/backproject.js';
 import { densify, toleranceForZoom } from '../src/math/subdivide.js';
 import {
   buildTile,
@@ -388,5 +393,77 @@ describe('blended warp in the tile pipeline', () => {
     ];
     const options = { tolerance: toleranceForZoom(4) };
     expect(densify(meridian, { ...options, blend: 2 / 3 })).not.toEqual(densify(meridian, options));
+  });
+});
+
+describe('geometry beyond the antimeridian', () => {
+  it('places a world-copy label once, at its real position', () => {
+    const layers: GeographicLayers = new Map([
+      [
+        'place',
+        [
+          {
+            type: 'Feature',
+            properties: { class: 'country', name: 'United Kingdom' },
+            geometry: {
+              type: 'MultiPoint',
+              coordinates: [
+                [-2.58, 54.72],
+                [357.42, 54.72],
+                [-362.58, 54.72],
+              ],
+            },
+          },
+        ],
+      ],
+    ]);
+    const out = buildTile(layers, { z: 0, x: 0, y: 0 }, { blend: 0 });
+    const layer = new VectorTile(new PbfReader(out)).layers['place']!;
+    const positions: number[][] = [];
+    for (let i = 0; i < layer.length; i++) {
+      const g = layer.feature(i).toGeoJSON(0, 0, 0).geometry;
+      if (g.type === 'Point') positions.push(g.coordinates);
+      else if (g.type === 'MultiPoint') positions.push(...g.coordinates);
+    }
+    expect(positions).toHaveLength(1);
+    const [lng, lat] = mapToGeographic([positions[0]![0]!, positions[0]![1]!], 0);
+    expect(Math.abs(lng - -2.58)).toBeLessThan(0.1);
+    expect(Math.abs(lat - 54.72)).toBeLessThan(0.1);
+  });
+
+  it('does not fold a polygon overhanging +180 back into the western half', () => {
+    const layers: GeographicLayers = new Map([
+      [
+        'water',
+        [
+          {
+            type: 'Feature',
+            properties: {},
+            geometry: {
+              type: 'Polygon',
+              coordinates: [
+                [
+                  [170, -10],
+                  [185.6, -10],
+                  [185.6, 10],
+                  [170, 10],
+                  [170, -10],
+                ],
+              ],
+            },
+          },
+        ],
+      ],
+    ]);
+    const out = buildTile(layers, { z: 0, x: 0, y: 0 }, { blend: 0 });
+    const layer = new VectorTile(new PbfReader(out)).layers['water']!;
+    const xs: number[] = [];
+    for (let i = 0; i < layer.length; i++) {
+      for (const ring of layer.feature(i).loadGeometry()) for (const p of ring) xs.push(p.x);
+    }
+    expect(xs.length).toBeGreaterThan(0);
+    // x <= 0 is geojson-vt's copy of the east-edge content into the (undrawn) western buffer;
+    // its clipped apex lands exactly on x = 0. Anything in (0, 2048) would be visible.
+    expect(xs.filter((x) => x > 0 && x < 2048)).toEqual([]);
   });
 });
