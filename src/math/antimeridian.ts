@@ -49,7 +49,7 @@ export function clipLineToWorld(line: Position[]): Position[][] {
     const b = line[i]!;
     const dx = b[0]! - a[0]!;
 
-    // Parametric extent [t0, t1] of the segment inside the band (Liang�Barsky, one axis).
+    // Parametric extent [t0, t1] of the segment inside the band (Liang-Barsky, one axis).
     let t0 = 0;
     let t1 = 1;
     if (dx === 0) {
@@ -81,6 +81,11 @@ export function clipLineToWorld(line: Position[]): Position[][] {
   }
   flush();
   return parts;
+}
+
+/** Clip several lines; returns the input unchanged when every line is already in range. */
+export function clipLinesToWorld(lines: Position[][]): Position[][] {
+  return lines.every((line) => line.every(inBand)) ? lines : lines.flatMap(clipLineToWorld);
 }
 
 /** Sutherland–Hodgman against one vertical half-plane, over an open vertex list. */
