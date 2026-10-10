@@ -22,6 +22,10 @@
  * HandlerManager fires a gesture's `moveend` on the *Map* when there is no inertia (v6 22022),
  * which always happens for scroll zoom (`noInertia: true`, v6 20979). That `moveend` never
  * reaches the Camera, so `R` survives into the next gesture.
+ *
+ * The HandlerManager takes `R` *before* calling `stop(true)` (v6 21867/21873, v5 67195/67202).
+ * When a gesture interrupts a running ease, `stop` fires the Camera's `moveend` and deletes
+ * `R`, yet that first frame still renders the detached `R` it took.
  */
 import type { CameraUpdate, CameraUpdateFn, CameraUpdateResult } from '../../src/map/camera.js';
 
@@ -75,8 +79,8 @@ const copy = (state: CameraState): CameraState => ({ center: { ...state.center }
 export class FakeCamera extends Emitter {
   /** `T`: what is rendered, and what `getZoom()` and `getCenter()` report. */
   transform: CameraState;
-  /** `R`: the requested state, or `undefined` between moves. */
-  requested: CameraState | undefined;
+  /** `R`: the requested state, absent between moves. Named as in MapLibre. */
+  _requestedCameraState?: CameraState;
   transformCameraUpdate: CameraUpdateFn | null = null;
 
   constructor(center: readonly [number, number], zoom: number) {
@@ -84,13 +88,13 @@ export class FakeCamera extends Emitter {
     this.transform = { center: { lng: center[0], lat: center[1] }, zoom };
     // v6 22072 / v5 67377: registered in the Camera constructor, so it runs first.
     this.on('moveend', () => {
-      this.requested = undefined;
+      delete this._requestedCameraState;
     });
   }
 
   getTransformForUpdate(): CameraState {
-    this.requested ??= copy(this.transform);
-    return this.requested;
+    this._requestedCameraState ??= copy(this.transform);
+    return this._requestedCameraState;
   }
 
   applyUpdatedTransform(requested: CameraState): void {
@@ -113,9 +117,29 @@ export interface Frame {
   panDelta?: readonly [number, number];
 }
 
+function applyTo(state: CameraState, frame: Frame): void {
+  if (frame.zoom !== undefined) state.zoom = frame.zoom;
+  if (frame.zoomDelta !== undefined) state.zoom += frame.zoomDelta;
+  if (frame.panDelta) {
+    state.center = {
+      lng: state.center.lng + frame.panDelta[0],
+      lat: state.center.lat + frame.panDelta[1],
+    };
+  }
+}
+
+/** A running `easeTo`/`flyTo`, including a double-click zoom. */
+export interface FakeEase {
+  /** One animation frame, applied to the `R` captured when the ease started (v6 22368). */
+  frame(frame: Frame): void;
+  /** Run to completion: `_afterEase` fires the Camera's `moveend` (v6 22478-22495). */
+  finish(): void;
+}
+
 /** Driving logic shared by the v5 and v6 shapes; they differ only in their event wiring. */
 export abstract class FakeMapBase {
   protected readonly camera: FakeCamera;
+  #ease: object | undefined;
 
   constructor(center: readonly [number, number], zoom: number) {
     this.camera = new FakeCamera(center, zoom);
@@ -133,24 +157,23 @@ export abstract class FakeMapBase {
 
   /** `R.center`, or `undefined` when there is no requested state. */
   get requestedCenter(): LngLat | undefined {
-    return this.camera.requested?.center;
+    return this.camera._requestedCameraState?.center;
   }
 
   getZoom(): number {
     return this.camera.transform.zoom;
   }
 
-  /** One gesture or animation frame: mutate `R`, then render it through the hook. */
+  /**
+   * One HandlerManager gesture frame, in its real order (v6 21865-21896, v5 67193-67202): take
+   * `R` with `getTransformForUpdate()`, *then* `stop(true)`, which ends a running ease and so
+   * fires the Camera's `moveend`, deleting `R`. The frame still applies its delta to the
+   * now-detached `R` it took, and renders that.
+   */
   applyFrame(frame: Frame): void {
     const requested = this.camera.getTransformForUpdate();
-    if (frame.zoom !== undefined) requested.zoom = frame.zoom;
-    if (frame.zoomDelta !== undefined) requested.zoom += frame.zoomDelta;
-    if (frame.panDelta) {
-      requested.center = {
-        lng: requested.center.lng + frame.panDelta[0],
-        lat: requested.center.lat + frame.panDelta[1],
-      };
-    }
+    this.#stop();
+    applyTo(requested, frame);
     this.camera.applyUpdatedTransform(requested);
   }
 
@@ -164,9 +187,41 @@ export abstract class FakeMapBase {
     else this.fireOnMap('moveend');
   }
 
-  /** `jumpTo`: one frame, then the Camera's own `moveend` (v6 22287). */
+  /** `jumpTo` (v6 22257): `stop()` first, then one frame, then the Camera's own `moveend`. */
   jumpTo(frame: Frame): void {
-    this.applyFrame(frame);
+    this.#stop();
+    const requested = this.camera.getTransformForUpdate();
+    applyTo(requested, frame);
+    this.camera.applyUpdatedTransform(requested);
+    this.camera.fire('moveend');
+  }
+
+  /** `easeTo`/`flyTo` (v6 22321-22330): `stop()` first, then capture `R` for every frame. */
+  easeTo(): FakeEase {
+    this.#stop();
+    const requested = this.camera.getTransformForUpdate();
+    const ease = {};
+    this.#ease = ease;
+    const assertRunning = () => {
+      if (this.#ease !== ease) throw new Error('This ease was stopped.');
+    };
+    return {
+      frame: (frame) => {
+        assertRunning();
+        applyTo(requested, frame);
+        this.camera.applyUpdatedTransform(requested);
+      },
+      finish: () => {
+        assertRunning();
+        this.#stop();
+      },
+    };
+  }
+
+  /** `Camera.stop()` (v6 22617): ending a running ease fires the Camera's `moveend`. */
+  #stop(): void {
+    if (this.#ease === undefined) return;
+    this.#ease = undefined;
     this.camera.fire('moveend');
   }
 
@@ -182,6 +237,11 @@ export class FakeV5Map extends FakeMapBase {
 
   set transformCameraUpdate(hook: CameraUpdateFn | null) {
     this.camera.transformCameraUpdate = hook;
+  }
+
+  /** On v5 the requested state lives on the Map, which is the Camera. */
+  get _requestedCameraState(): object | undefined {
+    return this.camera._requestedCameraState;
   }
 
   on(type: string, listener: Listener): this {

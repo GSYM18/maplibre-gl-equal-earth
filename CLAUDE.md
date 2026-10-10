@@ -116,6 +116,11 @@ mechanism, with line references:
   on the `moveend` that deletes `R`. On v6 that is only the **Camera's own** `moveend`
   (`host._camera`). A `moveend` the Map fires itself (a gesture ending without inertia, which
   includes every scroll zoom) does not bubble down, so `R` survives it.
+- **A gesture interrupting an ease.** The HandlerManager takes `R` *before* `stop(true)`, and
+  that `stop` fires the Camera's `moveend`, which deletes `R`. So the interrupting frame renders
+  a detached `R`, still in the space of the baseline the reset replaced. The hook spots this
+  because `_requestedCameraState` is absent at hook time, which otherwise never happens with
+  our hook installed. It converts that frame from the previous baseline.
 - **History.** The original compared against a zoom frozen at `movestart` and re-converted every
   frame (a Zürich pinch landed 24° off). The first rewrite compared against the previous frame's
   band, and so converted only on the crossing frame: the next frame rendered the unconverted `R`

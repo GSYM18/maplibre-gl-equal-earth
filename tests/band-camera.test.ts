@@ -7,6 +7,7 @@ import {
   FakeV5Map,
   FakeV6Map,
   OpaqueV6Map,
+  type FakeCamera,
   type FakeMapBase,
   type Frame,
 } from './support/fake-maplibre.js';
@@ -159,6 +160,51 @@ describe.each(SHAPES)('BandCamera on a MapLibre $shape-shaped host', ({ shape, c
       expect(Math.hypot(current[0] - previous[0], current[1] - previous[1])).toBeLessThan(1);
       previous = current;
     }
+  });
+
+  it.each([
+    // [name, ease zooms, interrupting scroll delta]: the second crosses z6 on that very frame.
+    ['a double-click zoom', [4.8, 5.1, 5.3], 0.1],
+    ['a flyTo', [4.0, 4.6, 5.2, 5.6, 5.9], 0.2],
+  ] as const)(
+    'holds the centre when a scroll then a drag interrupt %s that has crossed z5',
+    (_, easeZooms, scrollDelta) => {
+      const map = mapAt(create, GUADALAJARA, 4.6);
+      new BandCamera(map, { bands: EQUAL });
+
+      const ease = map.easeTo();
+      for (const zoom of easeZooms) {
+        ease.frame({ zoom });
+        expectGeographic(map, GUADALAJARA);
+      }
+
+      // The interrupting frame renders the `R` its own `stop()` just deleted.
+      expectHeldThrough(map, [{ zoomDelta: scrollDelta }], GUADALAJARA);
+      expect(map.requestedCenter).toBeUndefined();
+      expectHeldThrough(map, zoomFrames(0, 0.4, 0.1), GUADALAJARA);
+
+      // The drag: `R` was cloned from what the interrupting frame rendered, so it is in that
+      // frame's band. A drag there and back must land on Guadalajara again.
+      const draggedFrom = blendAt(map.zoom);
+      for (const panDelta of [[0.3, 0.2], [0.3, 0.2], [-0.3, -0.2], [-0.3, -0.2]] as const) {
+        map.applyFrame({ panDelta });
+        const requested = map.requestedCenter!;
+        const geographic = mapToGeographic([requested.lng, requested.lat], draggedFrom);
+        expectGeographic(map, geographic);
+      }
+      expectGeographic(map, GUADALAJARA);
+    },
+  );
+
+  it('holds the centre through a gesture after an ease that crossed z5 has finished', () => {
+    const map = mapAt(create, GUADALAJARA, 4.6);
+    new BandCamera(map, { bands: EQUAL });
+
+    const ease = map.easeTo();
+    for (const zoom of [4.8, 5.1, 5.3]) ease.frame({ zoom });
+    ease.finish();
+
+    expectHeldThrough(map, zoomFrames(5.3, 6.3, 0.2), GUADALAJARA);
   });
 
   it('stops listening for moveend on destroy, and destroys idempotently', () => {
@@ -318,6 +364,28 @@ describe('BandCamera', () => {
       camera.destroy();
 
       expect(map._camera.transformCameraUpdate).toBe(upstream);
+    });
+
+    it('still holds ordinary gestures when the requested state cannot be read', () => {
+      // As if MapLibre had renamed the field: it never reads as present, so the camera falls
+      // back to the moveend baseline alone.
+      class RenamedV6Map extends FakeV6Map {
+        override get _camera(): FakeCamera {
+          return new Proxy(super._camera, {
+            get: (target, key) => {
+              if (key === '_requestedCameraState') return undefined;
+              const value: unknown = Reflect.get(target, key);
+              return typeof value === 'function' ? (value.bind(target) as unknown) : value;
+            },
+          });
+        }
+      }
+      const map = new RenamedV6Map(geographicToMap(GUADALAJARA, 0), 4.6);
+      new BandCamera(map, { bands: EQUAL });
+
+      expectHeldThrough(map, zoomFrames(4.6, 5.4, 0.2), GUADALAJARA);
+      map.endGesture({ inertia: true });
+      expectHeldThrough(map, zoomFrames(5.4, 6.4, 0.2), GUADALAJARA);
     });
 
     it('warns once, and still installs, when the camera internals cannot be read', () => {
