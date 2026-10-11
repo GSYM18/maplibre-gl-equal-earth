@@ -18,7 +18,7 @@ import {
   clipPointsToWorld,
   clipPolygonToWorld,
 } from '../math/antimeridian.js';
-import { geographicToMap } from '../math/backproject.js';
+import { geographicToMap, MERCATOR_MAX_LATITUDE } from '../math/backproject.js';
 import type { LngLatTuple } from '../math/equal-earth.js';
 import { densify, TILE_EXTENT, toleranceForZoom } from '../math/subdivide.js';
 import { clipFeatureToTile, type TileFeature } from './clip.js';
@@ -42,6 +42,27 @@ export interface WarpTileOptions {
   layers?: readonly string[];
   /** Blend of the zoom band this tile is built for: 0 Equal Earth … 1 Mercator. @defaultValue 0 */
   blend?: number;
+}
+
+/** Tolerance, in degrees, when matching a decoded vertex to Mercator's latitude limit. */
+export const POLE_SNAP_EPSILON = 1e-9;
+
+/**
+ * Snap polygon positions on Mercator's edge (±85.0511°) to the pole. Mercator data ends there,
+ * while Equal Earth shows ±90°; unfixed, the world polygon's land colour would show above the
+ * Arctic Ocean. Lines and points are deliberately not snapped: a road or label at 85° is real
+ * data, only area fills must close the gap. Mutates the freshly decoded arrays.
+ */
+function snapPolygonToPoles(geometry: GeoJSON.Geometry): void {
+  const snapRing = (ring: GeoJSON.Position[]): void => {
+    for (const position of ring) {
+      const lat = position[1]!;
+      if (lat >= MERCATOR_MAX_LATITUDE - POLE_SNAP_EPSILON) position[1] = 90;
+      else if (lat <= -(MERCATOR_MAX_LATITUDE - POLE_SNAP_EPSILON)) position[1] = -90;
+    }
+  };
+  if (geometry.type === 'Polygon') geometry.coordinates.forEach(snapRing);
+  else if (geometry.type === 'MultiPolygon') for (const polygon of geometry.coordinates) polygon.forEach(snapRing);
 }
 
 /** One decoded source tile: GeoJSON features in true geographic coordinates, by layer. */
@@ -70,7 +91,9 @@ export function decodeToGeographic(
 
     const features: GeoJSON.Feature[] = [];
     for (let i = 0; i < layer.length; i++) {
-      features.push(layer.feature(i).toGeoJSON(tile.x, tile.y, tile.z));
+      const feature = layer.feature(i).toGeoJSON(tile.x, tile.y, tile.z);
+      snapPolygonToPoles(feature.geometry);
+      features.push(feature);
     }
     if (features.length > 0) result.set(name, features);
   }

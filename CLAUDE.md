@@ -310,7 +310,11 @@ mind before "optimising" anything here.
 Known artifact, not yet addressed: source tiles are clipped upstream, so a polygon spanning
 several source tiles arrives as several pieces. After warping, the pieces meet exactly (the
 shared edge derives from the same geographic tile boundary and `densify` is deterministic),
-but hairline seams in fills are still possible.
+but hairline seams in fills were a risk. `tests/browser/cartography.spec.ts` measures it
+(40×40 points inside fixture land box 1, which straddles four source tiles, at z2/z3/z4, dpr 1
+and 2, MapLibre 5.24 and 6.6): 0 background-coloured pixels everywhere (1360/512/128 points
+sampled per zoom), so `fill-antialias: false` is not applied. Polygon vertices on Mercator's
+edge are snapped to ±90° in `decodeToGeographic`.
 
 ## Planned work
 

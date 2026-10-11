@@ -45,6 +45,7 @@ import type { CompensationMode } from '../math/jacobian.js';
 import {
   EQUAL_EARTH_BANDS,
   bandIndexForZoom,
+  parseRange,
   resolveTransition,
   type Band,
   type ResolvedTransition,
@@ -135,6 +136,22 @@ interface Installed {
 
 /** The name of the error an activation rejects with when a later call superseded it. */
 export const SUPERSEDED_ERROR_NAME = 'EqualEarthSupersededError';
+
+const UNWARPED_TYPES: ReadonlySet<string> = new Set(['raster', 'hillshade', 'color-relief']);
+let reliefAnnounced = false;
+
+/**
+ * Raster, hillshade and color-relief layers are not warped (spec §1): they are shown in the
+ * Mercator band only. Say so once per page, so the missing basemap is not mistaken for a bug.
+ */
+function announceUnwarpedRelief(original: StyleLike, transition: ResolvedTransition | null): void {
+  if (reliefAnnounced || !original.layers.some((layer) => UNWARPED_TYPES.has(layer.type))) return;
+  reliefAnnounced = true;
+  const where = transition
+    ? `they are shown only in the Mercator band (from z${parseRange(transition, transition.steps)[0].toFixed(1)}), and hidden under pure Equal Earth.`
+    : 'they are hidden under pure Equal Earth.';
+  console.info(`[equal-earth] raster, hillshade and color-relief layers are not warped: ${where}`);
+}
 
 function superseded(): Error {
   const error = new Error('Equal Earth: activation superseded');
@@ -593,6 +610,7 @@ export class EqualEarthController {
     // offsets, since the hook now runs with the baseline the camera was constructed with.
     const center = geographicToMap(view.geographic, bands[initialBand]!.blend);
     host.jumpTo({ center: lngLatFactory(center[0], center[1]), zoom: view.zoom, bearing: view.bearing });
+    announceUnwarpedRelief(original, transition);
     return true;
   }
 
