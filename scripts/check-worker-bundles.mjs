@@ -85,9 +85,24 @@ if (esm !== null) {
   if (!registeredScheme(calls)) failures.push(`worker.mjs: did not register ${SCHEME}.`);
 }
 
+// Ruling P15: the main bundle must reference each worker with the literal
+// `new URL("./worker…", import.meta.url)`, the only form application bundlers emit as an asset
+// (see the strip plugin in vite.config.ts).
+const index = read('index.js');
+if (index !== null) {
+  for (const file of ['./worker.mjs', './worker.iife.js']) {
+    const literal = `new URL(${JSON.stringify(file)}, import.meta.url)`;
+    if (!index.includes(literal)) failures.push(`index.js: missing the literal \`${literal}\`.`);
+  }
+  if (index.includes('@vite-ignore')) failures.push('index.js: a @vite-ignore hint reached the bundle.');
+}
+
 if (failures.length > 0) {
   console.error(`check-worker-bundles:\n  ${failures.join('\n  ')}`);
   process.exit(1);
 }
 
-console.log('check-worker-bundles: worker.mjs and worker.iife.js are self-contained and register eqearth.');
+console.log(
+  'check-worker-bundles: worker.mjs and worker.iife.js are self-contained and register eqearth; ' +
+    'index.js references both with literal new URL(…, import.meta.url).',
+);

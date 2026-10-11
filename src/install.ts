@@ -94,12 +94,14 @@ export async function installEqualEarth(
   }
 
   // v6 loads worker scripts with `import()`, v5 with `importScripts`: each needs its own bundle.
-  // Literal `new URL(…, import.meta.url)` in each branch, so bundlers emit the files (P15).
+  // Literal `new URL(…, import.meta.url)` in each branch, so the application's bundler emits
+  // the files (P15). `@vite-ignore` only stops *our* library build from rewriting the second
+  // argument (the files do not exist yet when it runs); `check-worker-bundles.mjs` guards it.
   const workerUrl =
     options.workerUrl ??
     (major >= 6
-      ? new URL('./worker.mjs', import.meta.url)
-      : new URL('./worker.iife.js', import.meta.url));
+      ? new URL(/* @vite-ignore */ './worker.mjs', import.meta.url)
+      : new URL(/* @vite-ignore */ './worker.iife.js', import.meta.url));
   let workerPath: EqualEarthInstall['workerPath'] = 'worker';
   try {
     await maplibregl.importScriptInWorkers(String(workerUrl));
