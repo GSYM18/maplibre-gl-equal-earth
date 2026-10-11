@@ -159,7 +159,11 @@ export class RequestCoalescer<T> {
     return this.#inFlight.size;
   }
 
-  async run(key: string, task: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
+  async run(
+    key: string,
+    task: (signal: AbortSignal) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
     signal?.throwIfAborted();
 
     let entry = this.#inFlight.get(key);

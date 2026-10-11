@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Equal Earth for MapLibre GL JS — adaptive transition</title>
+    <style>
+      .panel {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        z-index: 1;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        align-items: flex-start;
+        font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color: #e8eef5;
+        /* The panel box must not swallow map gestures; only its controls take the pointer. */
+        pointer-events: none;
+      }
+      .panel button,
+      .panel pre {
+        pointer-events: auto;
+      }
+      .panel button {
+        font: inherit;
+        padding: 6px 10px;
+        border: 1px solid #3d7ea6;
+        border-radius: 4px;
+        background: #12202f;
+        color: #e8eef5;
+        cursor: pointer;
+      }
+      .panel #cities,
+      .panel #controls {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+      .panel pre {
+        margin: 0;
+        padding: 8px 10px;
+        max-width: min(640px, calc(100vw - 48px));
+        max-height: 35vh;
+        overflow: auto;
+        border-radius: 4px;
+        background: rgb(9 18 28 / 85%);
+        white-space: pre;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="map"></div>
+    <div class="panel">
+      <div id="cities"></div>
+      <div id="controls"></div>
+      <pre id="readout">loading…</pre>
+    </div>
+    <script type="module" src="./transition.ts"></script>
+  </body>
+</html>

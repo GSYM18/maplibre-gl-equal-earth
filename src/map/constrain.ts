@@ -149,7 +149,8 @@ export function createEqualEarthConstrain(
     if (!isActive()) return base;
     // The band drawn, or else the band of the zoom the fallback settled on, since that is what
     // will be rendered.
-    let limit = limits[currentBand ? currentBand() : bandIndexForZoom(bands, base.zoom)] ?? Infinity;
+    const band = currentBand ? currentBand() : bandIndexForZoom(bands, base.zoom);
+    let limit = limits[band] ?? Infinity;
     const baseline = baselineBand?.();
     if (baseline !== undefined) limit = Math.max(limit, limits[baseline] ?? -Infinity);
     if (limit === Infinity) return base;
