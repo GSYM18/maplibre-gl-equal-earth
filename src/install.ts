@@ -12,7 +12,13 @@
  * `maplibre-gl` and works with whichever major (5.24+ or 6) the application loaded.
  */
 
-import { EqualEarthController, type ControllerHost, type ControllerOptions } from './map/controller.js';
+import {
+  EqualEarthController,
+  SUPERSEDED_ERROR_NAME,
+  reportError,
+  type ControllerHost,
+  type ControllerOptions,
+} from './map/controller.js';
 import type { Transition } from './map/bands.js';
 import type { CompensationMode } from './math/jacobian.js';
 import { PROTOCOL_SCHEME, createEqualEarthProtocol } from './tiles/protocol.js';
@@ -88,8 +94,12 @@ export async function installEqualEarth(
   }
 
   // v6 loads worker scripts with `import()`, v5 with `importScripts`: each needs its own bundle.
-  const workerFile = major >= 6 ? './worker.mjs' : './worker.iife.js';
-  const workerUrl = options.workerUrl ?? new URL(workerFile, import.meta.url);
+  // Literal `new URL(…, import.meta.url)` in each branch, so bundlers emit the files (P15).
+  const workerUrl =
+    options.workerUrl ??
+    (major >= 6
+      ? new URL('./worker.mjs', import.meta.url)
+      : new URL('./worker.iife.js', import.meta.url));
   let workerPath: EqualEarthInstall['workerPath'] = 'worker';
   try {
     await maplibregl.importScriptInWorkers(String(workerUrl));
@@ -117,16 +127,26 @@ export async function installEqualEarth(
   const controllerFor = (map: ControllerHost): EqualEarthController => {
     let controller = controllers.get(map);
     if (!controller) {
-      controller = new EqualEarthController(map, controllerOptions);
-      controllers.set(map, controller);
-      live.add(controller);
+      const created = new EqualEarthController(map, controllerOptions);
+      controller = created;
+      controllers.set(map, created);
+      live.add(created);
+      // A removed map must not be kept alive, nor have its style restored on `uninstall`.
+      if (typeof map.once === 'function') {
+        map.once('remove', () => {
+          controllers.delete(map);
+          live.delete(created);
+          created.dispose();
+        });
+      }
     }
     return controller;
   };
 
   const report = (map: ControllerHost, error: unknown): void => {
-    if (typeof map.fire === 'function') map.fire({ type: 'error', error });
-    else console.error(error);
+    // A later setProjection overtook this one: not an error the application needs to see.
+    if (error instanceof Error && error.name === SUPERSEDED_ERROR_NAME) return;
+    reportError(map, error);
   };
 
   const proto = maplibregl.Map.prototype;
@@ -136,12 +156,21 @@ export async function installEqualEarth(
   // eslint-disable-next-line @typescript-eslint/unbound-method
   const originalGet = proto.getProjection;
 
+  /** MapLibre's own `getProjection`, which throws on a map without a style. */
+  const currentType = (map: ControllerHost): unknown => {
+    try {
+      return (originalGet.call(map) as { type?: unknown } | null | undefined)?.type;
+    } catch {
+      return undefined;
+    }
+  };
+
   const setProjection = function (this: ControllerHost, projection: unknown): unknown {
     const type = (projection as { type?: unknown } | null | undefined)?.type;
     if (typeof type === 'string' && EQUAL_EARTH_TYPES.has(type)) {
       // Equal Earth is drawn by the Mercator renderer; under globe the warped coordinates would
       // render as a distorted sphere.
-      const current = (originalGet.call(this) as { type?: unknown } | null | undefined)?.type;
+      const current = currentType(this);
       if (current !== undefined && current !== 'mercator') {
         originalSet.call(this, { type: 'mercator' });
       }

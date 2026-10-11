@@ -209,4 +209,140 @@ describe('EqualEarthController', () => {
     expect(host.worldCopies).toBe(true);
     await expect(controller.activate('equal')).rejects.toThrow(/destroyed/);
   });
+
+  describe('style events (I2)', () => {
+    it("detaches inside an application's diffed setStyle: no frame reads sources or writes paint before the re-apply", async () => {
+      const { host, controller } = setup();
+      await controller.activate('equal');
+      host.loaded.add('openmaptiles__b2');
+      const replacement = liberty();
+      replacement.layers = replacement.layers.slice(0, 10);
+      const checks = host.sourceChecks.length;
+      const writes = host.writes.length;
+      host.setStyle(replacement, { diff: true }); // style.load fires inside the call
+      host.applyFrame({ zoomDelta: 0.4 }); // the next frame, before the re-apply has finished
+      expect(host.sourceChecks).toHaveLength(checks);
+      expect(host.writes).toHaveLength(writes);
+      await vi.waitFor(() => expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeDefined());
+      expect(controller.active).toBe(true);
+    });
+
+    it('detaches on the styledataloading of a full rebuild, and re-applies on its style.load', async () => {
+      const { host, controller } = setup();
+      await controller.activate('equal');
+      host.loaded.add('openmaptiles__b2');
+      host.deferStyleData = true;
+      const replacement = liberty();
+      replacement.layers = replacement.layers.slice(0, 10);
+      host.setStyle(replacement, { diff: false });
+      expect(host._camera.transformCameraUpdate).toBeNull();
+      const writes = host.writes.length;
+      host.applyFrame({ zoomDelta: 0.4 }); // the style is unloaded: setPaintProperty would throw
+      expect(host.writes).toHaveLength(writes);
+      host.deferStyleData = false;
+      host.flushStyleData();
+      await vi.waitFor(() => expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeDefined());
+      await controller.deactivate();
+      expect(host.style!.layers).toHaveLength(10);
+    });
+
+    it('does not read the style on styledata (an app animating a paint property)', async () => {
+      const { host, controller } = setup();
+      await controller.activate('equal');
+      const reads = host.getStyleCalls;
+      for (let i = 0; i < 5; i++) host.fireMapEvent('styledata');
+      expect(host.getStyleCalls).toBe(reads);
+      expect(controller.active).toBe(true);
+    });
+
+    it('turns off and reports when a re-apply fails (I1)', async () => {
+      const host = new FakeControllerHost(TOKYO, 4.6);
+      host.style = liberty();
+      const fetchJson = vi.fn(async (url: string) => {
+        if (url.includes('offline')) throw new Error('offline');
+        return TILEJSON;
+      });
+      const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+      await controller.activate('equal');
+      host.on('error', () => {});
+      const replacement = liberty();
+      replacement.sources['openmaptiles']!['url'] = 'https://offline.example/planet';
+      host.setStyle(replacement, {});
+      await vi.waitFor(() => expect(controller.active).toBe(false));
+      expect(host.errors).toEqual([expect.objectContaining({ message: expect.stringMatching(/openmaptiles.*offline/) as unknown })]);
+      expect(host.worldCopies).toBe(true);
+      expect(host.center.lat).toBeCloseTo(TOKYO[1], 9);
+    });
+  });
+
+  it('starts again from a style the application set during the TileJSON fetch (I3)', async () => {
+    const host = new FakeControllerHost(TOKYO, 4.6);
+    host.style = liberty();
+    let release!: (json: unknown) => void;
+    const fetchJson = vi.fn(() => new Promise<unknown>((resolve) => { release = resolve; }));
+    const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+    const pending = controller.activate('equal');
+    await vi.waitFor(() => expect(fetchJson).toHaveBeenCalledOnce());
+    const replacement = liberty();
+    replacement.layers = replacement.layers.slice(0, 10);
+    host.setStyle(replacement, {});
+    release(TILEJSON);
+    await pending;
+    expect(host.style.layers.length).toBeGreaterThan(10);
+    await controller.deactivate();
+    expect(host.style.layers).toHaveLength(10);
+  });
+
+  it("draws with MapLibre's Mercator under a globe style, and restores the globe (I4)", async () => {
+    const globe = liberty();
+    globe['projection'] = { type: 'globe' };
+    const { host, controller } = setup(4.6, globe);
+    await controller.activate('equal');
+    expect(host.style!['projection']).toEqual({ type: 'mercator' });
+    await controller.deactivate();
+    expect(host.style!['projection']).toEqual({ type: 'globe' });
+  });
+
+  describe('source fields (P14)', () => {
+    it('carries the TileJSON attribution and minzoom, and the source promoteId, onto band sources', async () => {
+      const style = liberty();
+      style.sources['openmaptiles']!['promoteId'] = 'osm_id';
+      const host = new FakeControllerHost(TOKYO, 4.6);
+      host.style = style;
+      const fetchJson = async () => ({ ...TILEJSON, minzoom: 0, attribution: '© OpenMapTiles © OpenStreetMap contributors' });
+      await new EqualEarthController(host, { lngLatFactory, fetchJson }).activate('equal');
+      expect(host.style.sources['openmaptiles__b1']).toMatchObject({
+        attribution: '© OpenMapTiles © OpenStreetMap contributors',
+        minzoom: 0,
+        promoteId: 'osm_id',
+      });
+    });
+
+    it('rejects a TMS source, inline or from its TileJSON, leaving the map untouched', async () => {
+      const style = liberty();
+      style.sources['openmaptiles']!['scheme'] = 'tms';
+      const { host, controller } = setup(4.6, style);
+      await expect(controller.activate('equal')).rejects.toThrow('Equal Earth: TMS tile schemes are not supported yet (source "openmaptiles").');
+      expect(host.setStyleCalls).toHaveLength(0);
+      const other = new FakeControllerHost(TOKYO, 4.6);
+      other.style = liberty();
+      const fromJson = new EqualEarthController(other, { lngLatFactory, fetchJson: async () => ({ ...TILEJSON, scheme: 'tms' }) });
+      await expect(fromJson.activate('equal')).rejects.toThrow(/TMS/);
+    });
+
+    it('formats an inline source without tiles like an unresolvable TileJSON (M8)', async () => {
+      const style = liberty();
+      style.sources['openmaptiles'] = { type: 'vector', tiles: [] };
+      const { controller } = setup(4.6, style);
+      await expect(controller.activate('equal')).rejects.toThrow('Equal Earth: could not resolve TileJSON for source "openmaptiles": the source lists no tiles');
+    });
+  });
+
+  it('rejects an activation that a deactivate superseded (M3)', async () => {
+    const { controller } = setup();
+    const pending = controller.activate('equal');
+    await controller.deactivate();
+    await expect(pending).rejects.toMatchObject({ name: 'EqualEarthSupersededError', message: 'Equal Earth: activation superseded' });
+    expect(controller.active).toBe(false);
+  });
 });

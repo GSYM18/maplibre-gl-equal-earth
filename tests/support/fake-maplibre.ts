@@ -552,12 +552,20 @@ export type ControllerJump = Omit<Frame, 'center'> & { center?: readonly [number
 
 /**
  * A v6 map with the style machinery the controller drives: `getStyle`/`setStyle`, the
- * switcher's paint and readiness surface, world copies, and `render` after every camera frame.
+ * switcher's paint and readiness surface, world copies, and a render after every camera frame.
  *
- * `setStyle` fires `styledata` synchronously, as MapLibre's diff path does (`Style.setState`
- * fires its load event inside the call, v6 14482-14498). With `deferStyleData` it models the
- * full rebuild instead (`_updateStyle`, v6 24842): until {@link flushStyleData} the style is
- * not loaded, `getStyle()` throws, and no `styledata` has fired.
+ * The style events follow MapLibre (v6 `src/`):
+ *
+ * - **Diff path** (the default): `setStyle` swaps the style synchronously and fires `style.load`
+ *   inside the call (`Style.setState`, `style/style.ts:870`). `styledata` comes only from
+ *   `Style.update` on the next render (`style.ts:784`), which `_render` runs *after* the camera
+ *   frames (`ui/map.ts:4250` before `4279`).
+ * - **Full rebuild** (`deferStyleData`): `setStyle` fires `styledataloading` synchronously
+ *   (`Style.loadJSON`, `style.ts:452`) and the style is not loaded (`getStyle()` throws) until
+ *   {@link flushStyleData}, which fires `styledata` and then `style.load` (`Style._load`, 499-500).
+ *
+ * A render ({@link render}, and after every `applyFrame`, `jumpTo` and ease frame) fires a pending
+ * `styledata`, then `render`.
  */
 export class FakeControllerHost extends FakeV6Map {
   /** The loaded style; `undefined` while none is (then `getStyle()` throws). */
@@ -566,12 +574,17 @@ export class FakeControllerHost extends FakeV6Map {
   /** Model the full-rebuild path: the next `setStyle` loads only on {@link flushStyleData}. */
   deferStyleData = false;
   #pendingStyle: StyleLike | undefined;
+  /** A style change awaits the next render's `Style.update`, which fires `styledata`. */
+  #styleChanged = false;
+  /** `getStyle()` calls: each is a full serialisation on a real map. */
+  getStyleCalls = 0;
   readonly loaded = new Set<string>();
   /** Every `isSourceLoaded` call's source id, in order. */
   readonly sourceChecks: string[] = [];
   readonly paint: Record<string, Record<string, unknown>> = {};
   readonly layout: Record<string, Record<string, unknown>> = {};
   readonly writes: { kind: 'paint' | 'layout'; layerId: string; name: string; value: unknown }[] = [];
+  /** Error events fired while something listened for `error`. */
   readonly errors: unknown[] = [];
   worldCopies = true;
   moving = false;
@@ -587,6 +600,7 @@ export class FakeControllerHost extends FakeV6Map {
   }
 
   getStyle(): StyleLike {
+    this.getStyleCalls++;
     if (!this.style) throw new Error('Style is not done loading.');
     return structuredClone(this.style);
   }
@@ -596,19 +610,31 @@ export class FakeControllerHost extends FakeV6Map {
     if (this.deferStyleData) {
       this.#pendingStyle = structuredClone(style);
       this.style = undefined;
+      this.fireMapEvent('styledataloading');
       return this;
     }
     this.style = structuredClone(style);
-    this.fireMapEvent('styledata');
+    this.#styleChanged = true;
+    this.fireMapEvent('style.load');
     return this;
   }
 
-  /** Finish a deferred `setStyle`: the style loads and `styledata` fires. */
+  /** Finish a deferred `setStyle`: the style loads, `styledata` and `style.load` fire. */
   flushStyleData(): void {
     if (!this.#pendingStyle) throw new Error('No deferred setStyle to flush.');
     this.style = this.#pendingStyle;
     this.#pendingStyle = undefined;
     this.fireMapEvent('styledata');
+    this.fireMapEvent('style.load');
+  }
+
+  /** One render: `Style.update` fires a pending `styledata`, then the Map fires `render`. */
+  render(): void {
+    if (this.#styleChanged) {
+      this.#styleChanged = false;
+      this.fireMapEvent('styledata');
+    }
+    this.fireMapEvent('render');
   }
 
   once(type: string, listener: () => void): this {
@@ -617,6 +643,10 @@ export class FakeControllerHost extends FakeV6Map {
       listener();
     };
     return this.on(type, once);
+  }
+
+  listens(type: string): boolean {
+    return this.listenerCount(type) > 0;
   }
 
   getCenter(): LngLat {
@@ -653,34 +683,35 @@ export class FakeControllerHost extends FakeV6Map {
     return this;
   }
 
+  /** As `Evented.fire`: delivered only if something listens (the payload is recorded). */
   fire(event: { type: string; error?: unknown }): this {
-    if (event.type === 'error') this.errors.push(event.error);
+    if (event.type === 'error' && this.listens('error')) this.errors.push(event.error);
     return this;
   }
 
-  /** A gesture frame, then the `render` a real map draws after it. */
+  /** A gesture frame, then a render. */
   override applyFrame(frame: Frame): void {
     super.applyFrame(frame);
-    this.fireMapEvent('render');
+    this.render();
   }
 
-  /** `jumpTo` with a `LngLat`-like or tuple centre, then a `render`. */
+  /** `jumpTo` with a `LngLat`-like or tuple centre, then a render. */
   override jumpTo(options: ControllerJump): void {
     this.jumps++;
     const { center, ...rest } = options;
     const frame: Frame = { ...rest };
     if (center) frame.center = 'lng' in center ? [center.lng, center.lat] : center;
     super.jumpTo(frame);
-    this.fireMapEvent('render');
+    this.render();
   }
 
-  /** `easeTo`, whose every frame is followed by a `render`. */
+  /** `easeTo`, whose every frame is followed by a render. */
   override easeTo(options?: { zooming?: boolean }): FakeEase {
     const ease = super.easeTo(options);
     return {
       frame: (frame) => {
         ease.frame(frame);
-        this.fireMapEvent('render');
+        this.render();
       },
       finish: () => ease.finish(),
     };

@@ -1,7 +1,9 @@
-/* eslint-disable @typescript-eslint/unbound-method -- prototype methods are compared by identity */
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 
 import { installEqualEarth, parseVersion } from '../src/install.js';
+import type { StyleLike } from '../src/map/style-rewrite.js';
+import { FakeControllerHost } from './support/fake-maplibre.js';
 
 function fakeModule(version = '6.6.0', importResult: Promise<unknown> = Promise.resolve()) {
   class FakeMap {
@@ -47,17 +49,20 @@ describe('installEqualEarth', () => {
 
   it("raises the worker count from MapLibre's default of 1, but respects an app's own setting", async () => {
     vi.stubGlobal('navigator', { hardwareConcurrency: 12 });
-    const a = fakeModule();
-    await installEqualEarth(a.module);
-    expect(a.module.setWorkerCount).toHaveBeenCalledWith(4);
-    const b = fakeModule();
-    b.module.getWorkerCount.mockReturnValue(3);
-    await installEqualEarth(b.module);
-    expect(b.module.setWorkerCount).not.toHaveBeenCalled();
-    const c = fakeModule();
-    await installEqualEarth(c.module, { workers: false });
-    expect(c.module.setWorkerCount).not.toHaveBeenCalled();
-    vi.unstubAllGlobals();
+    try {
+      const a = fakeModule();
+      await installEqualEarth(a.module);
+      expect(a.module.setWorkerCount).toHaveBeenCalledWith(4);
+      const b = fakeModule();
+      b.module.getWorkerCount.mockReturnValue(3);
+      await installEqualEarth(b.module);
+      expect(b.module.setWorkerCount).not.toHaveBeenCalled();
+      const c = fakeModule();
+      await installEqualEarth(c.module, { workers: false });
+      expect(c.module.setWorkerCount).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('falls back to a main-thread protocol when the worker script fails to load', async () => {
@@ -72,23 +77,28 @@ describe('installEqualEarth', () => {
 
   it('polyfills setProjection/getProjection on the prototype and restores them on uninstall', async () => {
     const { module, FakeMap } = fakeModule();
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- compared by identity
     const originalSet = FakeMap.prototype.setProjection;
     const install = await installEqualEarth(module);
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- compared by identity
     expect(FakeMap.prototype.setProjection).not.toBe(originalSet);
     const map = new FakeMap();
     // A plain Mercator projection passes straight through.
     map.setProjection({ type: 'mercator' });
     expect(map.getProjection()).toEqual({ type: 'mercator' });
     install.uninstall();
+    // eslint-disable-next-line @typescript-eslint/unbound-method -- compared by identity
     expect(FakeMap.prototype.setProjection).toBe(originalSet);
   });
 
-  it('routes the Equal Earth types to the controller and reports a failed activation on the map', async () => {
+  it('routes the Equal Earth types to the controller and fires a failed activation to error listeners (I1)', async () => {
     const { module, FakeMap } = fakeModule();
     const install = await installEqualEarth(module);
-    const map = new FakeMap() as InstanceType<typeof FakeMap> & { fire: (event: { type: string; error: unknown }) => void };
     const fired: { type: string; error: unknown }[] = [];
-    map.fire = (event) => { fired.push(event); };
+    const map = Object.assign(new FakeMap(), {
+      listens: (type: string) => type === 'error',
+      fire: (event: { type: string; error: unknown }) => { fired.push(event); },
+    });
     const controller = install.controllerFor(map as never);
     const activate = vi.spyOn(controller, 'activate').mockRejectedValue(new Error('boom'));
     expect(map.setProjection({ type: 'equal' })).toBe(map);
@@ -97,5 +107,55 @@ describe('installEqualEarth', () => {
     await vi.waitFor(() => expect(fired).toHaveLength(1));
     expect(fired[0]).toMatchObject({ type: 'error', error: new Error('boom') });
     install.uninstall();
+  });
+
+  it("logs a failed activation when nothing listens for errors, as MapLibre's Evented would not (I1)", async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { module, FakeMap } = fakeModule();
+      const install = await installEqualEarth(module);
+      const fire = vi.fn();
+      const map = Object.assign(new FakeMap(), { listens: () => false, fire });
+      vi.spyOn(install.controllerFor(map as never), 'activate').mockRejectedValue(new Error('offline'));
+      map.setProjection({ type: 'equal' });
+      await vi.waitFor(() => expect(error).toHaveBeenCalledWith(new Error('offline')));
+      expect(fire).not.toHaveBeenCalled();
+      install.uninstall();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it('does not report an activation a later setProjection superseded (M3)', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { module, FakeMap } = fakeModule();
+      const install = await installEqualEarth(module);
+      const map = new FakeMap();
+      const superseded = Object.assign(new Error('Equal Earth: activation superseded'), { name: 'EqualEarthSupersededError' });
+      vi.spyOn(install.controllerFor(map as never), 'activate').mockRejectedValue(superseded);
+      map.setProjection({ type: 'equal' });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(error).not.toHaveBeenCalled();
+      install.uninstall();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
+  it('forgets a removed map: uninstall does not restore its style (I5)', async () => {
+    const { module } = fakeModule();
+    const install = await installEqualEarth(module, {
+      fetchJson: async () => ({ tiles: ['https://tiles.example/{z}/{x}/{y}.pbf'] }),
+    });
+    const host = new FakeControllerHost([139.69, 35.69], 4.6);
+    host.style = JSON.parse(readFileSync(new URL('./fixtures/liberty.json', import.meta.url), 'utf8')) as StyleLike;
+    await install.controllerFor(host).activate('equal');
+    const calls = host.setStyleCalls.length;
+    host.fireMapEvent('remove');
+    install.uninstall();
+    expect(host.setStyleCalls).toHaveLength(calls);
+    // A fresh controller is created for it after removal: the old one was dropped.
+    expect(install.controllerFor(host).active).toBe(false);
   });
 });

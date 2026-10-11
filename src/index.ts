@@ -143,6 +143,7 @@ export {
 
 export {
   EqualEarthController,
+  SUPERSEDED_ERROR_NAME,
   type ControllerHost,
   type ControllerOptions,
   type EqualEarthProjection,
