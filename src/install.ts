@@ -50,7 +50,9 @@ export interface InstallOptions {
   /**
    * How long to wait for the worker bundle before warping on the main thread instead (spec §8).
    * A CDN that accepts the connection and stalls would otherwise hold the install, and with it
-   * the application's first map, forever. `Infinity` waits without a bound.
+   * the application's first map, forever. `Infinity` waits without a bound. `0` or a negative
+   * value falls back to the main thread at once; `NaN` also waits without a bound (it fails
+   * the `ms <= MAX_TIMEOUT_MS` check).
    * @defaultValue 10000
    */
   workerTimeoutMs?: number;

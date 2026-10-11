@@ -63,6 +63,16 @@ describe('EqualEarthController', () => {
     expect(host.worldCopies).toBe(true);
   });
 
+  it('dispose releases the camera hook and the constraint as well as the switcher', async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    expect(host._camera.transformCameraUpdate).not.toBeNull();
+    expect(host.constrain).not.toBeNull();
+    controller.dispose();
+    expect(host._camera.transformCameraUpdate).toBeNull();
+    expect(host.constrain).toBeNull();
+  });
+
   it('deactivates: restores the original style, the centre, world copies and the hooks', async () => {
     const { host, controller } = setup();
     const original = JSON.stringify(host.style);

@@ -46,7 +46,7 @@ which is why `scripts/*.mjs` needs an explicit `globals.node` block.
 
 ## What this package is
 
-Equal Earth projection support for MapLibre GL JS v6, published as
+Equal Earth projection support for MapLibre GL JS v6, and v5 from 5.24, published as
 `@yellowmap/maplibre-gl-equal-earth`. It is a rewrite of, and a hard fork from,
 [pka/maplibre-gl-equal-earth](https://github.com/pka/maplibre-gl-equal-earth) (the old `lib/`,
 proj4, and the `0.2.x` line are gone). ESM only — maplibre-gl v6 dropped CJS.
@@ -109,7 +109,7 @@ affects the absolute metre values from `toEqualEarth`.
   set through `setPaintProperty`, never `global-state`: MapLibre re-evaluates a transition's
   prior expression against the live state, so a `global-state` flip can never cross-fade.
   Symbol, hillshade and color-relief copies are also hidden by `visibility: "none"`
-  (`LayerGate.symbol`): transparent labels still collide, and a `basic` hillshade still tints
+  (`LayerGate.hideByVisibility`): transparent labels still collide, and a `basic` hillshade still tints
   at exaggeration 0.
 - `src/map/switcher.ts` — `BandSwitcher`, the band selector: which band is *shown* is runtime
   state, moved only when the target band's sources report `isSourceLoaded`. Readiness is

@@ -171,6 +171,25 @@ describe('rewriteStyle', () => {
     expect(style.layers.find((l) => l.id === 'a__b2')!.paint!['fill-opacity']).toBe(0);
   });
 
+  it('marks symbol, hillshade and color-relief copies hideByVisibility, and no others', () => {
+    const style = liberty();
+    style.sources['dem'] = { type: 'raster-dem', url: 'https://example.invalid/dem.json' };
+    style.layers.push(
+      { id: 'shade', type: 'hillshade', source: 'dem' },
+      { id: 'relief', type: 'color-relief', source: 'dem' },
+    );
+    const { gates } = rewrite(style, SIX, 4.4);
+    const byType = new Map(style.layers.map((l) => [l.id, l.type]));
+    for (const gate of gates) {
+      const id = gate.layerId.replace(/__b\d+$/, '');
+      const type = byType.get(id);
+      expect(gate.hideByVisibility, `${gate.layerId} (${type})`).toBe(
+        type === 'symbol' || type === 'hillshade' || type === 'color-relief',
+      );
+      expect('symbol' in gate).toBe(false);
+    }
+  });
+
   it('shows symbol copies in the initial band only, keeping their own visibility', () => {
     const { style, gates } = rewrite(tiny(vec('s', 'symbol'), vec('h', 'symbol', { layout: { visibility: 'none' } })), SIX, 4.6);
     const byId = (id: string) => style.layers.find((l) => l.id === id)!;
@@ -196,7 +215,7 @@ describe('rewriteStyle', () => {
       expect(layer[0]!.minzoom).toBeCloseTo(7.2, 12);
     }
     expect(out.layers.find((l) => l.id === 'r')!.paint!['raster-opacity']).toBe(0);
-    expect(gates.find((g) => g.layerId === 'r')).toMatchObject({ band: 6, paint: { 'raster-opacity': undefined }, symbol: false });
+    expect(gates.find((g) => g.layerId === 'r')).toMatchObject({ band: 6, paint: { 'raster-opacity': undefined }, hideByVisibility: false });
     expect(removedLayers).toEqual([]);
     const atMercator = rewrite(tiny({ id: 'r', type: 'raster', source: 'geo', paint: { 'raster-opacity': 0.5 } }), SIX, 9).style;
     expect(atMercator.layers[0]!.paint!['raster-opacity']).toBe(0.5);
@@ -208,7 +227,7 @@ describe('rewriteStyle', () => {
     const layer = style.layers.find((l) => l.id === 'hs')!;
     expect(layer.layout!['visibility']).toBe('none');
     expect(layer.paint!['hillshade-exaggeration']).toBe(0.6);
-    expect(gates.find((g) => g.layerId === 'hs')).toEqual({ layerId: 'hs', band: 6, paint: {}, visibility: undefined, symbol: true });
+    expect(gates.find((g) => g.layerId === 'hs')).toEqual({ layerId: 'hs', band: 6, paint: {}, visibility: undefined, hideByVisibility: true });
     // In the initial band it keeps its own visibility.
     const shown = rewrite(tiny({ id: 'hs', type: 'hillshade', source: 'geo', paint: basic, layout: { visibility: 'visible' } }), SIX, 9);
     expect(shown.style.layers[0]!.layout!['visibility']).toBe('visible');
@@ -233,7 +252,7 @@ describe('rewriteStyle', () => {
     expect(layer[0]!.minzoom).toBeCloseTo(7.2, 12);
     expect(layer[0]!.paint!['color-relief-opacity']).toBe(0);
     expect(layer[0]!.layout!['visibility']).toBe('none');
-    expect(gates.find((g) => g.layerId === 'cr')).toMatchObject({ band: 6, paint: { 'color-relief-opacity': undefined }, symbol: true });
+    expect(gates.find((g) => g.layerId === 'cr')).toMatchObject({ band: 6, paint: { 'color-relief-opacity': undefined }, hideByVisibility: true });
   });
 
   it('rejects bands whose blends differ from the transition at equal length', () => {
@@ -323,8 +342,8 @@ describe('rewriteStyle', () => {
 });
 
 describe('applyGate', () => {
-  const symbol: LayerGate = { layerId: 's__b2', band: 2, paint: { 'text-opacity': 0.8, 'icon-opacity': undefined }, visibility: 'visible', symbol: true };
-  const fill: LayerGate = { layerId: 'f__b2', band: 2, paint: { 'fill-opacity': 0.5 }, symbol: false };
+  const symbol: LayerGate = { layerId: 's__b2', band: 2, paint: { 'text-opacity': 0.8, 'icon-opacity': undefined }, visibility: 'visible', hideByVisibility: true };
+  const fill: LayerGate = { layerId: 'f__b2', band: 2, paint: { 'fill-opacity': 0.5 }, hideByVisibility: false };
 
   it('shown restores own visibility and paint verbatim', () => {
     const host = new FakeGateHost();
@@ -356,7 +375,7 @@ describe('applyGate', () => {
   });
 
   it('shows and hides a hillshade gate by visibility alone', () => {
-    const hillshade: LayerGate = { layerId: 'hs', band: 6, paint: {}, visibility: undefined, symbol: true };
+    const hillshade: LayerGate = { layerId: 'hs', band: 6, paint: {}, visibility: undefined, hideByVisibility: true };
     const host = new FakeGateHost();
     applyGate(host, hillshade, 'shown');
     applyGate(host, hillshade, 'fading');

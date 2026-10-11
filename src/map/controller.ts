@@ -294,8 +294,13 @@ export class EqualEarthController {
     this.#nextGeneration();
     this.#pending = undefined;
     this.#settle(superseded());
-    this.#installed?.switcher.destroy();
+    const installed = this.#installed;
     this.#installed = undefined;
+    if (installed) {
+      installed.switcher.destroy();
+      installed.camera.destroy();
+      installed.uninstallConstrain();
+    }
     this.#projection = undefined;
     this.#view = undefined;
     this.#unsubscribe(); // `off` only: the map's state is not touched

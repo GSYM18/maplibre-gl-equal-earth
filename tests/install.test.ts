@@ -194,6 +194,24 @@ describe('installEqualEarth', () => {
     }
   });
 
+  it('getProjection falls back to MapLibre after a failed activation', async () => {
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { module, Host } = hostModule();
+      const install = await installEqualEarth(module, {
+        fetchJson: async () => { throw new Error('offline'); },
+      });
+      const map = new Host([139.69, 35.69], 4.6);
+      map.style = liberty();
+      map.setProjection({ type: 'equal' });
+      await vi.waitFor(() => expect(error).toHaveBeenCalled());
+      expect(map.getProjection()).toEqual({ type: 'mercator' });
+      install.uninstall();
+    } finally {
+      error.mockRestore();
+    }
+  });
+
   it('getProjection reports an Equal Earth type from setProjection on, before the activation commits (M3)', async () => {
     const { module, Host } = hostModule();
     let release!: (json: unknown) => void;

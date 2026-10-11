@@ -10,8 +10,8 @@ const idsFor = (band: number) => [band === 6 ? 'openmaptiles' : `openmaptiles__b
 const layerId = (id: string, band: number) => (band === 6 ? id : `${id}__b${band}`);
 /** A fill and a symbol gate per band, the shape `rewriteStyle` produces. */
 const gatesFor = (band: number): LayerGate[] => [
-  { layerId: layerId('water', band), band, paint: { 'fill-opacity': 0.8 }, symbol: false },
-  { layerId: layerId('place', band), band, paint: { 'text-opacity': 1, 'icon-opacity': undefined }, visibility: undefined, symbol: true },
+  { layerId: layerId('water', band), band, paint: { 'fill-opacity': 0.8 }, hideByVisibility: false },
+  { layerId: layerId('place', band), band, paint: { 'text-opacity': 1, 'icon-opacity': undefined }, visibility: undefined, hideByVisibility: true },
 ];
 
 /** Manual clock and timer queue so the dwell and fade are deterministic. */
