@@ -29,10 +29,12 @@ export interface SimilarityOffsets {
 
 /**
  * Sign relating the warp's rotation (in world coordinates, y down) to MapLibre's bearing.
- * Pinned by `tests/band-camera.test.ts` ("compensation reduces the probe displacement"),
- * which fails with the wrong sign; prose cannot be trusted with this.
+ * Pinned by `tests/band-camera.test.ts` ("reduces the geometry snap at a crossing to under
+ * 60 % at San Francisco and Zürich"); prose cannot be trusted with this. `-1` won: with `+1`
+ * the San Francisco snap grew from 30.7 px to 43.2 px; with `-1` it fell to 16.4 px (Zürich
+ * 19.5 px to 6.9 px).
  */
-const BEARING_SIGN = 1;
+const BEARING_SIGN = -1;
 
 const H = 1e-4;
 const IDENTITY: Matrix2 = [1, 0, 0, 1];

@@ -52,6 +52,7 @@ export interface LngLat {
 interface CameraState {
   center: LngLat;
   zoom: number;
+  bearing: number;
 }
 
 type Listener = () => void;
@@ -88,7 +89,11 @@ class Emitter {
   }
 }
 
-const copy = (state: CameraState): CameraState => ({ center: { ...state.center }, zoom: state.zoom });
+const copy = (state: CameraState): CameraState => ({
+  center: { ...state.center },
+  zoom: state.zoom,
+  bearing: state.bearing,
+});
 
 /** The MapLibre `Camera`: rendered transform `T`, requested state `R`, and the hook. */
 export class FakeCamera extends Emitter {
@@ -106,7 +111,7 @@ export class FakeCamera extends Emitter {
 
   constructor(center: readonly [number, number], zoom: number) {
     super();
-    this.transform = { center: { lng: center[0], lat: center[1] }, zoom };
+    this.transform = { center: { lng: center[0], lat: center[1] }, zoom, bearing: 0 };
     // v6 22072 / v5 67377: registered in the Camera constructor, so it runs first.
     this.on('moveend', () => {
       delete this._requestedCameraState;
@@ -119,14 +124,19 @@ export class FakeCamera extends Emitter {
   }
 
   applyUpdatedTransform(requested: CameraState): void {
-    const next: CameraUpdate = { center: { ...requested.center }, zoom: requested.zoom };
+    const next: CameraUpdate = {
+      center: { ...requested.center },
+      zoom: requested.zoom,
+      bearing: requested.bearing,
+    };
     const result: CameraUpdateResult = this.transformCameraUpdate?.(next) ?? {};
     const final = copy(requested);
     // Store the returned object by reference, as `setCenter(center)` does.
     if (result.center) final.center = result.center;
-    if (typeof result['zoom'] === 'number') final.zoom = result['zoom'];
+    if (typeof result.zoom === 'number') final.zoom = result.zoom;
+    if (typeof result.bearing === 'number') final.bearing = result.bearing;
     // v6 22459-22462: the result goes through `setCenter`/`setZoom`, which constrain.
-    if (result.center || typeof result['zoom'] === 'number') this.#constrainState(final);
+    if (result.center || typeof result.zoom === 'number') this.#constrainState(final);
     this.transform = final;
   }
 
@@ -138,6 +148,7 @@ export class FakeCamera extends Emitter {
     if (frame.center) state.center = { lng: frame.center[0], lat: frame.center[1] };
     if (frame.zoom !== undefined) state.zoom = frame.zoom;
     if (frame.zoomDelta !== undefined) state.zoom += frame.zoomDelta;
+    if (frame.bearing !== undefined) state.bearing = frame.bearing;
     if (frame.panDelta) {
       state.center = {
         lng: state.center.lng + frame.panDelta[0],
@@ -202,6 +213,8 @@ export interface Frame {
   zoomDelta?: number;
   /** Pan in map-space degrees. */
   panDelta?: readonly [number, number];
+  /** Absolute bearing in degrees, as `jumpTo`/`easeTo` options or a rotate frame set it. */
+  bearing?: number;
 }
 
 /** A running `easeTo`/`flyTo`, including a double-click zoom. */
@@ -244,6 +257,11 @@ export abstract class FakeMapBase {
     return this.camera.transform.zoom;
   }
 
+  /** `T.bearing`. */
+  get bearing(): number {
+    return this.camera.transform.bearing;
+  }
+
   /** `R.center`, or `undefined` when there is no requested state. */
   get requestedCenter(): LngLat | undefined {
     return this.camera._requestedCameraState?.center;
@@ -251,6 +269,10 @@ export abstract class FakeMapBase {
 
   getZoom(): number {
     return this.camera.transform.zoom;
+  }
+
+  getBearing(): number {
+    return this.camera.transform.bearing;
   }
 
   /**

@@ -11,6 +11,10 @@
  * own `moveend`; every frame runs the hook on a copy of it and renders only the result. So
  * within one move the hook keeps seeing an unconverted centre, in the map space of the band
  * the move started in — see {@link BandCamera}.
+ *
+ * Optionally the camera also absorbs the rotation and scale a band step causes at the centre,
+ * with continuous bearing and zoom offsets (spec §4.2), and lets a *selector* rather than the
+ * zoom decide which band is shown (spec §4.3).
  */
 
 import {
@@ -20,7 +24,18 @@ import {
   mapToGeographic,
 } from '../math/backproject.js';
 import type { LngLatTuple } from '../math/equal-earth.js';
-import { bandIndexForZoom, validateBands, type Band } from './bands.js';
+import {
+  similarityOffsets,
+  type CompensationMode,
+  type SimilarityOffsets,
+} from '../math/jacobian.js';
+import {
+  bandIndexForZoom,
+  continuousBlend,
+  validateBands,
+  type Band,
+  type ResolvedTransition,
+} from './bands.js';
 
 /**
  * The subset of `maplibre-gl`'s camera-update payload we care about.
@@ -31,11 +46,14 @@ import { bandIndexForZoom, validateBands, type Band } from './bands.js';
 export interface CameraUpdate {
   center: { lng: number; lat: number };
   zoom: number;
+  bearing: number;
   [key: string]: unknown;
 }
 
 export type CameraUpdateResult = {
   center?: { lng: number; lat: number };
+  zoom?: number;
+  bearing?: number;
   [key: string]: unknown;
 };
 
@@ -69,6 +87,8 @@ export interface CameraHost extends MoveEndEmitter {
   on(type: 'moveend' | GestureEndEvent, listener: () => void): unknown;
   off(type: 'moveend' | GestureEndEvent, listener: () => void): unknown;
   getZoom(): number;
+  /** Both majors have it. */
+  getBearing?(): number;
   /** MapLibre v5's `Map` inherits it from `Camera`; a v6 `Map` has none (its `_camera` does). */
   isEasing?(): boolean;
   /** MapLibre v5, and test doubles: the hook is a plain property. */
@@ -198,9 +218,40 @@ const GESTURE_END_EVENTS = ['dragend', 'zoomend', 'rotateend', 'pitchend', 'roll
 /** One of {@link GESTURE_END_EVENTS}. */
 export type GestureEndEvent = (typeof GESTURE_END_EVENTS)[number];
 
+const ZERO_OFFSETS: SimilarityOffsets = { deltaZoom: 0, deltaBearing: 0 };
+
+/** The space a requested camera state was created in. */
+interface Baseline {
+  /** Band whose map space the requested camera state is in. */
+  band: number;
+  /** Zoom and bearing offsets already applied to the transform the state was cloned from. */
+  offsets: SimilarityOffsets;
+}
+
+/**
+ * Decides which band is shown, in place of the zoom (spec §4.3): the switcher holds a band
+ * until the next one is ready.
+ */
+export interface BandSelector {
+  /** The band to render this frame, given the requested zoom. May switch bands. Called only from the hook. */
+  decide(requestedZoom: number): number;
+  /** The band rendered now; never switches. */
+  current(): number;
+}
+
+/** Continuous zoom and bearing offsets that absorb each band step at the centre (spec §4.2). */
+export interface Compensation {
+  transition: ResolvedTransition;
+  mode: CompensationMode;
+}
+
 export interface BandCameraOptions {
   /** Zoom bands, validated with `validateBands`. */
   bands: readonly Band[];
+  /** Picks the shown band each frame. Without one, the band is the requested zoom's. */
+  selector?: BandSelector;
+  /** Absorb each step's rotation and scale at the centre. Without it, no offsets are applied. */
+  compensation?: Compensation;
   /** Builds the center object handed back to MapLibre. Pass `maplibregl.LngLat`. */
   lngLatFactory?: LngLatFactory;
   /** Called when a conversion produces a non-finite coordinate. Defaults to a console warning. */
@@ -232,6 +283,11 @@ export interface ThresholdCameraOptions {
  *   state, because the next one is cloned from what is rendered. On v6 that is the Camera's
  *   own `moveend`, not the Map's — see {@link cameraHookAccess}. A gesture's `*end` events
  *   delete the state and re-base too, because an inertial ease follows them with no `moveend`.
+ * - **Baseline offsets.** With {@link Compensation}, the rendered zoom and bearing carry
+ *   offsets, and the requested state is cloned from the rendered transform, so it carries the
+ *   offsets in effect when it was created. The baseline records them with its band; the hook
+ *   subtracts them to recover what was requested, decides the band on that, and adds the new
+ *   offsets (spec §4.2). A {@link BandSelector} may pick the band instead of the zoom.
  * - **State initialised in the constructor**, from the live camera, so an initial `flyTo`
  *   across a boundary is converted even before any interaction.
  *
@@ -246,18 +302,24 @@ export class BandCamera {
   readonly #bands: readonly Band[];
   readonly #lngLatFactory: LngLatFactory;
   readonly #onConversionFailure: (reason: string, input: LngLatTuple) => void;
+  readonly #selector: BandSelector | undefined;
+  readonly #compensation: Compensation | undefined;
 
   /**
-   * Band whose map space the requested camera state is in: the rendered band when that state
-   * was created. Seeded from the live camera, reset on the `moveend` that deletes the state.
+   * Band whose map space the requested camera state is in (the rendered band when that state
+   * was created), and the offsets that state carries. Seeded from the live camera, reset on the
+   * `moveend` that deletes the state.
    */
-  #baseline: number;
+  #baseline: Baseline;
 
   /**
    * The baseline the last reset replaced: the space of a requested state that was deleted
    * while still in use — see {@link handleCameraUpdate}.
    */
-  #previousBaseline: number;
+  #previousBaseline: Baseline;
+
+  /** The offsets the hook last returned: what the rendered transform carries. */
+  #lastOffsets: SimilarityOffsets = ZERO_OFFSETS;
 
   /**
    * Whether the last hook frame rendered a detached requested state (one a `moveend` deleted
@@ -290,6 +352,8 @@ export class BandCamera {
 
     this.#bands = [...options.bands];
     this.#lngLatFactory = options.lngLatFactory ?? defaultLngLatFactory;
+    this.#selector = options.selector;
+    this.#compensation = options.compensation;
     this.#onConversionFailure =
       options.onConversionFailure ??
       ((reason, input) => {
@@ -300,7 +364,10 @@ export class BandCamera {
       });
 
     this.#host = host;
-    this.#baseline = bandIndexForZoom(this.#bands, host.getZoom());
+    this.#baseline = {
+      band: this.#selector ? this.#selector.current() : bandIndexForZoom(this.#bands, host.getZoom()),
+      offsets: ZERO_OFFSETS,
+    };
     this.#previousBaseline = this.#baseline;
     this.#access = cameraHookAccess(host);
 
@@ -341,7 +408,22 @@ export class BandCamera {
 
   /** Blend of the band the rendered camera is in. */
   get blend(): number {
-    return this.#bands[bandIndexForZoom(this.#bands, this.#host.getZoom())]!.blend;
+    return this.#bands[this.shownBand]!.blend;
+  }
+
+  /**
+   * The rendered zoom minus the zoom offset in effect: what was requested. The switcher decides
+   * bands on this, not on `getZoom()`.
+   */
+  get requestedZoom(): number {
+    return this.#host.getZoom() - this.#lastOffsets.deltaZoom;
+  }
+
+  /** The band rendered now: the selector's, or the requested zoom's. */
+  get shownBand(): number {
+    return this.#selector
+      ? this.#selector.current()
+      : bandIndexForZoom(this.#bands, this.requestedZoom);
   }
 
   /**
@@ -351,7 +433,7 @@ export class BandCamera {
    * `createEqualEarthConstrain`'s `baselineBand`).
    */
   get baselineBand(): number {
-    return this.#baseline;
+    return this.#baseline.band;
   }
 
   /**
@@ -364,10 +446,8 @@ export class BandCamera {
     // map synchronisation, and anything else the application relies on.
     const upstream = this.#previousHook ? this.#previousHook(next) : {};
     const center = upstream.center ?? next.center;
-    const upstreamZoom = upstream['zoom'];
-    const zoom = typeof upstreamZoom === 'number' ? upstreamZoom : next.zoom;
-
-    const current = bandIndexForZoom(this.#bands, zoom);
+    const zoom = typeof upstream.zoom === 'number' ? upstream.zoom : next.zoom;
+    const bearing = typeof upstream.bearing === 'number' ? upstream.bearing : next.bearing;
 
     // With this hook installed, `getTransformForUpdate()` creates the requested state before
     // anything applies a change to it, so an absent one means this frame renders a state that
@@ -385,15 +465,23 @@ export class BandCamera {
     this.#lastFrameStale = stale;
     this.#lastFrameEasing = this.#access.isEasing() === true;
 
+    // Recover what was requested: the state was cloned from a transform that already carried
+    // the baseline's offsets (spec §4.2 "baseline offsets"). Without compensation both are 0.
+    const requestedZoom = zoom - baseline.offsets.deltaZoom;
+    const requestedBearing = bearing - baseline.offsets.deltaBearing;
+
     // Otherwise no state change here: the baseline moves only on `moveend`, so every frame of
     // a move converts its requested state the same way.
-    const fromBlend = this.#bands[baseline]!.blend;
-    const toBlend = this.#bands[current]!.blend;
+    const shown = this.#selector
+      ? this.#selector.decide(requestedZoom)
+      : bandIndexForZoom(this.#bands, requestedZoom);
+    const fromBlend = this.#bands[baseline.band]!.blend;
+    const toBlend = this.#bands[shown]!.blend;
 
     // Still in the baseline band (or one sharing its blend), including after a move crossed
     // out and back: the requested centre is already in the right space.
-    if (fromBlend === toBlend) {
-      if (stale) this.#baseline = current;
+    if (fromBlend === toBlend && !this.#compensation) {
+      if (stale) this.#baseline = { band: shown, offsets: ZERO_OFFSETS };
       return upstream;
     }
 
@@ -407,17 +495,44 @@ export class BandCamera {
       clampLongitude(wrapLongitude(center.lng), mapSpaceMaxLongitude(clampedLat, fromBlend)),
       clampedLat,
     ];
-    // One conversion straight from the baseline band to the current one, however many bands
-    // lie between — chaining through each would accumulate error.
-    const converted = geographicToMap(mapToGeographic(inWorld, fromBlend), toBlend);
+    const geographic = mapToGeographic(inWorld, fromBlend);
 
-    if (!Number.isFinite(converted[0]) || !Number.isFinite(converted[1])) {
-      this.#onConversionFailure('non-finite result', source);
-      return upstream;
+    let converted: LngLatTuple | null = null;
+    let failed = false;
+    if (fromBlend !== toBlend) {
+      // One conversion straight from the baseline band to the shown one, however many bands
+      // lie between — chaining through each would accumulate error.
+      converted = geographicToMap(geographic, toBlend);
+      if (!Number.isFinite(converted[0]) || !Number.isFinite(converted[1])) {
+        this.#onConversionFailure('non-finite result', source);
+        converted = null;
+        failed = true;
+      }
     }
 
-    if (stale) this.#baseline = current;
-    return { ...upstream, center: this.#lngLatFactory(converted[0], converted[1]) };
+    // Give the centre the rotation and scale the continuous blend at the requested zoom would
+    // show, while `shown` is drawn. Applied even when the conversion failed: they belong to the
+    // shown band, and they are zero for a non-finite point.
+    const offsets = this.#compensation
+      ? similarityOffsets(
+          geographic,
+          toBlend,
+          continuousBlend(this.#compensation.transition, requestedZoom),
+          this.#compensation.mode,
+        )
+      : ZERO_OFFSETS;
+    this.#lastOffsets = offsets;
+    // m14: a stale frame that failed to convert rendered its state unconverted, in the space of
+    // the band it was already based on; only the offsets it rendered are new.
+    if (stale) this.#baseline = { band: failed ? this.#baseline.band : shown, offsets };
+
+    const result: CameraUpdateResult = { ...upstream };
+    if (converted) result.center = this.#lngLatFactory(converted[0], converted[1]);
+    if (this.#compensation) {
+      result.zoom = requestedZoom + offsets.deltaZoom;
+      result.bearing = requestedBearing + offsets.deltaBearing;
+    }
+    return result;
   };
 
   /**
@@ -431,7 +546,7 @@ export class BandCamera {
     if (!(this.#lastFrameStale && this.#access.isEasing() === true)) {
       this.#previousBaseline = this.#baseline;
     }
-    this.#baseline = bandIndexForZoom(this.#bands, this.#host.getZoom());
+    this.#baseline = { band: this.shownBand, offsets: this.#lastOffsets };
   };
 
   /**

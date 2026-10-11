@@ -1,9 +1,16 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import type { Band } from '../src/map/bands.js';
-import { BandCamera, type CameraUpdateResult } from '../src/map/camera.js';
+import { continuousBlend, resolveTransition, type Band } from '../src/map/bands.js';
+import { BandCamera, type BandSelector, type CameraUpdateResult } from '../src/map/camera.js';
 import { createEqualEarthConstrain } from '../src/map/constrain.js';
-import { geographicToMap, mapSpaceMaxLatitude, mapToGeographic } from '../src/math/backproject.js';
+import {
+  geographicToMap,
+  geographicToMapWorld,
+  mapSpaceMaxLatitude,
+  mapToGeographic,
+  mapWorldToGeographic,
+} from '../src/math/backproject.js';
+import { similarityOffsets } from '../src/math/jacobian.js';
 import {
   FakeV5Map,
   FakeV6Map,
@@ -430,6 +437,7 @@ describe.each(SHAPES)('BandCamera on a MapLibre $shape-shaped host', ({ shape, c
     // On the outline, not 246° beyond it. The slack is this check's own round trip: even an
     // exact ±180° comes back from blend ⅓ map space as 180 ± 4e-12.
     expect(Math.abs(lng)).toBeLessThanOrEqual(180 + 1e-9);
+    expect(Math.abs(Math.abs(lng) - 180)).toBeLessThan(1e-6);
     expect(Math.abs(lat)).toBeLessThanOrEqual(90);
   });
 
@@ -624,5 +632,152 @@ describe('BandCamera', () => {
       expect(map.listenerCount('moveend')).toBe(before);
       warn.mockRestore();
     });
+  });
+});
+
+const SIX = resolveTransition();
+const ZURICH: [number, number] = [8.54, 47.37];
+
+/** Screen position of a geographic point, MapLibre conventions: y down, `angle = −bearing`. */
+function screen(map: FakeMapBase, geo: [number, number], blend: number): [number, number] {
+  const scale = 512 * 2 ** map.zoom;
+  const [px, py] = geographicToMapWorld(geographicToMap(geo, blend), 1);
+  const [cx, cy] = geographicToMapWorld([map.center.lng, map.center.lat], 1);
+  const dx = (px - cx) * scale, dy = (py - cy) * scale;
+  const a = (-map.bearing * Math.PI) / 180;
+  return [dx * Math.cos(a) - dy * Math.sin(a), dx * Math.sin(a) + dy * Math.cos(a)];
+}
+
+/** Geographic points 300 px from the centre in four directions, in the shown band's space. */
+function probes(map: FakeMapBase, blend: number): [number, number][] {
+  const scale = 512 * 2 ** map.zoom;
+  const [cx, cy] = geographicToMapWorld([map.center.lng, map.center.lat], 1);
+  const a = (map.bearing * Math.PI) / 180;
+  const offsets: [number, number][] = [[300, 0], [0, 300], [-300, 0], [0, -300]];
+  return offsets.map(([sx, sy]) => {
+    const dx = sx * Math.cos(a) - sy * Math.sin(a), dy = sx * Math.sin(a) + sy * Math.cos(a);
+    const world: [number, number] = [cx + dx / scale, cy + dy / scale];
+    return mapToGeographic(mapWorldToGeographic(world, 1), blend);
+  });
+}
+
+/** Largest probe displacement across the crossing from z5.59 to z5.61 (band 2 → 3). */
+function crossingSnap(mode: 'none' | 'zoom+bearing', city: [number, number]): number {
+  const map = new FakeV6Map(geographicToMap(city, SIX.bands[2]!.blend), 5.59);
+  new BandCamera(map, { bands: SIX.bands, compensation: { transition: SIX, mode } });
+  map.jumpTo({ zoom: 5.59 }); // settle the offsets of band 2 into T
+  const before = probes(map, SIX.bands[2]!.blend);
+  const seen = before.map((geo) => screen(map, geo, SIX.bands[2]!.blend));
+  map.applyFrame({ zoomDelta: 0.02 });
+  return Math.max(...before.map((geo, i) => {
+    const [x, y] = screen(map, geo, SIX.bands[3]!.blend);
+    // Remove the zoom step's own uniform scaling (0.02 zoom ≈ 1.4 %), which is not a snap.
+    const s = 2 ** -0.02;
+    return Math.hypot(x * s - seen[i]![0], y * s - seen[i]![1]);
+  }));
+}
+
+describe('BandCamera compensation (spec §4.2)', () => {
+  it('reduces the geometry snap at a crossing to under 60 % at San Francisco and Zürich', () => {
+    for (const city of [SAN_FRANCISCO, ZURICH]) {
+      const plain = crossingSnap('none', city);
+      const compensated = crossingSnap('zoom+bearing', city);
+      expect(plain, 'uncompensated snap must be measurable').toBeGreaterThan(5);
+      expect(compensated).toBeLessThan(0.6 * plain);
+    }
+  });
+
+  it('returns zero offsets outside the transition range', () => {
+    const map = new FakeV6Map(geographicToMap(ANCHORAGE, 0), 3);
+    new BandCamera(map, { bands: SIX.bands, compensation: { transition: SIX, mode: 'zoom+bearing' } });
+    map.applyFrame({ zoomDelta: 0.3 });
+    expect(map.zoom).toBeCloseTo(3.3, 12);
+    expect(map.bearing).toBe(0);
+    map.jumpTo({ zoom: 9 });
+    expect(map.zoom).toBe(9);
+    expect(map.bearing).toBe(0);
+  });
+
+  it('does not compensate twice when a new requested state is cloned from the rendered one', () => {
+    const map = new FakeV6Map(geographicToMap(ZURICH, 0), 3.9);
+    new BandCamera(map, { bands: SIX.bands, compensation: { transition: SIX, mode: 'zoom+bearing' } });
+    // Two scroll gestures of +0.4 each, the first ending without inertia (Map moveend).
+    for (const frame of zoomFrames(3.9, 4.3, 0.1)) map.applyFrame(frame);
+    map.endGesture();
+    for (const frame of zoomFrames(4.3, 4.7, 0.1)) map.applyFrame(frame);
+    const geo = mapToGeographic([map.center.lng, map.center.lat], SIX.bands[1]!.blend);
+    const expected = similarityOffsets(geo, SIX.bands[1]!.blend, continuousBlend(SIX, 4.7), 'zoom+bearing');
+    expect(map.zoom).toBeCloseTo(4.7 + expected.deltaZoom, 9);
+    expect(map.bearing).toBeCloseTo(expected.deltaBearing, 9);
+    expect(expected.deltaZoom).not.toBe(0);
+  });
+
+  it('is continuous in zoom inside a band', () => {
+    const map = new FakeV6Map(geographicToMap(SAN_FRANCISCO, SIX.bands[2]!.blend), 4.9);
+    new BandCamera(map, { bands: SIX.bands, compensation: { transition: SIX, mode: 'zoom+bearing' } });
+    // Settle the offsets into T first: the map was created without them.
+    map.jumpTo({ zoom: 4.9 });
+    let previous = { zoom: map.zoom, bearing: map.bearing };
+    for (const frame of zoomFrames(4.9, 5.5, 0.01)) {
+      map.applyFrame(frame);
+      expect(Math.abs(map.zoom - previous.zoom)).toBeLessThan(0.02);
+      expect(Math.abs(map.bearing - previous.bearing)).toBeLessThan(0.2);
+      previous = { zoom: map.zoom, bearing: map.bearing };
+    }
+  });
+
+  it("adds its offsets to a bearing returned by the host's own hook (chaining)", () => {
+    const map = new FakeV6Map(geographicToMap(SAN_FRANCISCO, SIX.bands[2]!.blend), 5);
+    map.setTransformCameraUpdate(() => ({ bearing: 10 }));
+    new BandCamera(map, { bands: SIX.bands, compensation: { transition: SIX, mode: 'zoom+bearing' } });
+    map.applyFrame({ zoomDelta: 0.1 });
+    const geo = mapToGeographic([map.center.lng, map.center.lat], SIX.bands[2]!.blend);
+    const expected = similarityOffsets(geo, SIX.bands[2]!.blend, continuousBlend(SIX, 5.1), 'zoom+bearing');
+    expect(map.bearing).toBeCloseTo(10 + expected.deltaBearing, 9);
+  });
+});
+
+describe('BandCamera with a selector (spec §4.3)', () => {
+  function holdingSelector(held: number): BandSelector & { calls: number[] } {
+    const calls: number[] = [];
+    return { calls, decide: (zoom) => { calls.push(zoom); return held; }, current: () => held };
+  }
+
+  it("asks the selector on every frame with the requested zoom and renders the selector's band", () => {
+    const selector = holdingSelector(0);
+    const map = new FakeV6Map(geographicToMap(GUADALAJARA, 0), 3.9);
+    new BandCamera(map, { bands: SIX.bands, selector });
+    for (const frame of zoomFrames(3.9, 4.5, 0.1)) map.applyFrame(frame);
+    expect(selector.calls.length).toBe(6);
+    expect(selector.calls.at(-1)).toBeCloseTo(4.5, 9);
+    // Band 0 is held past the z4 boundary: the centre is still band 0's map space, unconverted.
+    expectAt(map, geographicToMap(GUADALAJARA, 0));
+  });
+
+  it('converts to the band the selector switches to, however many bands away', () => {
+    let held = 0;
+    const selector: BandSelector = { decide: () => held, current: () => held };
+    const map = new FakeV6Map(geographicToMap(TOKYO, 0), 3.9);
+    new BandCamera(map, { bands: SIX.bands, selector });
+    map.applyFrame({ zoomDelta: 2 }); // z5.9, still held in band 0
+    expectAt(map, geographicToMap(TOKYO, 0));
+    held = 3; // the selector decides band 3 is ready
+    map.applyFrame({ zoomDelta: 0.1 });
+    expectAt(map, geographicToMap(TOKYO, SIX.bands[3]!.blend), 6);
+    map.endGesture();
+    // After the moveend the baseline is the selector's band: a pan stays converted.
+    map.applyFrame({ panDelta: [0.1, 0] });
+    const geo = mapToGeographic([map.center.lng, map.center.lat], SIX.bands[3]!.blend);
+    expect(geo[1]).toBeCloseTo(TOKYO[1], 2);
+  });
+
+  it('exposes requestedZoom and shownBand for the switcher', () => {
+    const selector = holdingSelector(1);
+    const map = new FakeV6Map(geographicToMap(ZURICH, SIX.bands[1]!.blend), 4.2);
+    const camera = new BandCamera(map, { bands: SIX.bands, selector, compensation: { transition: SIX, mode: 'zoom+bearing' } });
+    map.applyFrame({ zoomDelta: 0.3 });
+    expect(camera.requestedZoom).toBeCloseTo(4.5, 9);
+    expect(map.zoom).not.toBeCloseTo(4.5, 3);
+    expect(camera.shownBand).toBe(1);
   });
 });
