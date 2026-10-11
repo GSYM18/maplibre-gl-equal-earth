@@ -19,6 +19,7 @@ function fakeModule(version = '6.6.0', importResult: Promise<unknown> = Promise.
       getWorkerCount: vi.fn(() => 1),
       setWorkerCount: vi.fn(),
       LngLat: class { constructor(public lng: number, public lat: number) {} },
+      LngLatBounds: class { constructor(public sw: [number, number], public ne: [number, number]) {} },
       Map: FakeMap,
     },
     FakeMap,
@@ -336,6 +337,28 @@ describe('installEqualEarth', () => {
     await expect(installEqualEarth(old.module)).rejects.toThrow(/>= 5\.24/);
     old.module.getVersion = () => '6.6.0';
     await expect(installEqualEarth(old.module)).resolves.toMatchObject({ version: '6.6.0' });
+  });
+
+  it('reads geographically while Equal Earth is active, unless geographicApi is false', async () => {
+    const liberty = JSON.parse(readFileSync(new URL('./fixtures/liberty.json', import.meta.url), 'utf8')) as StyleLike;
+    const fetchJson = async () => ({ tiles: ['https://tiles.example/{z}/{x}/{y}.pbf'] });
+    for (const geographicApi of [undefined, false]) {
+      const { module } = fakeModule();
+      const install = await installEqualEarth(module, { fetchJson, ...(geographicApi === undefined ? {} : { geographicApi }) });
+      const host = new FakeControllerHost([139.69, 35.69], 4.6);
+      host.style = structuredClone(liberty);
+      await install.controllerFor(host).activate('equal');
+      const centre = host.getCenter();
+      expect(Object.prototype.hasOwnProperty.call(host, 'getCenter'), String(geographicApi)).toBe(geographicApi !== false);
+      if (geographicApi === false) {
+        expect(centre).toEqual({ lng: host.center.lng, lat: host.center.lat });
+      } else {
+        expect(centre).toBeInstanceOf(module.LngLat);
+        expect(centre.lng).toBeCloseTo(139.69, 9);
+        expect(centre.lat).toBeCloseTo(35.69, 9);
+      }
+      install.uninstall();
+    }
   });
 
   it('forgets a removed map: uninstall does not restore its style (I5)', async () => {

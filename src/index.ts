@@ -153,6 +153,8 @@ export {
   type StyleLike,
 } from './map/style-rewrite.js';
 
+export { geographicUnder, mapSpaceOf } from './map/geo-api.js';
+
 export {
   EqualEarthController,
   SUPERSEDED_ERROR_NAME,

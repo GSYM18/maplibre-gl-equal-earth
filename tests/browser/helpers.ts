@@ -4,7 +4,8 @@
  *
  * Specs convert geographic positions **only** through {@link pixelOf}, {@link centreOn} and
  * {@link geographicCentreOffsetPx}, never with `controller.toMapSpace` inline: once `project` and
- * `jumpTo` become geographic, only these bodies change.
+ * `jumpTo` become geographic, only these bodies change. `project` is geographic since Task 6
+ * (unless the page runs with `geoapi: false`); `jumpTo` is not yet.
  */
 import { test as base, expect, type Page } from '@playwright/test';
 import type { Map as MapLibreMap, StyleSpecification } from 'maplibre-gl';
@@ -28,6 +29,8 @@ export interface Harness {
   controller?: EqualEarthController;
   /** Map `error` events and `[equal-earth]` console warnings, in order. */
   errors: string[];
+  /** Whether the plugin runs with its geographic API (`?geoapi=0` turns it off). */
+  geoApi: boolean;
   /** A fresh copy of the fixture style. */
   fixtureStyle(): StyleSpecification;
   /** Resolves once the map is idle and has stayed still for a moment (see {@link idle}). */
@@ -58,6 +61,10 @@ export interface HarnessOptions {
   graticule?: number | true;
   /** `?control=1`: the `EqualEarthControl` (and, on v6, `GlobeControl`) on the map. */
   control?: boolean;
+  /** `geographicApi` of `installEqualEarth`. @defaultValue true */
+  geoapi?: boolean;
+  /** `hash: true` on the map. */
+  hash?: boolean;
 }
 
 /** `test` with the per-project `mlv` option (`playwright.config.ts` sets it). */
@@ -82,6 +89,8 @@ export async function openHarness(page: Page, options: HarnessOptions): Promise<
   if (options.outline) params.set('outline', '1');
   if (options.control) params.set('control', '1');
   if (options.graticule !== undefined) params.set('graticule', options.graticule === true ? '1' : String(options.graticule));
+  if (options.geoapi === false) params.set('geoapi', '0');
+  if (options.hash) params.set('hash', '1');
   await page.goto(`/tests/browser/harness.html?${params.toString()}`);
   await page.waitForFunction(() => window.__h !== undefined);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -104,11 +113,14 @@ export async function canvasDataUrl(page: Page): Promise<string> {
   return page.evaluate(() => window.__h.map.getCanvas().toDataURL('image/png'));
 }
 
-/** The canvas pixel (CSS pixels, from the top left) of a geographic position. */
+/**
+ * The canvas pixel (CSS pixels, from the top left) of a geographic position: `map.project`,
+ * geographic active or not, unless the page turned the geographic API off.
+ */
 export async function pixelOf(page: Page, lngLat: [number, number]): Promise<[number, number]> {
   return page.evaluate((c) => {
-    const { map, controller } = window.__h;
-    const point = map.project(controller?.active ? controller.toMapSpace(c) : c);
+    const { map, controller, geoApi } = window.__h;
+    const point = map.project(!geoApi && controller?.active ? controller.toMapSpace(c) : c);
     return [point.x, point.y] as [number, number];
   }, lngLat);
 }

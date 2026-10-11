@@ -33,13 +33,7 @@
  * structurally ({@link ControllerHost}).
  */
 
-import {
-  geographicToMap,
-  mapSpaceMaxLatitude,
-  mapSpaceMaxLongitude,
-  mapToGeographic,
-  wrapLongitude,
-} from '../math/backproject.js';
+import { geographicToMap, wrapLongitude } from '../math/backproject.js';
 import type { LngLatTuple } from '../math/equal-earth.js';
 import type { CompensationMode } from '../math/jacobian.js';
 import {
@@ -54,6 +48,16 @@ import {
 import type { CartographyOptions } from './cartography.js';
 import { BandCamera, type CameraHost, type LngLatFactory } from './camera.js';
 import { installEqualEarthConstrain, type ConstrainHost } from './constrain.js';
+import {
+  geographicUnder,
+  installGeoApi,
+  markMapSpace,
+  rawCamera,
+  type GeoApi,
+  type GeoApiHost,
+  type GeoApiState,
+  type RawCamera,
+} from './geo-api.js';
 import {
   REWRITTEN_METADATA_KEY,
   restorableStyle,
@@ -93,6 +97,12 @@ export interface ControllerHost extends CameraHost, ConstrainHost, SwitcherHost 
   /** MapLibre's also takes a URL or `null`; the controller passes only style objects. */
   setStyle(style: HostStyle | string | null, options?: { diff?: boolean }): unknown;
   getCenter(): { lng: number; lat: number };
+  /** Wrapped by the geographic API where present (both majors have it). */
+  project?(lngLat: unknown): { x: number; y: number };
+  /** Wrapped by the geographic API where present (both majors have it). */
+  unproject?(point: unknown): { lng: number; lat: number };
+  /** Wrapped by the geographic API where present (both majors have it). */
+  getBounds?(): unknown;
   getBearing(): number;
   getRenderWorldCopies(): boolean;
   setRenderWorldCopies(value: boolean): unknown;
@@ -121,6 +131,22 @@ export interface ControllerOptions extends CartographyOptions {
   fetchJson?: (url: string) => Promise<unknown>;
   /** Called on every band switch. */
   onSwitch?: (event: SwitchEvent) => void;
+  /**
+   * Builds the bounds `getBounds()` returns while active. Pass
+   * `(sw, ne) => new maplibregl.LngLatBounds(sw, ne)`.
+   *
+   * @defaultValue `[sw, ne]`, a `LngLatBoundsLike`
+   */
+  lngLatBoundsFactory?: (sw: LngLatTuple, ne: LngLatTuple) => unknown;
+  /**
+   * Whether `project`, `unproject`, `getCenter` and `getBounds` speak geographic coordinates
+   * while Equal Earth is active (spec §7). They are wrapped on the map instance at its first
+   * activation and restored by `destroy()`/`dispose()`; `false` wraps nothing, and those
+   * methods then report the map space the renderer is fed.
+   *
+   * @defaultValue true
+   */
+  geographicApi?: boolean;
 }
 
 /** The camera, geographically: what survives a teardown and is restored after it. */
@@ -237,11 +263,19 @@ export class EqualEarthController {
   /** Activations waiting for a re-apply that took them over (M3). */
   #waiters: { resolve: () => void; reject: (error: unknown) => void }[] = [];
   #destroyed = false;
+  /**
+   * MapLibre's own `getCenter`/`jumpTo`, unconverted: every camera read and write the controller
+   * makes is in map space.
+   */
+  #raw: RawCamera;
+  /** The geographic API's wrappers, once installed (the first activation). */
+  #geoApi: GeoApi | undefined;
 
   constructor(host: ControllerHost, options: ControllerOptions) {
     this.#host = host;
     this.#options = options;
     this.#fetchJson = options.fetchJson ?? defaultFetchJson;
+    this.#raw = rawCamera(host as GeoApiHost);
   }
 
   get active(): boolean {
@@ -264,6 +298,20 @@ export class EqualEarthController {
   }
 
   /**
+   * Blend of the band the requested camera state is in (`BandCamera.baselineBand`): what a
+   * camera target converts with. {@link blend} while nothing is installed.
+   */
+  get baselineBlend(): number {
+    const installed = this.#installed;
+    return installed ? this.#bands[installed.camera.baselineBand]!.blend : this.blend;
+  }
+
+  /** The bands of the type shown (or last shown); {@link EQUAL_EARTH_BANDS} before that. */
+  get bands(): readonly Band[] {
+    return this.#bands;
+  }
+
+  /**
    * The zoom the application asked for: the rendered `getZoom()` minus the band's compensation
    * offset (spec §4.2). `getZoom()` itself while inactive; during a re-apply, the zoom captured
    * when the camera was torn down.
@@ -278,9 +326,16 @@ export class EqualEarthController {
     return this.active ? geographicToMap(lngLat, this.blend) : [lngLat[0], lngLat[1]];
   }
 
-  /** A map-space position of the band shown now, geographically. */
+  /**
+   * A map-space position of the band shown now, geographically. A position outside the world is
+   * first brought onto its outline, so the result is always finite with |lat| ≤ 90.
+   *
+   * With the geographic API on, `project`, `unproject`, `getCenter` and `getBounds` already
+   * convert; this and {@link toMapSpace} remain for the map-space values they do not cover,
+   * such as `queryRenderedFeatures` geometry and `getStyle()` contents.
+   */
   toGeographic(lngLat: LngLatTuple): LngLatTuple {
-    return this.active ? mapToGeographic(lngLat, this.blend) : [lngLat[0], lngLat[1]];
+    return this.active ? geographicUnder(lngLat, this.blend) : [lngLat[0], lngLat[1]];
   }
 
   /**
@@ -296,6 +351,7 @@ export class EqualEarthController {
    */
   activate(type: EqualEarthProjection): Promise<void> {
     if (this.#destroyed) return Promise.reject(new Error('Equal Earth: this controller was destroyed.'));
+    this.#installGeoApi();
     if (this.#pending?.type === type) return this.#pending.promise;
     if (this.#projection === type && !this.#pending) return Promise.resolve();
     const generation = this.#nextGeneration();
@@ -346,7 +402,43 @@ export class EqualEarthController {
     this.#release();
   }
 
+  /**
+   * Wrap the map's reads, once, at the first activation: a map that never shows Equal Earth is
+   * never touched, even when its controller exists. They pass through while inactive.
+   */
+  #installGeoApi(): void {
+    if (this.#geoApi || this.#options.geographicApi === false) return;
+    const read = {
+      active: () => this.active,
+      blend: () => this.blend,
+      baselineBlend: () => this.baselineBlend,
+      bands: () => this.bands,
+    };
+    const state: GeoApiState = {
+      get active() {
+        return read.active();
+      },
+      get blend() {
+        return read.blend();
+      },
+      get baselineBlend() {
+        return read.baselineBlend();
+      },
+      get bands() {
+        return read.bands();
+      },
+    };
+    const { lngLatFactory, lngLatBoundsFactory } = this.#options;
+    this.#geoApi = installGeoApi(this.#host as GeoApiHost, state, {
+      lngLat: lngLatFactory,
+      lngLatBounds: lngLatBoundsFactory ?? ((sw, ne) => [sw, ne]),
+    });
+    this.#raw = this.#geoApi.raw;
+  }
+
   #release(): void {
+    this.#geoApi?.uninstall();
+    this.#geoApi = undefined;
     this.#destroyed = true;
     this.#original = undefined;
     this.#rewritten = undefined;
@@ -423,7 +515,7 @@ export class EqualEarthController {
     } else {
       // With world copies on, the centre may sit on a copy (lng 400); off the outline, the
       // conversion would extrapolate into the empty corner.
-      const center = this.#host.getCenter();
+      const center = this.#raw.getCenter();
       this.#view = {
         geographic: [wrapLongitude(center.lng), center.lat],
         zoom: this.#host.getZoom(),
@@ -629,7 +721,11 @@ export class EqualEarthController {
     // C4: one camera update converts the centre into the initial band and settles the first
     // offsets, since the hook now runs with the baseline the camera was constructed with.
     const center = geographicToMap(view.geographic, bands[initialBand]!.blend);
-    host.jumpTo({ center: lngLatFactory(center[0], center[1]), zoom: view.zoom, bearing: view.bearing });
+    this.#raw.jumpTo({
+      center: markMapSpace(lngLatFactory(center[0], center[1])),
+      zoom: view.zoom,
+      bearing: view.bearing,
+    });
     announceUnwarpedRelief(original, transition);
     return true;
   }
@@ -707,9 +803,9 @@ export class EqualEarthController {
     if (!installed) return this.#view!;
     const { camera, switcher } = installed;
     const blend = camera.blend;
-    const center = this.#host.getCenter();
+    const center = this.#raw.getCenter();
     const view: View = {
-      geographic: centreToGeographic([center.lng, center.lat], blend),
+      geographic: geographicUnder([center.lng, center.lat], blend),
       zoom: camera.requestedZoom,
       bearing: camera.requestedBearing,
       blend,
@@ -729,8 +825,8 @@ export class EqualEarthController {
       this.#worldCopies = undefined;
     }
     const { lngLatFactory } = this.#options;
-    this.#host.jumpTo({
-      center: lngLatFactory(view.geographic[0], view.geographic[1]),
+    this.#raw.jumpTo({
+      center: markMapSpace(lngLatFactory(view.geographic[0], view.geographic[1])),
       zoom: view.zoom,
       bearing: view.bearing,
     });
@@ -845,15 +941,3 @@ function template(json: Record<string, unknown>): SourceTemplate & { tms?: boole
   };
 }
 
-/**
- * The geographic point under a map-space centre, brought into the band's world first as the
- * camera does: a centre panned beyond the rounded outline has no geographic meaning.
- */
-function centreToGeographic(center: LngLatTuple, blend: number): LngLatTuple {
-  const maxLat = mapSpaceMaxLatitude(blend);
-  const lat = Math.max(-maxLat, Math.min(maxLat, center[1]));
-  const maxLng = mapSpaceMaxLongitude(lat, blend);
-  const lng = Math.max(-maxLng, Math.min(maxLng, center[0]));
-  const geographic = mapToGeographic([lng, lat], blend);
-  return Number.isFinite(geographic[0]) && Number.isFinite(geographic[1]) ? geographic : center;
-}

@@ -142,8 +142,7 @@ const shownBand = (): number => {
 };
 
 const updateCentre = (): void => {
-  const centre = map.getCenter();
-  const [lng, lat] = controller.toGeographic([centre.lng, centre.lat]);
+  const { lng, lat } = map.getCenter();
   centreLine =
     `centre ${lng.toFixed(4)}, ${lat.toFixed(4)} at z${map.getZoom().toFixed(2)}; ` +
     `band b${shownBand()} (blend ${controller.blend.toFixed(3)})`;

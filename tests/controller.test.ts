@@ -712,6 +712,72 @@ describe('EqualEarthController', () => {
     });
   });
 
+  describe('geographic API (Task 6)', () => {
+    const own = (host: object, name: string): boolean => Object.prototype.hasOwnProperty.call(host, name);
+
+    it('getCenter reads geographically while active, and after deactivate', async () => {
+      const { host, controller } = setup();
+      await controller.activate('equal');
+      // T's centre is band 1's map space; the wrapped read is the geographic centre.
+      expect(host.center.lng).not.toBeCloseTo(TOKYO[0], 3);
+      const active = host.getCenter();
+      expect(active.lng).toBeCloseTo(TOKYO[0], 9);
+      expect(active.lat).toBeCloseTo(TOKYO[1], 9);
+      await controller.deactivate();
+      const after = host.getCenter();
+      expect(after.lng).toBeCloseTo(TOKYO[0], 9);
+      expect(after.lat).toBeCloseTo(TOKYO[1], 9);
+    });
+
+    it('touches nothing on the map until the first activation', () => {
+      const { host } = setup();
+      expect(own(host, 'getCenter')).toBe(false);
+    });
+
+    it('with geographicApi: false, reads stay map space and nothing is wrapped', async () => {
+      const host = new FakeControllerHost(TOKYO, 4.6);
+      host.style = liberty();
+      const controller = new EqualEarthController(host, { lngLatFactory, fetchJson: async () => TILEJSON, geographicApi: false });
+      await controller.activate('equal');
+      const expected = controller.toMapSpace(TOKYO);
+      const centre = host.getCenter();
+      expect(centre.lng).toBeCloseTo(expected[0], 9);
+      expect(centre.lat).toBeCloseTo(expected[1], 9);
+      expect(own(host, 'getCenter')).toBe(false);
+    });
+
+    it('dispose and destroy restore the wrapped methods', async () => {
+      const a = setup();
+      await a.controller.activate('equal');
+      expect(own(a.host, 'getCenter')).toBe(true);
+      a.controller.dispose();
+      expect(own(a.host, 'getCenter')).toBe(false);
+      const b = setup();
+      await b.controller.activate('equal');
+      await b.controller.destroy();
+      expect(own(b.host, 'getCenter')).toBe(false);
+    });
+
+    it('toGeographic is finite for a point above the world', async () => {
+      const { controller } = setup();
+      await controller.activate('equal');
+      const [lng, lat] = controller.toGeographic([0, 89]);
+      expect(Number.isFinite(lng) && Number.isFinite(lat)).toBe(true);
+      expect(lat).toBe(90);
+    });
+
+    it('exposes the bands and the baseline blend', async () => {
+      const { controller } = setup();
+      expect(controller.baselineBlend).toBe(1);
+      await controller.activate('equal');
+      expect(controller.bands).toHaveLength(7);
+      expect(controller.baselineBlend).toBeCloseTo(1 / 6, 12);
+      await controller.activate('equal-earth');
+      expect(controller.bands).toHaveLength(1);
+      expect(controller.baselineBlend).toBe(0);
+    });
+  });
+
   describe('unwarped layers notice', () => {
     async function fresh() {
       vi.resetModules();

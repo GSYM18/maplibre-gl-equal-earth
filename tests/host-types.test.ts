@@ -13,6 +13,7 @@ import type { CameraHost } from '../src/map/camera.js';
 import type { ConstrainHost } from '../src/map/constrain.js';
 import type { ControllerHost } from '../src/map/controller.js';
 import type { ControlHost } from '../src/map/control.js';
+import type { GeoApiHost } from '../src/map/geo-api.js';
 import type { MapLibreModule } from '../src/install.js';
 
 const acceptsV6 = (map: MapV6): [CameraHost, ConstrainHost] => [map, map];
@@ -21,12 +22,14 @@ const acceptsV6Controller = (map: MapV6): ControllerHost => map;
 const acceptsV5Controller = (map: MapV5): ControllerHost => map;
 const acceptsV6Control = (map: MapV6): ControlHost => map;
 const acceptsV5Control = (map: MapV5): ControlHost => map;
+const acceptsV6Geo = (map: MapV6): GeoApiHost => map;
+const acceptsV5Geo = (map: MapV5): GeoApiHost => map;
 const acceptsV6Module = (module: typeof import('maplibre-gl')): MapLibreModule => module;
 const acceptsV5Module = (module: typeof import('maplibre-gl-v5')): MapLibreModule => module;
 
 describe('host interfaces', () => {
   it('accept real v5 and v6 maps (enforced by the type checker)', () => {
-    const guards = [acceptsV5, acceptsV6, acceptsV5Controller, acceptsV6Controller, acceptsV5Module, acceptsV6Module, acceptsV5Control, acceptsV6Control];
-    expect(guards.map((guard) => typeof guard)).toEqual(Array(8).fill('function'));
+    const guards = [acceptsV5, acceptsV6, acceptsV5Controller, acceptsV6Controller, acceptsV5Module, acceptsV6Module, acceptsV5Control, acceptsV6Control, acceptsV5Geo, acceptsV6Geo];
+    expect(guards.map((guard) => typeof guard)).toEqual(Array(10).fill('function'));
   });
 });
