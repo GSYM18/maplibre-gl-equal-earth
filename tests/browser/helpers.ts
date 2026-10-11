@@ -98,6 +98,25 @@ export async function pixelOf(page: Page, lngLat: [number, number]): Promise<[nu
   }, lngLat);
 }
 
+/** The canvas colour `[r, g, b, a]` at a geographic position (the drawing buffer is preserved). */
+export async function colourAt(page: Page, lngLat: [number, number]): Promise<[number, number, number, number]> {
+  const [x, y] = await pixelOf(page, lngLat);
+  return page.evaluate(
+    ({ x, y }) => {
+      const canvas = window.__h.map.getCanvas();
+      const scale = canvas.width / canvas.clientWidth;
+      const copy = document.createElement('canvas');
+      copy.width = canvas.width;
+      copy.height = canvas.height;
+      const context = copy.getContext('2d')!;
+      context.drawImage(canvas, 0, 0);
+      const data = context.getImageData(Math.round(x * scale), Math.round(y * scale), 1, 1).data;
+      return [data[0]!, data[1]!, data[2]!, data[3]!] as [number, number, number, number];
+    },
+    { x, y },
+  );
+}
+
 /** Jump to a geographic centre and zoom, and wait for `idle`. */
 export async function centreOn(page: Page, lngLat: [number, number], zoom: number): Promise<void> {
   await page.evaluate(

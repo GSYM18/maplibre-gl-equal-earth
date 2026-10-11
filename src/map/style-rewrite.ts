@@ -227,6 +227,56 @@ export function restorableStyle(original: StyleLike, live: StyleLike | undefined
   };
 }
 
+/**
+ * The application's style as captured from the map after it was diffed over our rewritten
+ * style, without the zoom bounds the diff could not take away.
+ *
+ * The same `setLayerZoomRange` limit as in {@link restorableStyle}: a layer the Mercator band
+ * kept under its own id keeps the band's `minzoom` when the application's new style leaves the
+ * bound out. Captured as the new original, that bound would be intersected into every band copy
+ * and empty all the bands below it. So a bound is dropped when `rewritten` put it on that id,
+ * `original` (the application's style kept until now) had none there, and `captured` carries
+ * exactly that value: its presence is our artefact. A bound the new style sets to the same value
+ * on purpose is dropped too; it cannot be told apart. Works from what MapLibre serialised, so
+ * URL styles are covered. Returns `captured` itself when nothing is dropped.
+ */
+export function withoutRewriteBounds(
+  captured: StyleLike,
+  rewritten: StyleLike | undefined,
+  original: StyleLike | undefined,
+): StyleLike {
+  if (!rewritten || !original) return captured;
+  const ours = new Map(rewritten.layers.map((layer) => [layer.id, layer]));
+  const theirs = new Map(original.layers.map((layer) => [layer.id, layer]));
+  const artefacts = (layer: StyleLayerLike): { min: boolean; max: boolean } => {
+    const band = ours.get(layer.id);
+    const before = theirs.get(layer.id);
+    // A changed type, source or source layer was removed and re-added, not diffed.
+    const diffed =
+      band !== undefined &&
+      before !== undefined &&
+      band.type === layer.type &&
+      band.source === layer.source &&
+      band['source-layer'] === layer['source-layer'];
+    return {
+      min: diffed && before.minzoom === undefined && band.minzoom !== undefined && layer.minzoom === band.minzoom,
+      max: diffed && before.maxzoom === undefined && band.maxzoom !== undefined && layer.maxzoom === band.maxzoom,
+    };
+  };
+  if (!captured.layers.some((layer) => Object.values(artefacts(layer)).some(Boolean))) return captured;
+  return {
+    ...captured,
+    layers: captured.layers.map((layer) => {
+      const { min, max } = artefacts(layer);
+      if (!min && !max) return layer;
+      const copy = { ...layer };
+      if (min) delete copy.minzoom;
+      if (max) delete copy.maxzoom;
+      return copy;
+    }),
+  };
+}
+
 export function rewriteStyle(original: StyleLike, options: RewriteOptions): RewrittenStyle {
   const { bands, transition, templates } = options;
   if (original.metadata?.[REWRITTEN_METADATA_KEY]) {

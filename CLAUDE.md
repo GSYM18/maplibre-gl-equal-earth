@@ -124,6 +124,8 @@ affects the absolute metre values from `toEqualEarth`.
   at exaggeration 0. `restorableStyle` prepares the original for the diffed restore: MapLibre's
   `setLayerZoomRange` skips an absent bound, so a layer the Mercator band bounded under its own
   id is restored with an explicit `minzoom: 0` (it would otherwise keep the band's minzoom).
+  For the same reason the application's own `setStyle` while active inherits those bounds;
+  `withoutRewriteBounds` drops them when the controller captures that style as the new original.
 - `src/map/switcher.ts` — `BandSwitcher`, the band selector: which band is *shown* is runtime
   state, moved only when the target band's sources report `isSourceLoaded`. Readiness is
   judged at the last *rendered* zoom, because `isSourceLoaded` is vacuously true for a source
