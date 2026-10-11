@@ -86,13 +86,13 @@ export interface LayerGate {
   band: number;
   /** The layer's own value of every gated paint property (`undefined` = unset). */
   paint: Readonly<Record<string, unknown>>;
-  /** With `symbol`: the layer's own `layout.visibility` (`undefined` = unset). */
+  /** With `hideByVisibility`: the layer's own `layout.visibility` (`undefined` = unset). */
   visibility?: unknown;
   /**
    * Hidden by `visibility: "none"`, not only by its paint: symbol layers (transparent labels
    * still collide), hillshade (no opacity property; see the module comment) and color-relief.
    */
-  symbol: boolean;
+  hideByVisibility: boolean;
 }
 
 export type GatePhase = 'shown' | 'fading' | 'hidden';
@@ -144,14 +144,14 @@ const RELIEF = new Set(['raster', 'hillshade', 'color-relief']);
  */
 export function applyGate(host: GateHost, gate: LayerGate, phase: GatePhase): void {
   if (phase === 'shown') {
-    if (gate.symbol) host.setLayoutProperty(gate.layerId, 'visibility', gate.visibility);
+    if (gate.hideByVisibility) host.setLayoutProperty(gate.layerId, 'visibility', gate.visibility);
     for (const [name, value] of Object.entries(gate.paint)) {
       host.setPaintProperty(gate.layerId, name, value);
     }
     return;
   }
   for (const name of Object.keys(gate.paint)) host.setPaintProperty(gate.layerId, name, 0);
-  if (phase === 'hidden' && gate.symbol) host.setLayoutProperty(gate.layerId, 'visibility', 'none');
+  if (phase === 'hidden' && gate.hideByVisibility) host.setLayoutProperty(gate.layerId, 'visibility', 'none');
 }
 
 /**
@@ -186,7 +186,7 @@ function gateCopy(
     band,
     paint: own,
     ...(byVisibility ? { visibility: structuredClone(layer.layout?.['visibility']) } : {}),
-    symbol: byVisibility,
+    hideByVisibility: byVisibility,
   };
 }
 
