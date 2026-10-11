@@ -140,3 +140,11 @@ export {
   type StyleLayerLike,
   type StyleLike,
 } from './map/style-rewrite.js';
+
+export {
+  BandSwitcher,
+  chooseBand,
+  type SwitchEvent,
+  type SwitcherHost,
+  type SwitcherOptions,
+} from './map/switcher.js';
