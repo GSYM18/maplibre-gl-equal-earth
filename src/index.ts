@@ -126,3 +126,16 @@ export {
   TileCache,
   type TileCacheOptions,
 } from './tiles/cache.js';
+
+export {
+  REWRITTEN_METADATA_KEY,
+  gateByState,
+  rewriteStyle,
+  showKey,
+  symKey,
+  type RewriteOptions,
+  type RewrittenStyle,
+  type SourceTemplate,
+  type StyleLayerLike,
+  type StyleLike,
+} from './map/style-rewrite.js';
