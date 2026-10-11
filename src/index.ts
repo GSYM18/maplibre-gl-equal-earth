@@ -43,7 +43,19 @@ export {
   type ThresholdCameraOptions,
 } from './map/camera.js';
 
-export { bandIndexForZoom, validateBands, type Band } from './map/bands.js';
+export {
+  EQUAL_EARTH_BANDS,
+  bandIndexForZoom,
+  bandIndexWithHysteresis,
+  bandSourceId,
+  continuousBlend,
+  parseRange,
+  resolveTransition,
+  validateBands,
+  type Band,
+  type ResolvedTransition,
+  type Transition,
+} from './map/bands.js';
 
 export {
   createEqualEarthConstrain,

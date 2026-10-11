@@ -6,8 +6,8 @@
  * also covers every zoom below its own `minZoom`, and the last extends upward without end.
  *
  * Tiles are warped per band and MapLibre draws tiles per integer zoom, so a blend varying
- * continuously with zoom is not achievable with backprojection — the design spec (§2–§4)
- * measures what a hard switch would cost and why three steps were chosen instead.
+ * continuously with zoom is not achievable with backprojection. The step layout and its
+ * costs are in the design spec, §3 (the transition table).
  */
 
 export interface Band {
@@ -50,4 +50,101 @@ export function bandIndexForZoom(bands: readonly Band[], zoom: number): number {
     if (zoom >= bands[i]!.minZoom) return i;
   }
   return 0;
+}
+
+/** The adaptive `equal` transition, as the user configures it (spec §3). */
+export interface Transition {
+  /** Zoom of the first step. @defaultValue 4 */
+  from?: number;
+  /** Zoom from which plain Mercator is drawn. @defaultValue 8 */
+  to?: number;
+  /** Number of steps, i.e. boundaries, including the one into Mercator. @defaultValue 6 */
+  steps?: number;
+}
+
+export interface ResolvedTransition {
+  readonly from: number;
+  readonly to: number;
+  readonly steps: number;
+  /** Zoom between consecutive boundaries: `(to − from) / (steps − 1)`. */
+  readonly spacing: number;
+  /** Band 0 is Equal Earth from `−Infinity`; band `steps` is Mercator from `to`. */
+  readonly bands: readonly Band[];
+}
+
+/** Pure Equal Earth at every zoom. */
+export const EQUAL_EARTH_BANDS: readonly Band[] = [{ minZoom: -Infinity, blend: 0 }];
+
+/**
+ * Lay out the bands of a transition. Boundary `k` (1-based) sits at `from + (k − 1)·spacing`
+ * and starts the band drawn at blend `k / steps`, so the last boundary, at `to`, starts the
+ * Mercator band.
+ */
+export function resolveTransition(options: Transition = {}): ResolvedTransition {
+  const from = options.from ?? 4;
+  const to = options.to ?? 8;
+  const steps = options.steps ?? 6;
+  if (!Number.isFinite(from) || !Number.isFinite(to) || !(from < to)) {
+    throw new TypeError(
+      `Equal Earth transition needs finite from < to; received ${String(from)} and ${String(to)}.`,
+    );
+  }
+  if (!Number.isInteger(steps) || steps < 2) {
+    throw new TypeError(
+      `Equal Earth transition needs an integer steps >= 2; received ${String(steps)}.`,
+    );
+  }
+  const spacing = (to - from) / (steps - 1);
+  const bands: Band[] = [{ minZoom: -Infinity, blend: 0 }];
+  for (let k = 1; k <= steps; k++) {
+    // The last boundary is `to` exactly, not `from + (steps − 1) · spacing`, which can differ
+    // in the last bit and would put a zoom of exactly `to` in the wrong band.
+    bands.push({ minZoom: k === steps ? to : from + (k - 1) * spacing, blend: k / steps });
+  }
+  validateBands(bands);
+  return { from, to, steps, spacing, bands };
+}
+
+/**
+ * The blend a per-vertex renderer would use at `zoom`: linear through the band midpoints,
+ * 0 below `from − spacing/2`, 1 above `to + spacing/2`. The camera compensation steers the
+ * rotation and scale at the centre towards this (spec §4.2).
+ */
+export function continuousBlend(transition: ResolvedTransition, zoom: number): number {
+  const { from, spacing, steps } = transition;
+  const raw = (zoom - from) / spacing + 0.5;
+  return Math.min(steps, Math.max(0, raw)) / steps;
+}
+
+/**
+ * Zoom range over which band `band`'s layers are parsed: the band widened by one spacing on
+ * each side. A band may be shown anywhere inside it (spec §3 "parse early, show late").
+ */
+export function parseRange(transition: ResolvedTransition, band: number): [lo: number, hi: number] {
+  const { bands, spacing } = transition;
+  const lo = band === 0 ? -Infinity : bands[band]!.minZoom - spacing;
+  const next = bands[band + 1];
+  const hi = next === undefined ? Infinity : next.minZoom + spacing;
+  return [lo, hi];
+}
+
+/**
+ * `bandIndexForZoom`, except that a zoom less than `hysteresis` below the boundary of the
+ * `previous` band stays in it. Crossing upward switches at the boundary; crossing back
+ * switches only `hysteresis` lower, so a zoom hovering at a boundary does not flip.
+ */
+export function bandIndexWithHysteresis(
+  bands: readonly Band[],
+  zoom: number,
+  previous: number,
+  hysteresis: number,
+): number {
+  const target = bandIndexForZoom(bands, zoom);
+  if (target === previous - 1 && zoom >= bands[previous]!.minZoom - hysteresis) return previous;
+  return target;
+}
+
+/** Source id for band `band` of source `sourceId`: the original for Mercator, a suffix otherwise. */
+export function bandSourceId(sourceId: string, bands: readonly Band[], band: number): string {
+  return bands[band]!.blend === 1 ? sourceId : `${sourceId}__b${band}`;
 }
