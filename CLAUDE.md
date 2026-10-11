@@ -311,9 +311,12 @@ Known artifact, not yet addressed: source tiles are clipped upstream, so a polyg
 several source tiles arrives as several pieces. After warping, the pieces meet exactly (the
 shared edge derives from the same geographic tile boundary and `densify` is deterministic),
 but hairline seams in fills were a risk. `tests/browser/cartography.spec.ts` measures it
-(40×40 points inside fixture land box 1, which straddles four source tiles, at z2/z3/z4, dpr 1
-and 2, MapLibre 5.24 and 6.6): 0 background-coloured pixels everywhere (1360/512/128 points
-sampled per zoom), so `fill-antialias: false` is not applied. Polygon vertices on Mercator's
+(land layer only, centred on [5, 0] so the scan crosses the source-tile boundaries at lng 0 and
+lat 0 of fixture land box 1) reads every device pixel of a rectangle inside the box's warped
+outline (6 px margin, 126k to 744k pixels per case) at z2/z3/z4, dpr 1 and 2, MapLibre 5.24 and
+6.6, and counts each pixel that is not the land colour within 8/255, so antialiased blends count
+too. Result: 0 everywhere, and a self-test that paints a 1 px background row into the scanned
+copy proves the scan sees such a seam. So `fill-antialias: false` is not applied. Polygon vertices on Mercator's
 edge are snapped to ±90° in `decodeToGeographic`.
 
 ## Planned work

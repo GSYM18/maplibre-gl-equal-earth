@@ -738,6 +738,20 @@ describe('EqualEarthController', () => {
       }
     });
 
+    it('under pure equal-earth says the layers are hidden, without a Mercator band', async () => {
+      const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+      try {
+        const make = await fresh();
+        await make(liberty()).activate('equal-earth');
+        expect(info).toHaveBeenCalledTimes(1);
+        const message = String(info.mock.calls[0]![0]);
+        expect(message).toContain('hidden under pure Equal Earth');
+        expect(message).not.toContain('Mercator band');
+      } finally {
+        info.mockRestore();
+      }
+    });
+
     it('logs nothing for a style without raster, hillshade or color-relief', async () => {
       const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
       try {
