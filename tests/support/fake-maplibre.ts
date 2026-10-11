@@ -43,6 +43,7 @@
  *   with `setCenter`/`setZoom` on a clone too (v6 22459-22462), and constrained again.
  */
 import type { CameraUpdate, CameraUpdateFn, CameraUpdateResult } from '../../src/map/camera.js';
+import type { StyleLike } from '../../src/map/style-rewrite.js';
 
 export interface LngLat {
   lng: number;
@@ -374,6 +375,11 @@ export abstract class FakeMapBase {
 
   /** Fire an event on the Map itself, not the Camera. */
   protected abstract fireOnMap(type: string): void;
+
+  /** {@link fireOnMap}, for tests: an event the Map fires itself (`styledata`, `render`, ...). */
+  fireMapEvent(type: string): void {
+    this.fireOnMap(type);
+  }
 }
 
 /** MapLibre v5: `Map extends Camera`, so the Map and the Camera are one emitter. */
@@ -539,4 +545,144 @@ export class FakeSwitcherHost {
   off(type: string, listener: () => void): void { this.#listeners.set(type, (this.#listeners.get(type) ?? []).filter((l) => l !== listener)); }
   fire(type: string): void { for (const l of this.#listeners.get(type) ?? []) l(); }
   listenerCount(type: string): number { return (this.#listeners.get(type) ?? []).length; }
+}
+
+/** What `jumpTo` accepts on a controller host: a `LngLat`-like centre as well as a tuple. */
+export type ControllerJump = Omit<Frame, 'center'> & { center?: readonly [number, number] | LngLat };
+
+/**
+ * A v6 map with the style machinery the controller drives: `getStyle`/`setStyle`, the
+ * switcher's paint and readiness surface, world copies, and `render` after every camera frame.
+ *
+ * `setStyle` fires `styledata` synchronously, as MapLibre's diff path does (`Style.setState`
+ * fires its load event inside the call, v6 14482-14498). With `deferStyleData` it models the
+ * full rebuild instead (`_updateStyle`, v6 24842): until {@link flushStyleData} the style is
+ * not loaded, `getStyle()` throws, and no `styledata` has fired.
+ */
+export class FakeControllerHost extends FakeV6Map {
+  /** The loaded style; `undefined` while none is (then `getStyle()` throws). */
+  style: StyleLike | undefined;
+  readonly setStyleCalls: { layers: number; diff: boolean | undefined }[] = [];
+  /** Model the full-rebuild path: the next `setStyle` loads only on {@link flushStyleData}. */
+  deferStyleData = false;
+  #pendingStyle: StyleLike | undefined;
+  readonly loaded = new Set<string>();
+  /** Every `isSourceLoaded` call's source id, in order. */
+  readonly sourceChecks: string[] = [];
+  readonly paint: Record<string, Record<string, unknown>> = {};
+  readonly layout: Record<string, Record<string, unknown>> = {};
+  readonly writes: { kind: 'paint' | 'layout'; layerId: string; name: string; value: unknown }[] = [];
+  readonly errors: unknown[] = [];
+  worldCopies = true;
+  moving = false;
+  /** `jumpTo` calls, including the switcher's `jumpTo({})`. */
+  jumps = 0;
+  /** A v5-style transform with MapLibre's default constraint: the identity here. */
+  readonly transform = {
+    defaultConstrain: (center: LngLat, zoom: number) => ({ center, zoom }),
+  };
+
+  get constrain(): FakeCamera['constrain'] {
+    return this.camera.constrain;
+  }
+
+  getStyle(): StyleLike {
+    if (!this.style) throw new Error('Style is not done loading.');
+    return structuredClone(this.style);
+  }
+
+  setStyle(style: StyleLike, options?: { diff?: boolean }): this {
+    this.setStyleCalls.push({ layers: style.layers.length, diff: options?.diff });
+    if (this.deferStyleData) {
+      this.#pendingStyle = structuredClone(style);
+      this.style = undefined;
+      return this;
+    }
+    this.style = structuredClone(style);
+    this.fireMapEvent('styledata');
+    return this;
+  }
+
+  /** Finish a deferred `setStyle`: the style loads and `styledata` fires. */
+  flushStyleData(): void {
+    if (!this.#pendingStyle) throw new Error('No deferred setStyle to flush.');
+    this.style = this.#pendingStyle;
+    this.#pendingStyle = undefined;
+    this.fireMapEvent('styledata');
+  }
+
+  once(type: string, listener: () => void): this {
+    const once = () => {
+      this.off(type, once);
+      listener();
+    };
+    return this.on(type, once);
+  }
+
+  getCenter(): LngLat {
+    return { lng: this.center.lng, lat: this.center.lat };
+  }
+
+  isMoving(): boolean {
+    return this.moving;
+  }
+
+  isSourceLoaded(id: string): boolean {
+    this.sourceChecks.push(id);
+    return this.loaded.has(id);
+  }
+
+  setPaintProperty(layerId: string, name: string, value: unknown): this {
+    (this.paint[layerId] ??= {})[name] = value;
+    this.writes.push({ kind: 'paint', layerId, name, value });
+    return this;
+  }
+
+  setLayoutProperty(layerId: string, name: string, value: unknown): this {
+    (this.layout[layerId] ??= {})[name] = value;
+    this.writes.push({ kind: 'layout', layerId, name, value });
+    return this;
+  }
+
+  getRenderWorldCopies(): boolean {
+    return this.worldCopies;
+  }
+
+  setRenderWorldCopies(value: boolean): this {
+    this.worldCopies = value;
+    return this;
+  }
+
+  fire(event: { type: string; error?: unknown }): this {
+    if (event.type === 'error') this.errors.push(event.error);
+    return this;
+  }
+
+  /** A gesture frame, then the `render` a real map draws after it. */
+  override applyFrame(frame: Frame): void {
+    super.applyFrame(frame);
+    this.fireMapEvent('render');
+  }
+
+  /** `jumpTo` with a `LngLat`-like or tuple centre, then a `render`. */
+  override jumpTo(options: ControllerJump): void {
+    this.jumps++;
+    const { center, ...rest } = options;
+    const frame: Frame = { ...rest };
+    if (center) frame.center = 'lng' in center ? [center.lng, center.lat] : center;
+    super.jumpTo(frame);
+    this.fireMapEvent('render');
+  }
+
+  /** `easeTo`, whose every frame is followed by a `render`. */
+  override easeTo(options?: { zooming?: boolean }): FakeEase {
+    const ease = super.easeTo(options);
+    return {
+      frame: (frame) => {
+        ease.frame(frame);
+        this.fireMapEvent('render');
+      },
+      finish: () => ease.finish(),
+    };
+  }
 }

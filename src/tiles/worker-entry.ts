@@ -31,8 +31,8 @@ const workerSelf = globalThis as unknown as WorkerGlobal;
 if (typeof workerSelf.addProtocol === 'function') {
   workerSelf.addProtocol(PROTOCOL_SCHEME, createEqualEarthProtocol());
 } else {
-  // Loaded outside a MapLibre worker. Nothing registers a main-thread fallback yet, so
-  // tiles will fail to load until the application registers the protocol on the main thread.
+  // Loaded outside a MapLibre worker. `installEqualEarth` registers the protocol on the main
+  // thread only when the worker script fails to load, so here tiles fail until something does.
   console.warn(
     '[equal-earth] worker entry loaded but self.addProtocol is unavailable; ' +
       'tiles will fail to load until the protocol is registered on the main thread.',
