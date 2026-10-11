@@ -508,6 +508,8 @@ export class OpaqueV6Map extends FakeMapBase {
 /** A host for the switcher: scripted readiness, recorded paint/layout writes and wake-ups. */
 export class FakeSwitcherHost {
   readonly loaded = new Set<string>();
+  /** MapLibre reports a source no layer used at the last render as loaded. */
+  loadedWhenUnused = false;
   /** Last value written per layer and paint property. */
   readonly paint: Record<string, Record<string, unknown>> = {};
   /** Last value written per layer and layout property. */
@@ -518,7 +520,7 @@ export class FakeSwitcherHost {
   moving = false;
   readonly #listeners = new Map<string, (() => void)[]>();
 
-  isSourceLoaded(id: string): boolean { return this.loaded.has(id); }
+  isSourceLoaded(id: string): boolean { return this.loaded.has(id) || this.loadedWhenUnused; }
   setPaintProperty(layerId: string, name: string, value: unknown): void {
     (this.paint[layerId] ??= {})[name] = value;
     this.writes.push({ kind: 'paint', layerId, name, value });
