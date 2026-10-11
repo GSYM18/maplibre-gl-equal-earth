@@ -677,13 +677,20 @@ export class FakeControllerHost extends FakeV6Map {
     return structuredClone(this.style);
   }
 
+  /**
+   * Called first by every `setStyle`, whoever calls it (the plugin calls the method it captured
+   * before wrapping): `true` refuses the style, as MapLibre does a style with validation errors.
+   */
+  beforeSetStyle?: (style: StyleLike, options?: { diff?: boolean }) => boolean | void;
+
   setStyle(style: StyleLike, options?: { diff?: boolean }): this {
     this.setStyleCalls.push({ layers: style.layers.length, diff: options?.diff });
+    if (this.beforeSetStyle?.(style, options) === true) return this;
     if (this.deferStyleData || options?.diff === false || !this.style) {
       this.#pendingStyle = structuredClone(style);
       this.style = undefined;
       this.#sources.clear(); // a rebuild creates every source object anew
-      this.fireMapEvent('styledataloading');
+      this.fire({ type: 'styledataloading' });
       return this;
     }
     // A diff with no operations changes nothing and fires nothing.
@@ -716,7 +723,9 @@ export class FakeControllerHost extends FakeV6Map {
       if (layer.maxzoom === undefined && old.maxzoom !== undefined) layer.maxzoom = old.maxzoom;
     }
     this.#styleChanged = true;
-    this.fireMapEvent('style.load');
+    // `Style.setState` fires it on the Style, which bubbles through `parent.fire`: the Map's
+    // `fire`, looked up on the instance (so a wrapper there sees it).
+    this.fire({ type: 'style.load' });
     return this;
   }
 
@@ -747,8 +756,8 @@ export class FakeControllerHost extends FakeV6Map {
     if (!this.#pendingStyle) throw new Error('No pending setStyle to flush.');
     this.style = this.#pendingStyle;
     this.#pendingStyle = undefined;
-    this.fireMapEvent('styledata');
-    this.fireMapEvent('style.load');
+    this.fire({ type: 'styledata' });
+    this.fire({ type: 'style.load' });
   }
 
   /**
@@ -876,6 +885,23 @@ export class FakeControllerHost extends FakeV6Map {
     return structuredClone(this.getLayer(layerId)?.['filter']);
   }
 
+  /** The `layers` of every `queryRenderedFeatures` call. */
+  readonly queriedLayers: unknown[][] = [];
+
+  /** `Style.queryRenderedFeatures`: an unknown id in `layers` is an error event and no features. */
+  queryRenderedFeatures(geometryOrOptions?: unknown, options?: { layers?: string[] }): unknown[] {
+    const params = (options ?? (geometryOrOptions as { layers?: string[] } | undefined)) ?? {};
+    const layers = params.layers ?? [];
+    this.queriedLayers.push([...layers]);
+    for (const id of layers) {
+      if (!this.getLayer(id)) {
+        this.styleErrors.push(`The layer '${id}' does not exist in the map's style and cannot be queried for features.`);
+        return [];
+      }
+    }
+    return [];
+  }
+
   /** `Style.addLayer`: an inline source is added under the layer's id; refusals are error events. */
   addLayer(layer: StyleLike['layers'][number], beforeId?: string): this {
     this.edits.push({ method: 'addLayer', args: [structuredClone(layer), beforeId] });
@@ -944,9 +970,16 @@ export class FakeControllerHost extends FakeV6Map {
     return this;
   }
 
-  /** As `Evented.fire`: delivered only if something listens (the payload is recorded). */
+  /**
+   * As `Evented.fire`: an `error` is recorded only if something listens (its payload, not passed
+   * to the listeners); any other event is delivered to the Map's listeners.
+   */
   fire(event: { type: string; error?: unknown }): this {
-    if (event.type === 'error' && this.listens('error')) this.errors.push(event.error);
+    if (event.type === 'error') {
+      if (this.listens('error')) this.errors.push(event.error);
+      return this;
+    }
+    this.fireMapEvent(event.type);
     return this;
   }
 

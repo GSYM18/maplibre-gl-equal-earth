@@ -181,10 +181,8 @@ describe('EqualEarthController', () => {
     const { host, controller } = setup();
     await controller.activate('equal');
     const listenersAtSetStyle: number[] = [];
-    const setStyle = host.setStyle.bind(host);
-    host.setStyle = (style, options) => {
+    host.beforeSetStyle = () => {
       listenersAtSetStyle.push(host.listenerCount('render'));
-      return setStyle(style, options);
     };
     await controller.deactivate();
     expect(listenersAtSetStyle).toEqual([0]);
@@ -636,14 +634,7 @@ describe('EqualEarthController', () => {
       // The switch's TileJSON resolves; the map then rejects its rewritten style (as on a
       // validation error), leaving the application's style in place.
       await vi.waitFor(() => expect(held).toHaveLength(1));
-      const setStyle = host.setStyle.bind(host);
-      host.setStyle = (style, options) => {
-        if (style.metadata?.[REWRITTEN_METADATA_KEY] !== undefined) {
-          host.setStyleCalls.push({ layers: style.layers.length, diff: options?.diff });
-          return host;
-        }
-        return setStyle(style, options);
-      };
+      host.beforeSetStyle = (style) => style.metadata?.[REWRITTEN_METADATA_KEY] !== undefined;
       const switching = controller.activate('equal-earth');
       await vi.waitFor(() => expect(held).toHaveLength(2));
       held[1]!.resolve(TILEJSON);
@@ -1452,27 +1443,6 @@ describe('live style edits (Task 9)', () => {
     expect(layerOf(host, 'background')!.paint!['background-color']).toBe('#eeeeee');
   });
 
-  it("follows a style an application style.load listener sets inside an amend's setStyle", async () => {
-    const { host, controller } = setup();
-    await controller.activate('equal');
-    const appStyle = liberty();
-    appStyle.layers = appStyle.layers.slice(0, 10);
-    let swapped = false;
-    host.on('style.load', () => {
-      if (swapped) return;
-      swapped = true;
-      host.setStyle(appStyle, {});
-    });
-    host.addLayer(extra('extra'));
-    await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
-    await vi.waitFor(() => expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeDefined());
-    expect(swapped).toBe(true);
-    await tick();
-    expect(controller.active).toBe(true);
-    await controller.deactivate();
-    expect(host.style!.layers).toHaveLength(10); // the application's style became the original
-  });
-
   it('re-applies when MapLibre rebuilds an amended style instead of diffing it', async () => {
     const { host, controller } = setup();
     await controller.activate('equal');
@@ -1485,6 +1455,177 @@ describe('live style edits (Task 9)', () => {
     await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
     expect(layerOf(host, 'extra__b1')).toBeDefined();
     expect(controller.toGeographic([host.center.lng, host.center.lat])[1]).toBeCloseTo(TOKYO[1], 9);
+  });
+
+  describe('review fixes (R15–R18)', () => {
+    const MINE = { id: 'mine', type: 'circle', source: 'minesrc' };
+    const MINE_SOURCE = { type: 'geojson', data: { type: 'FeatureCollection', features: [{ type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: TOKYO } }] } };
+    /** The common "replace my layer" `style.load` listener; counts its calls (capped, so a loop ends). */
+    const replacing = (host: FakeControllerHost) => {
+      const counter = { calls: 0 };
+      const listener = () => {
+        if (++counter.calls > 50) return;
+        if (host.getLayer('mine')) host.removeLayer('mine');
+        if (host.getSource('minesrc')) host.removeSource('minesrc');
+        host.addSource('minesrc', structuredClone(MINE_SOURCE));
+        host.addLayer(structuredClone(MINE));
+      };
+      return { counter, listener };
+    };
+    /** The guarded `style.load` listener: adds its layer only when `getLayer` says it is missing. */
+    const guarding = (host: FakeControllerHost) => () => {
+      if (!host.getSource('minesrc')) host.addSource('minesrc', structuredClone(MINE_SOURCE));
+      if (!host.getLayer('mine')) host.addLayer(structuredClone(MINE));
+    };
+    const withMine = () => {
+      const style = liberty();
+      style.sources['minesrc'] = structuredClone(MINE_SOURCE);
+      style.layers.push(structuredClone(MINE));
+      return style;
+    };
+
+    it('an amend fires no style.load: a replace-my-layer listener does not run, and one addLayer is one setStyle (R15)', async () => {
+      const { host, controller } = setup();
+      await controller.activate('equal');
+      const { counter, listener } = replacing(host);
+      host.on('style.load', listener);
+      const styles = host.setStyleCalls.length;
+      host.addLayer(extra('extra'));
+      await tick();
+      await tick();
+      expect(counter.calls).toBe(0);
+      expect(host.setStyleCalls.length).toBe(styles + 1);
+      expect(layerOf(host, 'extra__b1')).toBeDefined();
+    });
+
+    it("an edit inside the plugin's own setStyle amends in a new macrotask, once (R15)", async () => {
+      const { host, controller } = setup();
+      const { counter, listener } = replacing(host);
+      host.on('style.load', listener); // runs inside the activation's setStyle
+      await controller.activate('equal');
+      expect(counter.calls).toBe(1);
+      await vi.waitFor(() => expect(layerOf(host, 'mine__b1')).toBeDefined());
+      await tick();
+      expect(counter.calls).toBe(1);
+      expect(host.setStyleCalls).toHaveLength(2); // the activation, then one amend
+      expect(host.styleErrors).toEqual([]);
+    });
+
+    it('a guarded listener re-adding its layer on a basemap switch is not refused (R16)', async () => {
+      const { host, controller } = setup(4.6, withMine());
+      host.on('error', () => undefined);
+      host.on('style.load', guarding(host)); // registered before the controller's own listener
+      await controller.activate('equal');
+      host.setStyle(liberty(), {}); // a new basemap, without the application's layer
+      await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+      await vi.waitFor(() => expect(layerOf(host, 'mine__b1')).toBeDefined());
+      expect(host.errors).toEqual([]);
+      expect(host.styleErrors).toEqual([]);
+      await controller.deactivate();
+      expect(layerOf(host, 'mine')).toBeDefined();
+    });
+
+    it("the plugin's own setStyle bypasses the setStyle wrapper (R16)", async () => {
+      const { host, controller } = setup();
+      expect(Object.hasOwn(host, 'setStyle')).toBe(true);
+      await controller.activate('equal');
+      await controller.deactivate();
+      await controller.destroy();
+      expect(Object.hasOwn(host, 'setStyle')).toBe(false);
+      expect(Object.hasOwn(host, 'fire')).toBe(false);
+      for (const name of ['getLayer', 'getPaintProperty', 'getLayoutProperty', 'getFilter']) expect(Object.hasOwn(host, name), name).toBe(false);
+    });
+
+    it('a layer added from style.load during the activation ends up banded (R17)', async () => {
+      const { host, controller } = setup();
+      host.once('style.load', () => host.addLayer(extra('late')));
+      await controller.activate('equal');
+      await vi.waitFor(() => expect(layerOf(host, 'late__b1')).toBeDefined());
+      expect(layerOf(host, 'late')!.minzoom).toBeGreaterThan(0); // the Mercator band's copy, ranged
+    });
+
+    it("a layer added from the rebuilt style's style.load ends up banded (R17)", async () => {
+      const { host, controller } = setup();
+      host.deferStyleData = true; // the activation's setStyle rebuilds; style.load comes on flush
+      const pending = controller.activate('equal');
+      await vi.waitFor(() => expect(host.setStyleCalls).toHaveLength(1));
+      host.once('style.load', () => host.addLayer(extra('late'))); // after the rewrite, before the install
+      host.deferStyleData = false;
+      host.flushStyleData();
+      await pending;
+      await vi.waitFor(() => expect(layerOf(host, 'late__b1')).toBeDefined());
+    });
+
+    for (const [name, make] of [
+      ['guarded', (host: FakeControllerHost) => guarding(host)],
+      ['replace-my-layer', (host: FakeControllerHost) => replacing(host).listener],
+    ] as const) {
+      it(`a ${name} style.load listener raises no error under pure Equal Earth, across activation and an amend (R18)`, async () => {
+        const { host, controller } = setup(2, withMine());
+        host.on('error', () => undefined);
+        host.on('style.load', make(host));
+        await controller.activate('equal-earth');
+        host.addLayer(extra('extra'));
+        await tick();
+        await tick();
+        expect(host.errors).toEqual([]);
+        expect(host.styleErrors).toEqual([]);
+        expect(layerOf(host, 'mine__b0')).toBeDefined();
+        expect(layerOf(host, 'extra__b0')).toBeDefined();
+        expect(host.style!.layers.filter((l) => l.id === 'mine' || l.id.startsWith('mine__'))).toHaveLength(1);
+      });
+    }
+
+    it('getLayer and the property getters resolve an id that is not live to the copy shown (R18)', async () => {
+      const { host, controller } = setup(2);
+      await controller.activate('equal-earth');
+      expect((host.getLayer('water') as { id: string } | undefined)?.id).toBe('water__b0');
+      host.setPaintProperty('water', 'fill-color', '#123456');
+      expect(host.getPaintProperty('water', 'fill-color')).toBe('#123456');
+      expect(host.getFilter('water')).toEqual(liberty().layers.find((l) => l.id === 'water')!['filter']);
+      expect(host.getLayoutProperty(LABEL, 'visibility')).toBeUndefined();
+      expect(host.getLayer('nowhere')).toBeUndefined();
+      await controller.deactivate();
+      expect((host.getLayer('water') as { id: string }).id).toBe('water');
+    });
+
+    it("queryRenderedFeatures's layers resolve as getLayer does, so a delegated layer listener raises no error (R18)", async () => {
+      const { host, controller } = setup(2);
+      await controller.activate('equal-earth');
+      // MapLibre's `on('click', 'water', …)` filters its ids with `getLayer`, then queries them.
+      const existing = ['water', 'nowhere'].filter((id) => host.getLayer(id));
+      host.queryRenderedFeatures({ layers: existing });
+      host.queryRenderedFeatures([0, 0], { layers: ['water'] });
+      expect(host.styleErrors).toEqual([]);
+      expect(host.queriedLayers).toEqual([['water__b0'], ['water__b0']]);
+    });
+
+    it("refuses a layer id a plugin layer holds, without keeping it (R18)", async () => {
+      const { host, controller } = setup();
+      host.on('error', () => undefined);
+      await controller.activate('equal');
+      host.addLayer(extra('water__b1'));
+      host.addLayer({ id: 'equal-earth:world__b1', type: 'line', source: 'openmaptiles', 'source-layer': 'water' });
+      expect(host.styleErrors).toEqual(['Layer "water__b1" already exists on this map.', 'Layer "equal-earth:world__b1" already exists on this map.']);
+      host.addLayer(extra('extra'));
+      await tick();
+      expect(host.errors).toEqual([]); // the amend's rewrite does not collide
+      expect(layerOf(host, 'extra__b1')).toBeDefined();
+    });
+
+    it('removeSource and addSource of an original source that is not live behave as natively (R18)', async () => {
+      const { host, controller } = setup(4.6, withMine());
+      host.on('error', () => undefined);
+      await controller.activate('equal-earth');
+      host.removeLayer('mine');
+      delete host.style!.sources['minesrc']; // stands in for an original source the live style lacks
+      expect(() => host.removeSource('minesrc')).not.toThrow();
+      await tick();
+      expect(host.errors).toEqual([]);
+      host.addSource('minesrc', structuredClone(MINE_SOURCE));
+      delete host.style!.sources['minesrc'];
+      expect(() => host.addSource('minesrc', structuredClone(MINE_SOURCE))).toThrow('Source "minesrc" already exists.');
+    });
   });
 
   it('destroy and dispose restore the seven methods', async () => {
