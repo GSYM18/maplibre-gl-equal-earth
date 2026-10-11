@@ -419,6 +419,11 @@ export class BandCamera {
     return this.#host.getZoom() - this.#lastOffsets.deltaZoom;
   }
 
+  /** The rendered bearing minus the bearing offset in effect: what was requested. */
+  get requestedBearing(): number {
+    return (this.#host.getBearing?.() ?? 0) - this.#lastOffsets.deltaBearing;
+  }
+
   /** The band rendered now: the selector's, or the requested zoom's. */
   get shownBand(): number {
     return this.#selector

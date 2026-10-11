@@ -44,7 +44,7 @@ export interface StyleLike {
   version: number;
   sources: Record<string, Record<string, unknown>>;
   layers: StyleLayerLike[];
-  state?: Record<string, { default: unknown }>;
+  state?: Record<string, { default?: unknown }>;
   metadata?: Record<string, unknown>;
   [key: string]: unknown;
 }

@@ -117,6 +117,15 @@ describe('createEqualEarthConstrain', () => {
     expect(constrain({ lng: 0, lat: limit1 + 1 }, 4.9).center.lat).toBeCloseTo(limit1, 9);
   });
 
+  it('takes the limit band from currentBand when given, not from the zoom (C1)', () => {
+    // z4.9 falls in band 0, but a holding switcher still draws band 1, whose world is wider.
+    const constrain = createEqualEarthConstrain({ lngLatFactory, bands: EQUAL, currentBand: () => 1 });
+    const limit1 = mapSpaceMaxLatitude(1 / 3);
+    expect(limit1).toBeGreaterThan(MAP_SPACE_MAX_LATITUDE);
+    expect(constrain({ lng: 0, lat: limit1 - 0.01 }, 4.9).center.lat).toBeCloseTo(limit1 - 0.01, 9);
+    expect(constrain({ lng: 0, lat: 89 }, 4.9).center.lat).toBeCloseTo(limit1, 9);
+  });
+
   it('does not clamp at all while the baseline band is Mercator', () => {
     // The requested state is then in geographic space: any Equal Earth edge would distort it.
     const constrain = createEqualEarthConstrain({ lngLatFactory, bands: EQUAL, baselineBand: () => 3 });
@@ -257,6 +266,22 @@ describe('installEqualEarthConstrain', () => {
     installEqualEarthConstrain(map, { lngLatFactory, fallback });
     map.constrain!({ lng: 0, lat: 0 }, 3);
     expect(fallback).toHaveBeenCalledOnce();
+  });
+
+  it("warns once per install when no default constraint is reachable (C2)", () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const map = new FakeMap(); // neither `transform` nor `_camera`
+    installEqualEarthConstrain(map, { lngLatFactory });
+    map.constrain!({ lng: 0, lat: 0 }, 3);
+    map.constrain!({ lng: 0, lat: 0 }, 4);
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0]![0])).toMatch(/defaultConstrain/);
+    // A second map is judged on its own.
+    const other = new FakeMap();
+    installEqualEarthConstrain(other, { lngLatFactory });
+    other.constrain!({ lng: 0, lat: 0 }, 3);
+    expect(warn).toHaveBeenCalledTimes(2);
+    warn.mockRestore();
   });
 
   it('rejects a map without setTransformConstrain (maplibre-gl < 5.24)', () => {

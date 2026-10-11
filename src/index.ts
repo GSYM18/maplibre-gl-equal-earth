@@ -142,6 +142,22 @@ export {
 } from './map/style-rewrite.js';
 
 export {
+  EqualEarthController,
+  type ControllerHost,
+  type ControllerOptions,
+  type EqualEarthProjection,
+  type HostStyle,
+} from './map/controller.js';
+
+export {
+  installEqualEarth,
+  parseVersion,
+  type EqualEarthInstall,
+  type InstallOptions,
+  type MapLibreModule,
+} from './install.js';
+
+export {
   BandSwitcher,
   chooseBand,
   type SwitchEvent,

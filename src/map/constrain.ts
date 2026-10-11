@@ -80,7 +80,8 @@ export interface EqualEarthConstrainOptions {
   latitudeMargin?: number;
   /**
    * Zoom bands, for the adaptive projection. The world edge then depends on the band the
-   * zoom falls in, and the Mercator band (blend 1) gets no Equal Earth clamp.
+   * zoom falls in, and the Mercator band (blend 1) gets no Equal Earth clamp. Must be the same
+   * list the camera and the switcher use: {@link baselineBand} and {@link currentBand} index it.
    *
    * @defaultValue a single Equal Earth band — the world edge at ≈ ±65.54° at every zoom
    */
@@ -105,6 +106,16 @@ export interface EqualEarthConstrainOptions {
    * @defaultValue the band of the zoom alone
    */
   baselineBand?: () => number;
+  /**
+   * Index into {@link bands} of the band actually drawn: `BandCamera.shownBand`.
+   *
+   * Without it the band is the one the constrained zoom falls in, but the rendered zoom carries
+   * the camera's zoom offset (spec §4.2) and a holding switcher (§4.3) keeps drawing a band the
+   * zoom has already left, so the zoom may name a band other than the one on screen.
+   *
+   * @defaultValue the band of the zoom the fallback settled on
+   */
+  currentBand?: () => number;
 }
 
 /**
@@ -122,7 +133,7 @@ export interface EqualEarthConstrainOptions {
 export function createEqualEarthConstrain(
   options: EqualEarthConstrainOptions,
 ): TransformConstrainFn {
-  const { lngLatFactory, fallback, baselineBand } = options;
+  const { lngLatFactory, fallback, baselineBand, currentBand } = options;
   const isActive = options.isActive ?? (() => true);
   const margin = options.latitudeMargin ?? 0;
   const bands = options.bands ?? [{ minZoom: 0, blend: 0 }];
@@ -136,8 +147,9 @@ export function createEqualEarthConstrain(
   return (lngLat, zoom) => {
     const base = fallback ? fallback(lngLat, zoom) : { center: lngLat, zoom };
     if (!isActive()) return base;
-    // The band of the zoom the fallback settled on, since that is what will be rendered.
-    let limit = limits[bandIndexForZoom(bands, base.zoom)]!;
+    // The band drawn, or else the band of the zoom the fallback settled on, since that is what
+    // will be rendered.
+    let limit = limits[currentBand ? currentBand() : bandIndexForZoom(bands, base.zoom)] ?? Infinity;
     const baseline = baselineBand?.();
     if (baseline !== undefined) limit = Math.max(limit, limits[baseline] ?? -Infinity);
     if (limit === Infinity) return base;
@@ -155,7 +167,8 @@ export function createEqualEarthConstrain(
  * Unless the options name a `fallback`, it composes with the map's own `defaultConstrain`,
  * read on every call because `migrateProjection` swaps the transform (v6 22077-22079): the
  * v5 `map.transform`, or the v6 `map._camera.transform`. If neither can be found the camera
- * is clamped without composing, as before.
+ * is clamped without composing, which disables MapLibre's own min/max zoom and `maxBounds`;
+ * that is warned about once per install (one map may be fine and another not).
  *
  * `setTransformConstrain(null)` reverts to the transform's default constrain, so unlike
  * `transformCameraUpdate` there is no prior value to preserve.
@@ -170,9 +183,18 @@ export function installEqualEarthConstrain(
         '(maplibre-gl >= 5.24).',
     );
   }
+  let warned = false;
   const fallback: TransformConstrainFn = (lngLat, zoom) => {
     const transform = currentTransform(host);
-    return transform ? transform.defaultConstrain(lngLat, zoom) : { center: lngLat, zoom };
+    if (transform) return transform.defaultConstrain(lngLat, zoom);
+    if (!warned) {
+      warned = true;
+      console.warn(
+        '[equal-earth] no transform with defaultConstrain reachable; ' +
+          "MapLibre's own camera constraint is disabled while Equal Earth is active.",
+      );
+    }
+    return { center: lngLat, zoom };
   };
   host.setTransformConstrain(
     createEqualEarthConstrain({ ...options, fallback: options.fallback ?? fallback }),
