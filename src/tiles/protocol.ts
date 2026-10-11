@@ -101,8 +101,8 @@ export function createEqualEarthProtocol(options: ProtocolOptions = {}): Protoco
     const cached = cache.get(url);
     if (cached !== undefined) return cached;
 
-    return coalescer.run(url, async () => {
-      const response = await doFetch(url, { signal });
+    return coalescer.run(url, async (sharedSignal) => {
+      const response = await doFetch(url, { signal: sharedSignal });
       // 404/204 mean "no such tile", which is normal at the edges of a tileset and must
       // not fail the whole output tile.
       if (response.status === 404 || response.status === 204) {
@@ -115,7 +115,7 @@ export function createEqualEarthProtocol(options: ProtocolOptions = {}): Protoco
       const data = await response.arrayBuffer();
       cache.set(url, data);
       return data;
-    });
+    }, signal);
   }
 
   return async (params, abortController) => {
@@ -126,7 +126,10 @@ export function createEqualEarthProtocol(options: ProtocolOptions = {}): Protoco
     // the original source and never asks for this, but a hand-built URL may.
     if ((config.blend ?? 0) === 1) {
       const passthrough = await loadSource(config.url, tile, abortController.signal);
-      return { data: passthrough ?? new ArrayBuffer(0) };
+      abortController.signal.throwIfAborted();
+      // A copy: the buffer is also the cache entry, and a main-thread handler's result gets
+      // transferred, which would detach the cached bytes for every later request.
+      return { data: passthrough ? passthrough.slice(0) : new ArrayBuffer(0) };
     }
 
     const sources = sourceTilesFor(tile, config);
@@ -139,6 +142,9 @@ export function createEqualEarthProtocol(options: ProtocolOptions = {}): Protoco
       })),
     );
 
+    // Sources fetched for other tiles can resolve after this one was abandoned; skip the
+    // 100-750 ms warp rather than compute a result nobody will read.
+    abortController.signal.throwIfAborted();
     const warped = warpTiles(fetched, tile, config);
     // MapLibre treats a zero-length ArrayBuffer as a legitimately empty tile.
     return { data: toArrayBuffer(warped) };

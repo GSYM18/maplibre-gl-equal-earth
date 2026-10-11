@@ -152,6 +152,30 @@ describe('RequestCoalescer', () => {
     ).rejects.toThrow('boom');
     expect(coalescer.pending).toBe(0);
   });
+
+  it('keeps the shared task alive when one of several callers aborts', async () => {
+    const coalescer = new RequestCoalescer<number>();
+    let release!: (value: number) => void;
+    const gate = new Promise<number>((resolve) => (release = resolve));
+    let taskSignal!: AbortSignal;
+    const task = vi.fn((signal: AbortSignal) => {
+      taskSignal = signal;
+      return gate;
+    });
+    const middle = new AbortController();
+
+    const first = coalescer.run('k', task, new AbortController().signal);
+    const second = coalescer.run('k', task, middle.signal);
+    const third = coalescer.run('k', task, new AbortController().signal);
+    middle.abort();
+
+    await expect(second).rejects.toMatchObject({ name: 'AbortError' });
+    expect(taskSignal.aborted).toBe(false);
+    release(9);
+    expect(await Promise.all([first, third])).toEqual([9, 9]);
+    expect(task).toHaveBeenCalledOnce();
+    expect(taskSignal.aborted).toBe(false);
+  });
 });
 
 describe('protocol handler', () => {
@@ -233,5 +257,91 @@ describe('protocol handler', () => {
     // The two output tiles share their whole source cover at z1, so the second must
     // issue no new requests.
     expect(fetchImpl.mock.calls.length).toBe(afterFirst);
+  });
+
+  it('returns a copy at blend 1, so detaching the result leaves the cache intact', async () => {
+    const fetchImpl = vi.fn(async () => new Response(new Uint8Array([1, 2, 3]).buffer));
+    const handler = createEqualEarthProtocol({ fetchImpl: fetchImpl as unknown as typeof fetch });
+
+    const first = await handler({ url: tileUrl(8, 3, 4, 1) }, new AbortController());
+    structuredClone(first.data, { transfer: [first.data] });
+    const second = await handler({ url: tileUrl(8, 3, 4, 1) }, new AbortController());
+
+    expect(first.data.byteLength).toBe(0);
+    expect(second.data.byteLength).toBe(3);
+  });
+
+  describe('aborts', () => {
+    /** A fetch that stays pending until released, and honours `init.signal`. */
+    function controllableFetch() {
+      const signals: AbortSignal[] = [];
+      const releases: (() => void)[] = [];
+      const fetchImpl = vi.fn((_url: string, init?: RequestInit) => {
+        const signal = init?.signal as AbortSignal;
+        signals.push(signal);
+        return new Promise<Response>((resolve, reject) => {
+          releases.push(() => resolve(new Response(null, { status: 404 })));
+          signal.addEventListener('abort', () => reject(signal.reason as Error), { once: true });
+        });
+      });
+      return {
+        fetchImpl: fetchImpl as unknown as typeof fetch,
+        signals,
+        releaseAll: () => releases.forEach((release) => release()),
+      };
+    }
+
+    it('does not cancel a shared source fetch when only one output tile aborts', async () => {
+      const { fetchImpl, signals, releaseAll } = controllableFetch();
+      const handler = createEqualEarthProtocol({ fetchImpl });
+      const a = new AbortController();
+      const b = new AbortController();
+
+      // z1 output tiles 0/1 and 1/1 share all four z1 sources.
+      const first = handler({ url: tileUrl(1, 0, 1) }, a);
+      const second = handler({ url: tileUrl(1, 1, 1) }, b);
+      a.abort();
+
+      await expect(first).rejects.toMatchObject({ name: 'AbortError' });
+      expect(signals.length).toBeGreaterThan(0);
+      expect(signals.every((signal) => !signal.aborted)).toBe(true);
+
+      releaseAll();
+      await expect(second).resolves.toHaveProperty('data');
+    });
+
+    it('cancels the shared fetch once every output tile has aborted', async () => {
+      const { fetchImpl, signals } = controllableFetch();
+      const handler = createEqualEarthProtocol({ fetchImpl });
+      const a = new AbortController();
+      const b = new AbortController();
+
+      const first = handler({ url: tileUrl(1, 0, 1) }, a);
+      const second = handler({ url: tileUrl(1, 1, 1) }, b);
+      a.abort();
+      b.abort();
+
+      await expect(first).rejects.toMatchObject({ name: 'AbortError' });
+      await expect(second).rejects.toMatchObject({ name: 'AbortError' });
+      expect(signals.length).toBeGreaterThan(0);
+      expect(signals.every((signal) => signal.aborted)).toBe(true);
+    });
+
+    it('rejects an aborted tile whose sources are all cached, without fetching', async () => {
+      const primed = vi.fn(async () => new Response(null, { status: 404 }));
+      const fetchImpl = vi.fn(primed);
+      const handler = createEqualEarthProtocol({ fetchImpl: fetchImpl as unknown as typeof fetch });
+      await handler({ url: tileUrl(1, 0, 1) }, new AbortController());
+
+      fetchImpl.mockImplementation(() => {
+        throw new Error('must not fetch');
+      });
+      const aborted = new AbortController();
+      aborted.abort();
+
+      await expect(handler({ url: tileUrl(1, 0, 1) }, aborted)).rejects.toMatchObject({
+        name: 'AbortError',
+      });
+    });
   });
 });
