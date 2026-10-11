@@ -192,7 +192,7 @@ async function main() {
   }; undefined`); // a function cannot be returned by value
   /** Shown band, geographic centre, where `ref` is drawn relative to the anchor, empty cells. */
   const sample = (ref) => evaluate(`(() => {
-    const { map: m, controller: c, shownBand } = window.__eqe; const band = shownBand();
+    const { map: m, shownBand } = window.__eqe; const band = shownBand();
     const canvas = m.getCanvas(), w = canvas.clientWidth, h = canvas.clientHeight;
     const ids = window.__probeIds(band); let empty = null;
     if (ids.length) {
@@ -202,16 +202,16 @@ async function main() {
         if (m.queryRenderedFeatures(box, { layers: ids }).length === 0) empty++;
       }
     }
-    const ctr = m.getCenter(); const geo = c.toGeographic([ctr.lng, ctr.lat]);
-    const p = m.project(c.toMapSpace(${JSON.stringify(ref)}));
+    const ctr = m.getCenter(); const geo = [ctr.lng, ctr.lat];
+    const p = m.project(${JSON.stringify(ref)});
     const offset = Math.hypot(p.x - (w / 2 + ${anchor[0]}), p.y - (h / 2 + ${anchor[1]}));
     return { zoom: m.getZoom(), band, geo, offset, empty };
   })()`);
   /** The place under the anchor, geographically. */
-  const underAnchor = () => evaluate(`(() => { const { map: m, controller: c } = window.__eqe;
+  const underAnchor = () => evaluate(`(() => { const { map: m } = window.__eqe;
     const canvas = m.getCanvas(), x = canvas.clientWidth / 2, y = canvas.clientHeight / 2;
     const p = m.unproject([x + ${anchor[0]}, y + ${anchor[1]}]);
-    return c.toGeographic([p.lng, p.lat]); })()`);
+    return [p.lng, p.lat]; })()`);
 
   async function wheel(direction) {
     const [x, y, hit] = await evaluate(`(() => {

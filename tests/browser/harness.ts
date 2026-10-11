@@ -6,6 +6,8 @@
  * `pixelRatio`), `?projection=mercator|globe|equal|equal-earth` (default mercator, set after
  * `load`), `?compensation=`, `?outside=` (colour), `?outline=1` and `?graticule=<step>|1` (all
  * passed to `installEqualEarth` when present). `?control=1` adds the `EqualEarthControl` (and, on v6, MapLibre's `GlobeControl`) top right.
+ * `?geoapi=0` passes `geographicApi: false` (map-space reads while active); `?hash=1` creates the
+ * map with `hash: true`.
  */
 import type { StyleSpecification } from 'maplibre-gl';
 
@@ -27,6 +29,8 @@ const control = params.get('control') === '1';
 const outline = params.get('outline') === '1';
 const graticuleParam = params.get('graticule');
 const graticule = graticuleParam === null ? undefined : graticuleParam === '1' ? true : { step: Number(graticuleParam) };
+const geoApi = params.get('geoapi') !== '0';
+const hash = params.get('hash') === '1';
 
 const fixtureStyle = (): StyleSpecification => ({
   version: 8,
@@ -54,6 +58,7 @@ const h = {
   }),
   errors: [] as string[],
   fixtureStyle,
+  geoApi: plugin && geoApi,
 } as Partial<Harness> as Harness;
 window.__h = h;
 
@@ -131,6 +136,7 @@ async function start(): Promise<void> {
       ...(outside ? { outsideColor: outside } : {}),
       ...(outline ? { outline: true } : {}),
       ...(graticule ? { graticule } : {}),
+      ...(geoApi ? {} : { geographicApi: false }),
     });
   }
   const map = new maplibregl.Map({
@@ -142,6 +148,7 @@ async function start(): Promise<void> {
     ...(dpr !== undefined ? { pixelRatio: dpr } : {}),
     canvasContextAttributes: { preserveDrawingBuffer: true },
     attributionControl: false,
+    ...(hash ? { hash: true } : {}),
   });
   h.map = map;
   if (control) {

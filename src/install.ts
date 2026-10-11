@@ -31,6 +31,7 @@ export interface MapLibreModule {
   getWorkerCount(): number;
   setWorkerCount(count: number): void;
   LngLat: new (lng: number, lat: number) => { lng: number; lat: number };
+  LngLatBounds: new (sw: [number, number], ne: [number, number]) => unknown;
   Map: { prototype: { setProjection(projection: unknown): unknown; getProjection(): unknown } };
 }
 
@@ -66,6 +67,14 @@ export interface InstallOptions {
   outline?: ControllerOptions['outline'];
   /** Meridians and parallels in every band (spec §5). Off unless given. */
   graticule?: ControllerOptions['graticule'];
+  /**
+   * While Equal Earth is active, `map.project`, `unproject`, `getCenter` and `getBounds` (and
+   * with them Marker, Popup, mouse-event `lngLat`, `Hash` and `ScaleControl`) speak geographic
+   * coordinates (spec §7). They are wrapped on each map at its first Equal Earth activation.
+   * `false` wraps nothing: those methods then report map space while active.
+   * @defaultValue true
+   */
+  geographicApi?: boolean;
 }
 
 export interface EqualEarthInstall {
@@ -183,6 +192,8 @@ async function install(
 
   const controllerOptions: ControllerOptions = {
     lngLatFactory: (lng, lat) => new maplibregl.LngLat(lng, lat),
+    lngLatBoundsFactory: (sw, ne) => new maplibregl.LngLatBounds(sw, ne),
+    ...(options.geographicApi === undefined ? {} : { geographicApi: options.geographicApi }),
     ...(options.transition ? { transition: options.transition } : {}),
     ...(options.compensation ? { compensation: options.compensation } : {}),
     ...(options.fetchJson ? { fetchJson: options.fetchJson } : {}),
