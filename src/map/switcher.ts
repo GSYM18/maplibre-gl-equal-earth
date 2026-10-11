@@ -9,7 +9,7 @@
  *
  * Readiness comes from `isSourceLoaded`, public on both supported majors: every in-view tile
  * loaded or errored. It is also true for a source no layer used at the last render, so a band
- * counts as ready only if it was parsed at the zoom of the last decision (its layers were in
+ * counts as ready only if it was parsed at the zoom of the last render (its layers were in
  * range, so its tiles were really requested). Nothing here reads MapLibre's tile caches.
  *
  * Known residual: with the map's `fadeDuration: 0` and a symbol re-parse slower than
@@ -23,6 +23,7 @@ import { applyGate, type GateHost, type LayerGate } from './style-rewrite.js';
 
 export interface SwitcherHost extends GateHost {
   isSourceLoaded(id: string): boolean | undefined;
+  getZoom(): number;
   isMoving(): boolean;
   jumpTo(options: Record<string, never>): unknown;
   on(type: string, listener: () => void): unknown;
@@ -92,9 +93,11 @@ const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
 };
 
 /**
- * Before the first `decide`, `#lastZoom` is null and no band counts as ready, so the installer
- * should run one camera update right after construction (the controller does this via its
- * initial `jumpTo`).
+ * Readiness is judged at the zoom of the last `render` (MapLibre marks a source used, and
+ * requests its tiles, only while rendering), so nothing counts as ready until the first
+ * `render` after `start()`. A band whose source has only symbol layers is vacuously ready even
+ * when parsed (its hidden symbol copies are `visibility: none`, which MapLibre counts as
+ * unused); harmless for a single-source OpenMapTiles style.
  */
 export class BandSwitcher implements BandSelector {
   readonly #host: SwitcherHost;
@@ -110,7 +113,7 @@ export class BandSwitcher implements BandSelector {
   readonly #pendingHides = new Map<number, () => void>();
   #wakePending = false;
   #wakeTimer: (() => void) | null = null;
-  #lastZoom: number | null = null;
+  #renderedZoom: number | null = null;
   #started = false;
 
   constructor(host: SwitcherHost, options: SwitcherOptions) {
@@ -138,12 +141,14 @@ export class BandSwitcher implements BandSelector {
     this.#started = true;
     this.#host.on('sourcedata', this.#onWake);
     this.#host.on('idle', this.#onWake);
+    this.#host.on('render', this.#onRender);
   }
 
   destroy(): void {
     if (this.#started) {
       this.#host.off('sourcedata', this.#onWake);
       this.#host.off('idle', this.#onWake);
+      this.#host.off('render', this.#onRender);
       this.#started = false;
     }
     this.#cancelWake();
@@ -152,7 +157,6 @@ export class BandSwitcher implements BandSelector {
   }
 
   decide(requestedZoom: number): number {
-    this.#wakePending = false;
     const { band, forced, target } = this.#choose(requestedZoom);
     if (target === this.#shown) this.#waitingSince = null;
     else this.#waitingSince ??= this.#now();
@@ -161,9 +165,12 @@ export class BandSwitcher implements BandSelector {
       if (!forced && this.#now() - this.#lastSwitchAt < this.#dwellMs) result = this.#shown;
       else this.#switch(band, { requestedZoom, target, forced });
     }
-    this.#lastZoom = requestedZoom;
     return result;
   }
+
+  readonly #onRender = (): void => {
+    this.#renderedZoom = this.#host.getZoom();
+  };
 
   #cancelWake(): void {
     this.#wakeTimer?.();
@@ -193,10 +200,10 @@ export class BandSwitcher implements BandSelector {
   };
 
   #isReady(band: number): boolean {
-    if (this.#lastZoom === null) return false;
+    if (this.#renderedZoom === null) return false;
     if (this.#o.transition) {
       const [lo, hi] = parseRange(this.#o.transition, band);
-      if (!(this.#lastZoom >= lo && this.#lastZoom < hi)) return false;
+      if (!(this.#renderedZoom >= lo && this.#renderedZoom < hi)) return false;
     }
     return this.#o.sourceIdsForBand(band).every((id) => this.#host.isSourceLoaded(id) === true);
   }

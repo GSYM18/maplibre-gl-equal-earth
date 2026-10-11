@@ -36,8 +36,9 @@ function setup(initialBand = 1, zoom = 4.4, extra: Partial<SwitcherOptions> = {}
   });
   switcher.start();
   host.onJump = () => { switcher.decide(requested); };
-  switcher.decide(zoom); // the first render: readiness is judged against the last decided zoom
-  return { host, c, events, switcher, zoomTo: (z: number) => { requested = z; return switcher.decide(z); } };
+  host.zoom = zoom;
+  host.fire('render'); // the first frame: readiness is judged at the last rendered zoom
+  return { host, c, events, switcher, zoomTo: (z: number) => { requested = z; host.zoom = z; const r = switcher.decide(z); host.fire('render'); return r; } };
 }
 
 describe('chooseBand (spec §4.3 rules)', () => {
@@ -156,6 +157,8 @@ describe('BandSwitcher', () => {
     const { host, zoomTo } = setup(2, 4.1);
     host.loadedWhenUnused = true;
     expect(zoomTo(6.3)).toBe(2); // band 3 was out of range at z4.1: no tile was ever requested
+    host.loadedWhenUnused = false; // from here only real loading counts
+    expect(zoomTo(6.3)).toBe(2);
     host.loaded.add('openmaptiles__b3');
     expect(zoomTo(6.3)).toBe(3);
   });
@@ -171,7 +174,7 @@ describe('BandSwitcher', () => {
   });
 
   it('wakes once at the end of the dwell when the band becomes ready inside it', () => {
-    const { host, c, zoomTo } = setup(1, 4.4);
+    const { host, c, zoomTo, switcher } = setup(1, 4.4);
     host.loaded.add('openmaptiles__b2');
     expect(zoomTo(4.9)).toBe(2); // switch at t=0
     expect(zoomTo(5.7)).toBe(2); // band 3 not ready
@@ -184,6 +187,40 @@ describe('BandSwitcher', () => {
     expect(host.jumps).toBe(0);
     c.advance(1);
     expect(host.jumps).toBe(1);
+    expect(switcher.current()).toBe(3);
+  });
+
+  it('does not trust a zoom that has not been rendered yet', () => {
+    const { host, switcher } = setup(2, 4.1);
+    host.loadedWhenUnused = true;
+    expect(switcher.decide(6.3)).toBe(2);
+    expect(switcher.decide(6.3)).toBe(2); // still no render: band 3's source is only vacuously loaded
+    host.zoom = 6.3;
+    host.fire('render');
+    expect(switcher.decide(6.3)).toBe(3);
+  });
+
+  it('does not wake the camera for a zoom that has not been rendered yet', () => {
+    const { host, switcher } = setup(2, 4.1, { requestedZoom: () => 6.3 });
+    host.loadedWhenUnused = true;
+    switcher.decide(6.3);
+    host.fire('sourcedata');
+    expect(host.jumps).toBe(0);
+  });
+
+  it('cancels the dwell wake on destroy and on an intervening switch', () => {
+    for (const how of ['destroy', 'switch'] as const) {
+      const { host, c, zoomTo, switcher } = setup(1, 4.4);
+      host.loaded.add('openmaptiles__b2');
+      zoomTo(4.9);
+      zoomTo(5.7);
+      host.loaded.add('openmaptiles__b3');
+      host.fire('sourcedata'); // schedules the wake for the end of the dwell
+      if (how === 'destroy') switcher.destroy();
+      else expect(zoomTo(7.4)).toBe(5); // forced switch
+      c.advance(1000);
+      expect(host.jumps).toBe(0);
+    }
   });
 
   it('rejects a hysteresis that reaches the band spacing', () => {
