@@ -71,10 +71,21 @@
  *   by URL that is not cached yet (an added GeoJSON source, a TileJSON) is fetched first: only then
  *   does an amend wait, and edits made meanwhile join it. A source that cannot be resolved is
  *   reported (an `error` event, as for a re-apply) and stays unbanded.
- * - An amend is invisible, as a native `addLayer` is (R15): the `style.load` that `Style.setState`
- *   fires for its diff bubbles through the Map's `fire`, which is wrapped to swallow it while the
- *   amend's `setStyle` runs. An edit made inside the plugin's own `setStyle` (an application
- *   listener of an event it fires) is amended in a new macrotask, never in the running amend loop.
+ * - An amend is invisible, as a native `addLayer` is (R15), and so are activation, re-apply and
+ *   restore, as a native `setProjection` is (R21): the `style.load` that `Style.setState` fires for
+ *   the plugin's own diff bubbles through the Map's `fire`, which is wrapped to swallow it while
+ *   that `setStyle` runs. The application's `style.load` listeners hear only the styles it set
+ *   itself, once each; MapLibre's own listener only jumps to an unmodified camera's stylesheet view,
+ *   wrong for a map-space style anyway. A full rebuild of ours (a diff MapLibre cannot apply) still
+ *   delivers its later `style.load`. An edit made inside the plugin's own `setStyle` (an application
+ *   listener of an event it fires, such as `sourcedataloading`) is amended in a new macrotask, never
+ *   in the running amend loop.
+ * - An application `setStyle(url)` still fetching is never cancelled (R20): MapLibre aborts its
+ *   `_diffStyleRequest` on any `setStyle` of an object, ours included. While it is out, an amend
+ *   and a re-apply (or activation) wait, polling, and the wrappers go on following the original
+ *   (the live style is still ours). Its style arrives and is captured, which supersedes them and,
+ *   as natively, drops what was edited on the old style; or the fetch fails or changes nothing, and
+ *   they go ahead with the edits. A deactivation restores at once and asks for the URL again.
  * - Edits made while an activation fetches its TileJSON are taken before it commits; edits made
  *   while a re-apply is in flight reach the original it rewrites, and an amend follows the apply
  *   once it has finished (R17).
@@ -84,8 +95,9 @@
  *   switched to (`setStyle(url)` diffs it in from MapLibre's own fetch, so the call is long over),
  *   they pass straight through: a `style.load` listener that re-adds its layers edits the live
  *   style, where the capture finds them, and an edit made after the capture but before the
- *   re-apply is found by the re-apply's second look at the live style. The application's
- *   `setStyle` is still tracked (R16), but only a rewrite without a sentinel depends on it.
+ *   re-apply is found by the re-apply's second look at the live style, made again after every wait
+ *   (a TileJSON, a GeoJSON URL). The application's `setStyle` is still tracked (R16, R20), and a
+ *   rewrite without a sentinel decides by it.
  * - `getLayer`, `getPaintProperty`, `getLayoutProperty`, `getFilter` and the `layers` of
  *   `queryRenderedFeatures` read an original id that is not live (pure Equal Earth, or outside
  *   the Mercator band's range) as its copy in the band shown, else its first live copy (R18): the
@@ -352,6 +364,9 @@ export const SUPERSEDED_ERROR_NAME = 'EqualEarthSupersededError';
 
 const NO_OFFSETS: SimilarityOffsets = { deltaZoom: 0, deltaBearing: 0 };
 
+/** How often a wait for the application's `setStyle` looks again (R20): a style that changes nothing fires no event. */
+const APP_STYLE_POLL_MS = 16;
+
 const UNWARPED_TYPES: ReadonlySet<string> = new Set(['raster', 'hillshade', 'color-relief']);
 let reliefAnnounced = false;
 
@@ -474,15 +489,19 @@ export class EqualEarthController {
   /** An amend deferred to a new macrotask (an edit made inside the plugin's own `setStyle`, R15). */
   #amendTimer: ReturnType<typeof setTimeout> | undefined;
   #amendDeferred = false;
-  /** Set around an amend's `setStyle`: the `style.load` events it fires, swallowed (R15). */
-  #amendLoads: { count: number } | undefined;
+  /** Set around the plugin's own `setStyle`: the `style.load` events it fires, swallowed (R15, R21). */
+  #ownLoads: { count: number } | undefined;
   /**
-   * An application `setStyle` while active (R16): `call` during the call, `awaiting` until the
-   * style it asked for arrives (a URL, or a rebuild) or fails (an `error`), `none` once
-   * `#onStyleLoad` has run. Bookkeeping only: the live style decides (R19, {@link #liveIsOurs});
-   * this is consulted only for a rewrite without a sentinel.
+   * An application `setStyle` while active (R16): `call` during the call; `fetch` while a URL is
+   * fetched, until MapLibre's `_diffStyleRequest` is gone (or, on a map without it, until the
+   * style's `style.load` or an `error`); `rebuild` while a full rebuild loads, until its
+   * `style.load` or an `error`; `none` otherwise. See {@link #appStyleInFlight}.
    */
-  #appStyle: 'none' | 'call' | 'awaiting' = 'none';
+  #appStyle: 'none' | 'call' | 'fetch' | 'rebuild' = 'none';
+  /** The application's `setStyle` calls while active: an amend tells one made inside its own. */
+  #appStyleCalls = 0;
+  /** The application's last `setStyle(url)` while active, and MapLibre's request for it (R20). */
+  #appRequest: { url: string; rest: unknown[]; request: object | null | undefined } | undefined;
   /** Per rewrite, the id of a layer it adds that no original has (R19, {@link #liveIsOurs}). */
   readonly #sentinels = new WeakMap<RewrittenStyle, string | undefined>();
   /** Warped GeoJSON by data object and band (`blend/zoom`): an amend re-warps only new data. */
@@ -644,6 +663,7 @@ export class EqualEarthController {
     this.#projection = undefined;
     this.#view = undefined;
     this.#appStyle = 'none';
+    this.#appRequest = undefined;
     this.#unsubscribe(); // `off` only: the map's state is not touched
     this.#release();
   }
@@ -710,11 +730,7 @@ export class EqualEarthController {
     const original = this.#original;
     this.#projection = undefined;
     this.#unsubscribe();
-    if (original) {
-      const live = this.#readStyle();
-      takeLiveRoot(original, live);
-      this.#setStyle(restorableStyle(original, live));
-    }
+    if (original) this.#restoreOriginal(original, this.#readStyle());
     this.#rewritten = undefined;
     this.#finishDeactivate(view);
   }
@@ -961,21 +977,33 @@ export class EqualEarthController {
     let edits = this.#edits;
     resolved ??= await this.#resolveSources(original);
     if (generation !== this.#generation) return false;
-    // R19: edits made since the capture while the live style was the application's went to the
-    // live style alone. Capture it again (and resolve what it added) so the rewrite keeps them.
+    // Until the rewrite is set, three things can leave it behind the application, each looked at
+    // again after any wait, since every wait lets the application act:
+    // - R20: an application `setStyle(url)` still fetching. Our `setStyle` would abort it
+    //   (MapLibre's `_diffStyle` aborts `_diffStyleRequest`), so wait: its style arrives
+    //   (`#onStyleLoad` captures it and re-applies, superseding this apply), or the fetch fails or
+    //   changes nothing.
+    // - R19: edits made since the capture while the live style was the application's went to the
+    //   live style alone. Capture it again (and resolve what it added) so the rewrite keeps them.
+    // - GeoJSON data set since the capture (the application's `setProjection` and `setData` in one
+    //   tick, a `setData` right after its own `setStyle`): the wrappers only exist once installed.
+    //   Take the live data, so the rewrite neither warps nor diffs back the old one; a new URL is
+    //   resolved first.
     for (;;) {
+      if (this.#appStyleInFlight()) {
+        await this.#appStyleSettled(generation);
+        if (generation !== this.#generation) return false;
+        continue;
+      }
       const live = this.#edits === edits ? undefined : this.#readStyle();
-      if (!live || hasOurMetadata(live)) break;
-      edits = this.#edits;
-      original = this.#original = this.#capture(live);
-      resolved = await this.#resolveSources(original);
-      if (generation !== this.#generation) return false;
-    }
-    // The application may have set GeoJSON data since the original was captured (its
-    // `setProjection` and `setData` in one tick, a `setData` right after its own `setStyle`): the
-    // wrappers only exist once installed. Take the live data, so the rewrite neither warps nor
-    // diffs back the old one; a new URL is resolved first.
-    while (this.#refreshGeoJSONData(original)) {
+      if (live && !hasOurMetadata(live)) {
+        edits = this.#edits;
+        original = this.#original = this.#capture(live);
+        resolved = await this.#resolveSources(original);
+        if (generation !== this.#generation) return false;
+        continue;
+      }
+      if (!this.#refreshGeoJSONData(original)) break;
       resolved = { ...resolved, geojson: await this.#geojsonData(original, false) };
       if (generation !== this.#generation) return false;
     }
@@ -986,13 +1014,15 @@ export class EqualEarthController {
     const initialBand = bandIndexForZoom(bands, view.zoom);
     const rewritten = this.#rewrite(original, resolved, view.zoom);
 
-    // C7: install only once the rewritten style has loaded. Listen first: on the diff path
-    // `style.load` fires inside `setStyle`; on a full rebuild a frame or more later, or never
-    // when the rebuild is aborted, in which case the generation has moved on (M2).
+    // C7: install only once the rewritten style has loaded. On the diff path `style.load` fires
+    // inside `setStyle`, where it is counted and swallowed (R21); on a full rebuild it fires a
+    // frame or more later, unswallowed, or never when the rebuild is aborted, in which case the
+    // generation has moved on (M2). Listen first.
     const styleLoad = this.#nextEvent('style.load');
     this.#rewritten = rewritten;
-    this.#setStyle(rewritten.style);
-    if (!styleLoad.fired()) {
+    if (this.#setStyle(rewritten.style) > 0) {
+      styleLoad.cancel();
+    } else if (!styleLoad.fired()) {
       const current = this.#readStyle();
       if (current) {
         // Loaded without a `style.load`: either MapLibre found nothing to change (the style is
@@ -1090,7 +1120,7 @@ export class EqualEarthController {
    */
   readonly #onStyleLoading = (): void => {
     if (!this.active || this.#applying) return;
-    if (this.#appStyle === 'call') this.#appStyle = 'awaiting';
+    if (this.#appStyle !== 'none') this.#appStyle = 'rebuild';
     this.#view = this.#detach();
     if (!this.#switchPending()) this.#nextGeneration();
   };
@@ -1130,13 +1160,67 @@ export class EqualEarthController {
     this.#host.off('style.load', this.#onStyleLoad);
   }
 
-  /** Our own `setStyle`: its style events are not the application's. */
-  #setStyle(style: StyleLike): void {
+  /**
+   * Our own `setStyle`: its style events are not the application's. The `style.load` a diff fires
+   * inside it (`Style.setState`) is swallowed (R15, R21): activation, re-apply, amend and restore
+   * are as invisible to the application's `style.load` listeners as a native `setProjection`. The
+   * count is returned. MapLibre's own `style.load` listener (`ui/map.ts:864`) only jumps to the
+   * stylesheet's camera while the camera is unmodified, which our geographic centre in a map-space
+   * style must not do anyway, and resizes the transform of a map created with a globe style, once.
+   */
+  #setStyle(style: StyleLike): number {
+    const loads = { count: 0 };
+    const outer = this.#ownLoads;
+    this.#ownLoads = loads;
     this.#applying = true;
     try {
       this.#rawStyle.setStyle(style, { diff: true });
     } finally {
       this.#applying = false;
+      this.#ownLoads = outer;
+    }
+    return loads.count;
+  }
+
+  /**
+   * Put the original back (deactivation, abandon). Our `setStyle` aborts an application
+   * `setStyle(url)` still fetching (R20), so ask for that style again: MapLibre then diffs it into
+   * the original, as it would have without us, and fires its `style.load`.
+   */
+  #restoreOriginal(original: StyleLike, live: StyleLike | undefined): void {
+    const asked = this.#appRequest;
+    const request = this.#diffStyleRequest();
+    takeLiveRoot(original, live);
+    this.#setStyle(restorableStyle(original, live));
+    if (asked && request && asked.request === request) this.#rawStyle.setStyle(asked.url, ...asked.rest);
+  }
+
+  /** MapLibre's `_diffStyleRequest` (both majors): `null` while no URL is fetched, `undefined` on a map without it. */
+  #diffStyleRequest(): object | null | undefined {
+    const host: object = this.#host;
+    if (!('_diffStyleRequest' in host)) return undefined;
+    const request = host._diffStyleRequest;
+    return typeof request === 'object' ? request : null;
+  }
+
+  /**
+   * Whether a `setStyle` of the plugin's own would cancel or overtake one of the application's
+   * (R20). A URL is fetched with `_diffStyleRequest` set, which any `setStyle` of an object aborts
+   * (`Map._diffStyle`, `ui/map.ts:2743`); only the application passes a URL. Once the request is
+   * gone, the style has arrived (and `#onStyleLoad` has captured it), changed nothing (no event at
+   * all), failed or was aborted. On a map without the field, the bookkeeping decides alone.
+   */
+  #appStyleInFlight(): boolean {
+    const request = this.#diffStyleRequest();
+    if (request) return true;
+    if (this.#appStyle === 'fetch' && request === null) this.#appStyle = 'none';
+    return this.#appStyle !== 'none';
+  }
+
+  /** Resolves once no application `setStyle` is in flight, or `generation` is stale. */
+  async #appStyleSettled(generation: number): Promise<void> {
+    while (generation === this.#generation && !this.#destroyed && this.#appStyleInFlight()) {
+      await new Promise((resolve) => setTimeout(resolve, APP_STYLE_POLL_MS));
     }
   }
 
@@ -1171,6 +1255,7 @@ export class EqualEarthController {
   #finishDeactivate(view: View): void {
     this.#view = undefined;
     this.#appStyle = 'none';
+    this.#appRequest = undefined;
     this.#geojson.clear(); // the next activation fetches afresh
 
     if (this.#worldCopies !== undefined) {
@@ -1196,10 +1281,7 @@ export class EqualEarthController {
     this.#projection = undefined;
     this.#unsubscribe();
     const live = this.#readStyle();
-    if (this.#original && hasOurMetadata(live)) {
-      takeLiveRoot(this.#original, live);
-      this.#setStyle(restorableStyle(this.#original, live));
-    }
+    if (this.#original && hasOurMetadata(live)) this.#restoreOriginal(this.#original, live);
     this.#rewritten = undefined;
     this.#finishDeactivate(view);
   }
@@ -1249,18 +1331,22 @@ export class EqualEarthController {
     restores.push(
       wrapMethod<Edit>(host, 'queryRenderedFeatures', () => (...args) => raw.queryRenderedFeatures(...this.#resolveQuery(args))),
     );
-    // R15: an amend is invisible, as a native `addLayer` is: the `style.load` its `setStyle`
-    // fires (`Style.setState`, bubbling through the Map's `fire`) is counted, not delivered.
+    // R15, R21: the plugin's own `setStyle` is invisible, as a native `addLayer` or `setProjection`
+    // is: the `style.load` it fires (`Style.setState`, bubbling through the Map's `fire`) is
+    // counted, not delivered.
     restores.push(
       wrapMethod<Edit>(host, 'fire', (original) => (event, ...rest) => {
         const type = eventType(event);
-        const loads = this.#amendLoads;
+        const loads = this.#ownLoads;
         if (loads && type === 'style.load') {
           loads.count++;
           return host;
         }
-        // A style the application asked for that failed to load (R16 bookkeeping).
-        if (type === 'error' && this.#appStyle === 'awaiting') this.#appStyle = 'none';
+        // A style the application asked for that failed to load (R16 bookkeeping); where MapLibre
+        // has `_diffStyleRequest`, a URL's fetch is told by that instead (any `error` may come meanwhile).
+        if (type === 'error' && (this.#appStyle === 'rebuild' || (this.#appStyle === 'fetch' && this.#diffStyleRequest() === undefined))) {
+          this.#appStyle = 'none';
+        }
         return original(event, ...rest);
       }),
     );
@@ -1288,20 +1374,26 @@ export class EqualEarthController {
   #liveIsOurs(): boolean {
     const rewritten = this.#rewritten;
     const sentinel = rewritten ? this.#sentinels.get(rewritten) : undefined;
-    if (sentinel === undefined) return this.#appStyle === 'none';
+    if (sentinel === undefined) return !this.#appStyleInFlight();
     return this.#rawStyle.getLayer(sentinel) !== undefined;
   }
 
-  /** The application's `setStyle`: bookkeeping until the style it asked for has arrived (R16). */
+  /** The application's `setStyle`: bookkeeping until the style it asked for has arrived (R16, R20). */
   #appSetStyle(style: unknown, rest: unknown[]): unknown {
     if (!this.active) return this.#rawStyle.setStyle(style, ...rest);
+    this.#appStyleCalls++;
     this.#appStyle = 'call';
+    // Its `style.load` is the application's, even when it sets a style inside one of ours (R21).
+    const own = this.#ownLoads;
+    this.#ownLoads = undefined;
     try {
       return this.#rawStyle.setStyle(style, ...rest);
     } finally {
+      this.#ownLoads = own;
+      if (typeof style === 'string') this.#appRequest = { url: style, rest, request: this.#diffStyleRequest() };
       // An object diffed in synchronously (captured by `#onStyleLoad`, or nothing changed); a URL
-      // arrives later, through MapLibre's own diff or rebuild.
-      if (this.#appStyle === 'call') this.#appStyle = typeof style === 'string' ? 'awaiting' : 'none';
+      // arrives later, through MapLibre's own diff (or rebuild, `#onStyleLoading`).
+      if (this.#appStyle === 'call') this.#appStyle = typeof style === 'string' ? 'fetch' : 'none';
     }
   }
 
@@ -1554,6 +1646,15 @@ export class EqualEarthController {
         const generation = this.#generation;
         const failed = new Set<string>();
         for (;;) {
+          if (this.#appStyleInFlight()) {
+            // R20: our `setStyle` would abort the application's. Its style arrives (captured and
+            // re-applied, which takes every edit: this amend is moot), or the fetch fails or
+            // changes nothing, and the amend goes ahead.
+            await this.#appStyleSettled(generation);
+            if (generation !== this.#generation || this.#installed !== installed || this.#original !== original) return;
+            this.#amendRequested = false; // the edits made meanwhile are in the original: this pass takes them
+            continue;
+          }
           this.#amendDeferred = false; // this pass reads the original: it takes every edit so far
           this.#refreshGeoJSONData(original);
           const { resolved, missing } = this.#resolveNow(original, failed);
@@ -1577,6 +1678,9 @@ export class EqualEarthController {
       reportError(this.#host, error);
     } finally {
       this.#amendRunning = false;
+      // An edit made while this loop waited, which it then gave up (a re-apply took over): no apply
+      // in flight will pick it up, so run again (and stop at once if nothing is installed).
+      if (this.#amendRequested && this.#inFlight === undefined && this.#installed) this.#scheduleAmend();
     }
   }
 
@@ -1635,24 +1739,23 @@ export class EqualEarthController {
         }
       }
       const host = this.#host;
-      const loads = { count: 0 };
       let rebuilt = false;
       const onLoading = (): void => {
         rebuilt = true;
       };
+      const calls = this.#appStyleCalls;
       host.on('styledataloading', onLoading);
       this.#rewritten = rewritten;
-      this.#amendLoads = loads; // the `fire` wrapper counts and swallows `style.load` (R15)
+      let loads: number;
       try {
-        this.#setStyle(rewritten.style);
+        loads = this.#setStyle(rewritten.style); // its `style.load` is swallowed (R15)
       } finally {
-        this.#amendLoads = undefined;
         host.off('styledataloading', onLoading);
       }
-      if (loads.count > 1 || rebuilt) {
-        // A diff fires one `style.load`. More, or a rebuild: an application `style.load` listener
-        // set a style of its own inside ours (or MapLibre could not diff ours), and `#applying`
-        // hid its events. Handle them now, as if they had been heard.
+      if (rebuilt || this.#appStyleCalls !== calls) {
+        // MapLibre could not diff ours, or an application listener of an event our `setStyle`
+        // fired set a style of its own inside it, and `#applying` hid its events. Handle them
+        // now, as if they had been heard.
         const after = this.#readStyle();
         if (after === undefined) this.#onStyleLoading();
         else if (!hasOurMetadata(after)) this.#onStyleLoad();
@@ -1661,7 +1764,7 @@ export class EqualEarthController {
       // No `style.load`: nothing changed, or MapLibre refused the style (its validation errors
       // are `error` events). A refused style left the previous rewrite live.
       const added = rewritten.style.layers.find((layer) => !existed.has(layer.id));
-      if (loads.count === 0 && added && this.#rawStyle.getLayer(added.id) === undefined) {
+      if (loads === 0 && added && this.#rawStyle.getLayer(added.id) === undefined) {
         this.#rewritten = previous;
         throw new Error('Equal Earth: the map did not accept the amended style; the edit reaches the Mercator band only.');
       }

@@ -288,16 +288,20 @@ prints say nothing about latency on real hardware.
   new original and is rewritten. But `getStyle()` → modify → `setStyle()` hands back our
   rewritten style, which still counts as ours: the change is not captured as the original and
   is dropped on deactivation, and layers added against the original source id find no band
-  source. Change such a style before activating, or deactivate first.
+  source. Change such a style before activating, or deactivate first. A `setStyle(url)` is
+  never cancelled by the plugin: while MapLibre fetches it, the plugin's own style updates wait
+  (edits made meanwhile are kept if the fetch fails, and dropped with the old style, as in
+  MapLibre, when it arrives), and a deactivation meanwhile requests the URL again.
 - **Style edits while active.** `addSource`, `removeSource`, `addLayer`, `removeLayer`,
   `setPaintProperty`, `setLayoutProperty` and `setFilter` reach every band: address your own
   ids, the plugin fans the change out to the band copies (`<id>__b<k>`) and keeps it for
   deactivation. A layer or source you add is drawn warped in each band from the next microtask
   on (several edits in one task cost one style diff; a GeoJSON or TileJSON given by URL is
   fetched first). An opacity the transition gates, or a symbol layer's `visibility`, becomes the
-  value its band shows. Like a native `addLayer`, none of this fires `style.load`, so a
-  `style.load` listener that re-adds its layers runs only for a real style change (a `setStyle`
-  of yours, or the activation itself). Under pure Equal Earth (and outside the Mercator band's
+  value its band shows. Like a native `addLayer`, none of this fires `style.load`, and neither
+  does switching the projection on or off, as with a native `setProjection`: a `style.load`
+  listener that re-adds its layers runs once for each `setStyle` of yours and for nothing else.
+  Under pure Equal Earth (and outside the Mercator band's
   zoom range) only the copies exist; `getLayer(id)`, `getPaintProperty`, `getLayoutProperty`,
   `getFilter` and the `layers` of `queryRenderedFeatures` then read your id as the copy the
   shown band draws, so the usual `if (!map.getLayer(id)) map.addLayer(…)` guard and

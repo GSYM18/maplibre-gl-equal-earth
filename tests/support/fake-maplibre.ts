@@ -636,6 +636,13 @@ export type ControllerJump = Omit<Frame, 'center'> & { center?: readonly [number
  *   with `deferStyleData` until {@link flushStyleData}; then `styledata` and `style.load` fire
  *   (`Style._load`, 499-500).
  *
+ * - **A URL** (`setStyle(url)` on the diff path, `Map._diffStyle`, `ui/map.ts:2742`): the fetch
+ *   is `_diffStyleRequest`, an `AbortController` set synchronously; {@link resolveStyleRequest}
+ *   answers it (the request is cleared, then the style diffs in as above) and
+ *   {@link failStyleRequest} fails it (cleared, then an `error`). Any later `setStyle` of an
+ *   object, or a rebuild, aborts it and clears the field (`_diffStyle` 2743, `_updateStyle` 2695):
+ *   the style it fetched never arrives.
+ *
  * A render ({@link render}, and after every `applyFrame`, `jumpTo` and ease frame) completes a
  * pending rebuild (unless deferred), fires a pending `styledata`, then `render`.
  */
@@ -648,6 +655,8 @@ export class FakeControllerHost extends FakeV6Map {
   #pendingStyle: StyleLike | undefined;
   /** A style change awaits the next render's `Style.update`, which fires `styledata`. */
   #styleChanged = false;
+  /** As `Map._diffStyleRequest`: the fetch of a `setStyle(url)` in flight, else `null`. */
+  _diffStyleRequest: AbortController | null = null;
   /** `getStyle()` calls: each is a full serialisation on a real map. */
   getStyleCalls = 0;
   readonly loaded = new Set<string>();
@@ -683,9 +692,18 @@ export class FakeControllerHost extends FakeV6Map {
    */
   beforeSetStyle?: (style: StyleLike, options?: { diff?: boolean }) => boolean | void;
 
-  setStyle(style: StyleLike, options?: { diff?: boolean }): this {
+  setStyle(style: StyleLike | string, options?: { diff?: boolean }): this {
+    if (typeof style === 'string') {
+      this.setStyleCalls.push({ layers: -1, diff: options?.diff });
+      if (options?.diff === false || !this.style) throw new Error('The fake fetches a style URL on the diff path only.');
+      this._diffStyleRequest?.abort();
+      this._diffStyleRequest = new AbortController();
+      return this;
+    }
     this.setStyleCalls.push({ layers: style.layers.length, diff: options?.diff });
     if (this.beforeSetStyle?.(style, options) === true) return this;
+    this._diffStyleRequest?.abort();
+    this._diffStyleRequest = null;
     if (this.deferStyleData || options?.diff === false || !this.style) {
       this.#pendingStyle = structuredClone(style);
       this.style = undefined;
@@ -693,8 +711,30 @@ export class FakeControllerHost extends FakeV6Map {
       this.fire({ type: 'styledataloading' });
       return this;
     }
+    this.#diffIn(style);
+    return this;
+  }
+
+  /** The style a `setStyle(url)` fetched arrives: the request is cleared, then it diffs in. */
+  resolveStyleRequest(style: StyleLike): void {
+    const request = this._diffStyleRequest;
+    if (!request || request.signal.aborted) throw new Error('No style request in flight.');
+    this._diffStyleRequest = null;
+    if (this.style) this.#diffIn(style);
+  }
+
+  /** The fetch of a `setStyle(url)` fails: the request is cleared, then an `error` fires. */
+  failStyleRequest(): void {
+    if (!this._diffStyleRequest) throw new Error('No style request in flight.');
+    this._diffStyleRequest = null;
+    this.fire({ type: 'error', error: new Error('style fetch failed') });
+  }
+
+  /** `Style.setState` (`_updateDiff`): the diff path of a loaded style. */
+  #diffIn(style: StyleLike): void {
+    if (!this.style) return;
     // A diff with no operations changes nothing and fires nothing.
-    if (JSON.stringify(this.style) === JSON.stringify(style)) return this;
+    if (JSON.stringify(this.style) === JSON.stringify(style)) return;
     const before = new Map(this.style.layers.map((layer) => [layer.id, layer]));
     const sourcesBefore = this.style.sources;
     this.style = structuredClone(style);
@@ -723,10 +763,15 @@ export class FakeControllerHost extends FakeV6Map {
       if (layer.maxzoom === undefined && old.maxzoom !== undefined) layer.maxzoom = old.maxzoom;
     }
     this.#styleChanged = true;
+    // Each source the diff adds starts loading inside the call: `TileManager.onAdd` →
+    // `VectorTileSource.load` fires `dataloading` synchronously (`tile/tile_manager.ts:133`,
+    // `source/vector_tile_source.ts:117`), which the Map re-fires as `sourcedataloading`.
+    for (const id of Object.keys(style.sources)) {
+      if (!(id in sourcesBefore)) this.fire({ type: 'sourcedataloading' });
+    }
     // `Style.setState` fires it on the Style, which bubbles through `parent.fire`: the Map's
     // `fire`, looked up on the instance (so a wrapper there sees it).
     this.fire({ type: 'style.load' });
-    return this;
   }
 
   /** Source objects handed out, by id: kept while the style keeps the source unchanged. */
