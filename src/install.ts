@@ -257,11 +257,25 @@ async function install(
       return this;
     }
     // Synchronous in effect: the original style is back before MapLibre's projection changes.
-    controllers
-      .get(this)
-      ?.deactivate()
-      .catch((error: unknown) => report(this, error));
-    return originalSet.call(this, projection);
+    const controller = controllers.get(this);
+    const wasEqual = controller?.projection !== undefined || controller?.pendingProjection !== undefined;
+    controller?.deactivate().catch((error: unknown) => report(this, error));
+    // Under Equal Earth MapLibre's own projection is already mercator, so setting mercator
+    // returns early and fires no `projectiontransition`; announce it here. A type MapLibre
+    // does change (globe) fires its own event, which a one-shot listener detects.
+    let native = false;
+    const seen = (): void => {
+      native = true;
+    };
+    if (wasEqual) this.on('projectiontransition', seen);
+    try {
+      return originalSet.call(this, projection);
+    } finally {
+      if (wasEqual) {
+        this.off('projectiontransition', seen);
+        if (!native && typeof type === 'string') this.fire?.('projectiontransition', { newProjection: type });
+      }
+    }
   };
 
   const getProjection = function (this: ControllerHost): unknown {
