@@ -480,12 +480,13 @@ describe('EqualEarthController', () => {
     expect(host.style!.layers).toHaveLength(10);
   });
 
-  it("does not install over a style an application style.load listener set inside our setStyle", async () => {
+  it("does not install over a style an application listener set inside our setStyle", async () => {
     const { host, controller } = setup();
     const appStyle = liberty();
     appStyle.layers = appStyle.layers.slice(0, 10);
     let swapped = false;
-    host.on('style.load', () => {
+    // Our `style.load` is swallowed (R21); a source the diff adds fires `sourcedataloading` inside it.
+    host.on('sourcedataloading', () => {
       if (swapped || !host.style?.metadata?.[REWRITTEN_METADATA_KEY]) return;
       swapped = true;
       host.setStyle(appStyle, {});
@@ -531,7 +532,7 @@ describe('EqualEarthController', () => {
     const listeners = (host: FakeControllerHost) =>
       LISTENED.reduce((sum, type) => sum + host.listenerCount(type), 0) + host._camera.listenerCount('moveend');
 
-    it("abandons and rejects when the style an application style.load listener swapped in cannot be resolved (F1)", async () => {
+    it("abandons and rejects when the style an application listener swapped in inside our setStyle cannot be resolved (F1)", async () => {
       const host = new FakeControllerHost(TOKYO, 4.6);
       host.style = liberty();
       const fetchJson = vi.fn(async (url: string) => {
@@ -542,7 +543,7 @@ describe('EqualEarthController', () => {
       const appStyle = liberty();
       appStyle.sources['openmaptiles']!['url'] = 'https://offline.example/planet';
       let swapped = false;
-      host.on('style.load', () => {
+      host.on('sourcedataloading', () => {
         if (swapped || !host.style?.metadata?.[REWRITTEN_METADATA_KEY]) return;
         swapped = true;
         host.setStyle(appStyle, {});
@@ -929,6 +930,25 @@ describe('GeoJSON sources (spec §7)', () => {
     for (const k of BANDS) expect(host.style!.sources[`pts__b${k}`]!['data']).toEqual(warped(onlyTokyo(), k));
     await controller.deactivate();
     expect(host.style!.sources['pts']!['data']).toEqual(onlyTokyo());
+  });
+
+  it('an edit made while a re-apply fetches a GeoJSON URL is recaptured, not reverted (round-2 minor)', async () => {
+    let arrive!: (data: unknown) => void;
+    const { host, controller, fetchJson } = geoSetup(cities(), { [LATER_URL]: () => new Promise((resolve) => { arrive = resolve; }) });
+    await controller.activate('equal');
+    const replacement = liberty();
+    replacement.sources['pts'] = { type: 'geojson', data: cities() };
+    replacement.layers.push({ id: 'dots', type: 'circle', source: 'pts', paint: { 'circle-color': '#0000ff' } });
+    host.setStyle(replacement, {});
+    host.geojsonSource('pts').setData(LATER_URL); // the re-apply resolves it before rewriting
+    await vi.waitFor(() => expect(fetchJson).toHaveBeenCalledWith(LATER_URL));
+    host.addLayer({ id: 'late', type: 'line', source: 'openmaptiles', 'source-layer': 'transportation' }); // the live style is the application's
+    arrive(onlyTokyo());
+    await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(host.style!.layers.some((l) => l.id === 'late__b1')).toBe(true);
+    expect(host.style!.layers.some((l) => l.id === 'late')).toBe(true);
+    for (const k of BANDS) expect(host.style!.sources[`pts__b${k}`]!['data']).toEqual(warped(onlyTokyo(), k));
   });
 
   it('resolves a URL set in the same tick as activate before rewriting', async () => {
@@ -1457,7 +1477,7 @@ describe('live style edits (Task 9)', () => {
     expect(controller.toGeographic([host.center.lng, host.center.lat])[1]).toBeCloseTo(TOKYO[1], 9);
   });
 
-  describe('review fixes (R15–R18)', () => {
+  describe('review fixes (R15–R21)', () => {
     const MINE = { id: 'mine', type: 'circle', source: 'minesrc' };
     const MINE_SOURCE = { type: 'geojson', data: { type: 'FeatureCollection', features: [{ type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: TOKYO } }] } };
     /** The common "replace my layer" `style.load` listener; counts its calls (capped, so a loop ends). */
@@ -1501,7 +1521,7 @@ describe('live style edits (Task 9)', () => {
     it("an edit inside the plugin's own setStyle amends in a new macrotask, once (R15)", async () => {
       const { host, controller } = setup();
       const { counter, listener } = replacing(host);
-      host.on('style.load', listener); // runs inside the activation's setStyle
+      host.once('sourcedataloading', listener); // runs inside the activation's setStyle (its style.load is swallowed, R21)
       await controller.activate('equal');
       expect(counter.calls).toBe(1);
       await vi.waitFor(() => expect(layerOf(host, 'mine__b1')).toBeDefined());
@@ -1536,9 +1556,9 @@ describe('live style edits (Task 9)', () => {
       for (const name of ['getLayer', 'getPaintProperty', 'getLayoutProperty', 'getFilter']) expect(Object.hasOwn(host, name), name).toBe(false);
     });
 
-    it('a layer added from style.load during the activation ends up banded (R17)', async () => {
+    it("a layer added inside the activation's setStyle ends up banded (R17)", async () => {
       const { host, controller } = setup();
-      host.once('style.load', () => host.addLayer(extra('late')));
+      host.once('sourcedataloading', () => host.addLayer(extra('late')));
       await controller.activate('equal');
       await vi.waitFor(() => expect(layerOf(host, 'late__b1')).toBeDefined());
       expect(layerOf(host, 'late')!.minzoom).toBeGreaterThan(0); // the Mercator band's copy, ranged
@@ -1680,6 +1700,143 @@ describe('live style edits (Task 9)', () => {
       host.addSource('minesrc', structuredClone(MINE_SOURCE));
       delete host.style!.sources['minesrc'];
       expect(() => host.addSource('minesrc', structuredClone(MINE_SOURCE))).toThrow('Source "minesrc" already exists.');
+    });
+
+    const BASEMAP_URL = 'https://styles.example/basemap.json';
+    const basemap = () => {
+      const style = liberty();
+      style.layers = style.layers.slice(0, 20);
+      return style;
+    };
+    const ids = (style: StyleLike) => style.layers.map((l) => l.id);
+
+    for (const [type, zoom] of [['equal', 4.6], ['equal-earth', 2]] as const) {
+      it(`edits while the application's setStyle(url) fetches neither abort it nor keep its basemap from being captured, under ${type} (R20)`, async () => {
+        const { host, controller } = setup(zoom);
+        host.on('error', () => undefined);
+        await controller.activate(type);
+        host.setStyle(BASEMAP_URL);
+        const request = host._diffStyleRequest!;
+        const styles = host.setStyleCalls.length;
+        host.setPaintProperty('water', 'fill-color', '#123456');
+        host.addLayer(extra('extra'));
+        await tick();
+        await tick();
+        expect(request.signal.aborted).toBe(false);
+        expect(host.setStyleCalls).toHaveLength(styles); // no amend while the fetch is out
+        host.resolveStyleRequest(basemap());
+        await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+        await tick();
+        expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeDefined();
+        expect(host.errors).toEqual([]);
+        expect(host.styleErrors).toEqual([]);
+        await controller.deactivate();
+        // Captured; as natively, edits made to the old style went with it.
+        expect(ids(host.style!)).toEqual(ids(basemap()));
+      });
+    }
+
+    it('an edit made while the fetch is out is amended once the fetch has failed (R20)', async () => {
+      const { host, controller } = setup();
+      host.on('error', () => undefined);
+      await controller.activate('equal');
+      host.setStyle(BASEMAP_URL);
+      host.addLayer(extra('extra'));
+      await tick();
+      expect(layerOf(host, 'extra__b1')).toBeUndefined();
+      host.failStyleRequest();
+      await vi.waitFor(() => expect(layerOf(host, 'extra__b1')).toBeDefined());
+      expect(host.errors).toHaveLength(1); // the fetch's own
+      expect(controller.active).toBe(true);
+    });
+
+    it("a re-apply waits for the application's setStyle(url) instead of aborting it (R20)", async () => {
+      const { host, controller } = setup();
+      host.on('error', () => undefined);
+      await controller.activate('equal');
+      const replacement = liberty();
+      replacement.sources['openmaptiles']!['url'] = 'https://tiles.example/other'; // the re-apply fetches its TileJSON
+      host.setStyle(replacement, {});
+      host.setStyle(BASEMAP_URL);
+      const request = host._diffStyleRequest!;
+      await tick();
+      await tick();
+      expect(request.signal.aborted).toBe(false);
+      host.resolveStyleRequest(basemap());
+      await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+      expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeDefined();
+      await controller.deactivate();
+      expect(ids(host.style!)).toEqual(ids(basemap()));
+    });
+
+    it("an activation waits for the application's setStyle(url) made just before it (R20)", async () => {
+      const { host, controller } = setup();
+      host.on('error', () => undefined);
+      host.setStyle(BASEMAP_URL);
+      const request = host._diffStyleRequest!;
+      const pending = controller.activate('equal');
+      await tick();
+      await tick();
+      expect(request.signal.aborted).toBe(false);
+      host.resolveStyleRequest(basemap());
+      await pending;
+      expect(controller.active).toBe(true);
+      await controller.deactivate();
+      expect(ids(host.style!)).toEqual(ids(basemap()));
+    });
+
+    it("deactivating while the application's setStyle(url) fetches restores at once and asks for its style again (R20)", async () => {
+      const { host, controller } = setup();
+      host.on('error', () => undefined);
+      await controller.activate('equal');
+      host.setStyle(BASEMAP_URL, { diff: true });
+      await controller.deactivate();
+      expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeUndefined(); // restored at once
+      const again = host._diffStyleRequest;
+      expect(again).not.toBeNull();
+      expect(again!.signal.aborted).toBe(false);
+      expect(host.setStyleCalls.at(-1)).toEqual({ layers: -1, diff: true });
+      host.resolveStyleRequest(basemap());
+      expect(ids(host.style!)).toEqual(ids(basemap()));
+      // It lands on the original, not on the rewrite: no band's zoom range is left behind.
+      for (const layer of basemap().layers) expect(layerOf(host, layer.id)!.minzoom ?? 0, layer.id).toBe(layer.minzoom ?? 0);
+    });
+
+    it("the plugin's own setStyle fires no style.load: activation, re-apply and restore (R21)", async () => {
+      const { host, controller } = setup();
+      let loads = 0;
+      host.on('style.load', () => loads++);
+      await controller.activate('equal');
+      await controller.activate('equal-earth');
+      await controller.deactivate();
+      expect(loads).toBe(0);
+      await controller.activate('equal');
+      host.setStyle(basemap(), {}); // the application's: exactly one
+      await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+      await tick();
+      expect(loads).toBe(1);
+      host.setStyle(liberty(), {});
+      await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+      await tick();
+      expect(loads).toBe(2);
+      await controller.deactivate();
+      expect(loads).toBe(2);
+    });
+
+    it('an unguarded add-my-layer style.load listener raises no error across projection toggles (R21)', async () => {
+      const { host, controller } = setup(4.6, withMine());
+      host.on('error', () => undefined);
+      host.on('style.load', () => {
+        host.addSource('minesrc2', structuredClone(MINE_SOURCE));
+        host.addLayer({ ...MINE, id: 'mine2', source: 'minesrc2' });
+      });
+      await controller.activate('equal');
+      await controller.deactivate();
+      await controller.activate('equal-earth');
+      await controller.activate('equal');
+      await controller.deactivate();
+      expect(host.errors).toEqual([]);
+      expect(host.styleErrors).toEqual([]);
     });
   });
 

@@ -2,7 +2,9 @@
  * The application's own style edits while Equal Earth is active (Task 9) on real MapLibre, both
  * majors: a layer added under `equal` at z2 is drawn in the band shown, on the fixture's places
  * where they are; a paint change reaches it there; a batch of `addLayer` calls neither moves the
- * view nor raises an `error`; `removeLayer` takes every copy away. None of it fires `style.load`.
+ * view nor raises an `error`; `removeLayer` takes every copy away. None of it fires `style.load`,
+ * nor does the plugin's own `setStyle` (R21); edits made while the application's `setStyle(url)`
+ * fetches do not cancel it (R20).
  */
 import type { Page } from '@playwright/test';
 
@@ -106,4 +108,40 @@ test('a basemap switch by URL is followed: a guarded style.load listener registe
   expect(await page.evaluate(() => window.__h.map.getStyle().layers.some((layer) => layer.id.startsWith('places')))).toBe(false);
   expect(await colourIs(page, [255, 0, 0])).toBe(true);
   expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
+});
+
+test("edits while the application's setStyle(url) fetches do not cancel it; the plugin's own setStyle fires no style.load", async ({ page, mlv }) => {
+  await openHarness(page, { mlv });
+  await page.evaluate(() => {
+    const kept = window as unknown as { __loads: number };
+    kept.__loads = 0;
+    window.__h.map.on('style.load', () => {
+      kept.__loads++;
+    });
+    window.__h.map.setProjection({ type: 'equal' });
+  });
+  await page.waitForFunction(() => window.__h.controller?.active === true && window.__h.controller.pendingProjection === undefined);
+  await centreOn(page, TOKYO, 2);
+  expect(await page.evaluate(() => (window as unknown as { __loads: number }).__loads)).toBe(0); // R21
+
+  // R20: an amend's `setStyle` would abort MapLibre's fetch of the URL (`_diffStyleRequest`).
+  await page.evaluate(() => {
+    const { map } = window.__h;
+    const style = window.__h.fixtureStyle();
+    style.layers = style.layers.filter((layer) => layer.id !== 'places');
+    map.setStyle(URL.createObjectURL(new Blob([JSON.stringify(style)], { type: 'application/json' })));
+    map.setPaintProperty('lines', 'line-color', '#000000');
+    map.addLayer({ id: 'extra', type: 'line', source: 'fixture', 'source-layer': 'lines' });
+  });
+  await page.waitForFunction(() => !window.__h.map.getStyle().layers.some((layer) => layer.id.startsWith('places')));
+  await page.waitForFunction(() => window.__h.controller?.active === true && window.__h.map.getLayer('lines__b0') !== undefined);
+  await idle(page);
+  expect(await page.evaluate(() => (window as unknown as { __loads: number }).__loads)).toBe(1); // the basemap's own
+  expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
+
+  await page.evaluate(() => window.__h.map.setProjection({ type: 'mercator' }));
+  await page.waitForFunction(() => window.__h.controller?.active !== true);
+  await idle(page);
+  expect(await page.evaluate(() => (window as unknown as { __loads: number }).__loads)).toBe(1);
+  expect(await page.evaluate(() => window.__h.map.getStyle().layers.map((layer) => layer.id))).toEqual(['background', 'land', 'lines']);
 });
