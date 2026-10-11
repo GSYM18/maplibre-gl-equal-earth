@@ -8,10 +8,26 @@
  * application's own `setStyle`: a style without the rewrite's metadata becomes the new original
  * and is rewritten in turn.
  *
- * Ordering rules that matter (C7): the switcher writes paint properties from inside the camera
- * hook, and MapLibre's `setPaintProperty` throws while a style is still loading, so nothing is
- * installed until the rewritten style's `styledata` has fired; and everything is torn down
- * before any other style is set, so no frame runs against a style whose band sources are gone.
+ * **MapLibre's style events** (v6 `src/`, v5 alike) decide the ordering:
+ *
+ * - A diffed `setStyle` swaps the style synchronously and fires `style.load` *inside the call*
+ *   (`Style.setState`, `style/style.ts:870`). `styledata` follows only on the next render
+ *   (`Style.update`, `style.ts:784`), and `_render` runs the camera frames — our hook, hence the
+ *   switcher — *before* that (`ui/map.ts:4250`, `4279`).
+ * - A full rebuild (`diff: false`, or a diff MapLibre cannot apply) fires `styledataloading`
+ *   inside the call (`Style.loadJSON`, `style.ts:452`); the style is unloaded, and
+ *   `setPaintProperty` throws, until `styledata` and `style.load` fire a frame or more later.
+ *
+ * So (C7) the switcher, camera and constraint are torn down synchronously on the application's
+ * `styledataloading` or `style.load`, before any frame can run against a style without band
+ * sources, and re-installed only once our rewritten style's `style.load` has fired. `styledata`,
+ * which fires on every paint or filter change, is not listened to while active: the style is
+ * read (a full serialisation) only on a swap.
+ *
+ * **TileJSON.** A vector source given by `url` is resolved with plain `fetch`, which bypasses
+ * MapLibre's `transformRequest`; relative tile URLs inside a TileJSON are not resolved against
+ * it. Pass `fetchJson` for authenticated endpoints, PMTiles and the like. TMS sources are not
+ * supported yet.
  *
  * Like every `map/` module this has no runtime dependency on `maplibre-gl`; the host is typed
  * structurally ({@link ControllerHost}).
@@ -76,6 +92,8 @@ export interface ControllerHost extends CameraHost, ConstrainHost, SwitcherHost 
   getRenderWorldCopies(): boolean;
   setRenderWorldCopies(value: boolean): unknown;
   fire?(event: unknown): unknown;
+  /** Both majors: whether anything listens for an event type (`Evented.listens`). */
+  listens?(type: string): boolean;
 }
 
 export interface ControllerOptions {
@@ -85,7 +103,12 @@ export interface ControllerOptions {
   transition?: Transition;
   /** What the camera absorbs of each step (spec §4.2). @defaultValue `'zoom+bearing'` */
   compensation?: CompensationMode;
-  /** Fetches a vector source's TileJSON. @defaultValue `fetch(url)` and `.json()` */
+  /**
+   * Fetches a vector source's TileJSON.
+   *
+   * @defaultValue plain `fetch(url)` and `.json()`: no `transformRequest`, no credentials, and
+   * relative tile URLs in the TileJSON are not resolved. Pass your own for auth or PMTiles.
+   */
   fetchJson?: (url: string) => Promise<unknown>;
   /** Called on every band switch. */
   onSwitch?: (event: SwitchEvent) => void;
@@ -107,11 +130,40 @@ interface Installed {
   uninstallConstrain: () => void;
 }
 
+/** The name of the error an activation rejects with when a later call superseded it. */
+export const SUPERSEDED_ERROR_NAME = 'EqualEarthSupersededError';
+
+function superseded(): Error {
+  const error = new Error('Equal Earth: activation superseded');
+  error.name = SUPERSEDED_ERROR_NAME;
+  return error;
+}
+
+/**
+ * Report an error on the map. `Evented.fire` logs an unheard error only when it is an
+ * `ErrorEvent` instance (v6 `util/evented.ts:193`), which this module cannot construct, so a
+ * plain error event is fired only when something listens; otherwise it goes to the console.
+ */
+export function reportError(host: Pick<ControllerHost, 'fire' | 'listens'>, error: unknown): void {
+  if (typeof host.fire === 'function' && typeof host.listens === 'function' && host.listens('error')) {
+    host.fire({ type: 'error', error });
+  } else {
+    console.error(error);
+  }
+}
+
 const defaultFetchJson = async (url: string): Promise<unknown> => {
   const response = await fetch(url);
   if (!response.ok) throw new Error(`HTTP ${response.status}`);
   return response.json();
 };
+
+const hasOurMetadata = (style: StyleLike | undefined): boolean =>
+  style?.metadata?.[REWRITTEN_METADATA_KEY] !== undefined;
+
+/** Cheap identity of a style: enough to tell that the application replaced it. */
+const fingerprint = (style: StyleLike): string =>
+  JSON.stringify([Object.keys(style.sources), style.layers.map((l) => l.id), hasOurMetadata(style)]);
 
 /**
  * Owns the Equal Earth state of one map.
@@ -120,13 +172,16 @@ const defaultFetchJson = async (url: string): Promise<unknown> => {
  * and bearing; on activation it runs right after the camera is installed, so it both moves the
  * centre into band space and settles the first frame's compensation offsets (it fires
  * `movestart`/`moveend` like any camera change).
+ *
+ * The rewritten style always uses MapLibre's Mercator projection (the warp feeds the Mercator
+ * renderer); the original keeps its own, and `deactivate` restores it.
  */
 export class EqualEarthController {
   readonly #host: ControllerHost;
   readonly #options: ControllerOptions;
   readonly #fetchJson: (url: string) => Promise<unknown>;
   /** Resolved TileJSONs by URL: a re-apply after the application's `setStyle` does not refetch. */
-  readonly #tileJson = new Map<string, SourceTemplate>();
+  readonly #tileJson = new Map<string, SourceTemplate & { tms?: boolean }>();
 
   #projection: EqualEarthProjection | undefined;
   #bands: readonly Band[] = EQUAL_EARTH_BANDS;
@@ -141,7 +196,7 @@ export class EqualEarthController {
   /** Bumped by every activate, re-apply and deactivate: a stale async apply abandons itself. */
   #generation = 0;
   #pending: { type: EqualEarthProjection; promise: Promise<void> } | undefined;
-  /** True while our own `setStyle` runs, whose `styledata` is not the application's. */
+  /** True while our own `setStyle` runs: its style events are not the application's. */
   #applying = false;
   #destroyed = false;
 
@@ -175,6 +230,14 @@ export class EqualEarthController {
     return this.active ? mapToGeographic(lngLat, this.blend) : [lngLat[0], lngLat[1]];
   }
 
+  /**
+   * Show `type`. Resolves once the rewritten style is live and the camera is in band space.
+   *
+   * Rejects when a TileJSON cannot be resolved or a source uses TMS (the map is then
+   * untouched), and with an error named {@link SUPERSEDED_ERROR_NAME} when a later
+   * `activate`/`deactivate` overtook it. A type switch (`equal` ↔ `equal-earth`) that fails
+   * after the old type was torn down leaves Equal Earth off, with the original style restored.
+   */
   activate(type: EqualEarthProjection): Promise<void> {
     if (this.#destroyed) return Promise.reject(new Error('Equal Earth: this controller was destroyed.'));
     if (this.#pending?.type === type) return this.#pending.promise;
@@ -203,6 +266,24 @@ export class EqualEarthController {
 
   async destroy(): Promise<void> {
     await this.deactivate();
+    this.#release();
+  }
+
+  /**
+   * The map was removed: forget it without touching it (no `setStyle` on a dead map). Pending
+   * timers are cancelled; anything still in flight abandons itself.
+   */
+  dispose(): void {
+    this.#generation++;
+    this.#pending = undefined;
+    this.#installed?.switcher.destroy();
+    this.#installed = undefined;
+    this.#projection = undefined;
+    this.#view = undefined;
+    this.#release();
+  }
+
+  #release(): void {
     this.#destroyed = true;
     this.#original = undefined;
     this.#tileJson.clear();
@@ -215,34 +296,35 @@ export class EqualEarthController {
     const view = this.#detach();
     const original = this.#original;
     this.#projection = undefined;
-    this.#host.off('styledata', this.#onStyleData);
-    this.#applying = true;
-    try {
-      if (original) this.#host.setStyle(original, { diff: true });
-    } finally {
-      this.#applying = false;
-    }
+    this.#unsubscribe();
+    if (original) this.#setStyle(original);
     this.#finishDeactivate(view);
   }
 
   async #activate(type: EqualEarthProjection, generation: number): Promise<void> {
-    // 1. A loaded style.
-    let style = this.#readStyle();
-    while (!style) {
-      await this.#nextStyleData();
-      if (generation !== this.#generation) return;
-      style = this.#readStyle();
+    let original: StyleLike;
+    let templates: Record<string, SourceTemplate>;
+    for (;;) {
+      // 1. A loaded style.
+      let style = this.#readStyle();
+      while (!style) {
+        await this.#nextEvent('styledata');
+        if (generation !== this.#generation) throw superseded();
+        style = this.#readStyle();
+      }
+      // 2. The original: the previously captured one if this style is already ours.
+      original = hasOurMetadata(style) && this.#original ? this.#original : structuredClone(style);
+      // 4. Templates; a failure rejects before anything on the map has changed.
+      const seen = fingerprint(style);
+      templates = await this.#templates(original);
+      if (generation !== this.#generation) throw superseded();
+      // I3: the application may have set another style meanwhile; start again from it.
+      const now = this.#readStyle();
+      if (now && fingerprint(now) === seen) break;
     }
-    // 2. The original: the previously captured one if this style is already ours.
-    const original = style.metadata?.[REWRITTEN_METADATA_KEY] !== undefined && this.#original
-      ? this.#original
-      : style;
     // 3. Bands.
     const transition = type === 'equal' ? resolveTransition(this.#options.transition) : null;
     const bands = transition ? transition.bands : EQUAL_EARTH_BANDS;
-    // 4. Templates; a failure rejects before anything on the map has changed.
-    const templates = await this.#templates(original);
-    if (generation !== this.#generation) return;
 
     // Commit. Switching type while active starts from the camera the old type showed.
     if (this.active) {
@@ -255,61 +337,70 @@ export class EqualEarthController {
         bearing: this.#host.getBearing(),
         blend: 1,
       };
-      this.#host.on('styledata', this.#onStyleData);
+      this.#host.on('styledataloading', this.#onStyleLoading);
+      this.#host.on('style.load', this.#onStyleLoad);
     }
     this.#original = original;
     this.#projection = type;
     this.#bands = bands;
     this.#transition = transition;
+    let applied: boolean;
     try {
-      await this.#apply(generation, templates);
+      applied = await this.#apply(generation, templates);
     } catch (error) {
       if (generation === this.#generation) this.#abandon();
       throw error;
     }
+    // A re-apply after the application's own `setStyle` may have taken over: still this type.
+    if (!applied && !(this.#pending?.type === type && this.#projection === type)) throw superseded();
   }
 
   /**
    * Rewrite {@link #original}, set it, wait for it to load, then install the switcher, the
    * camera and the constraint and move the camera into the initial band (steps 5–8). Expects
-   * nothing installed and {@link #view} set.
+   * nothing installed and {@link #view} set. Resolves `false` when superseded.
    */
-  async #apply(generation: number, templates?: Record<string, SourceTemplate>): Promise<void> {
+  async #apply(generation: number, templates?: Record<string, SourceTemplate>): Promise<boolean> {
     const original = this.#original!;
     templates ??= await this.#templates(original);
-    if (generation !== this.#generation) return;
+    if (generation !== this.#generation) return false;
 
     const view = this.#view!;
     const bands = this.#bands;
     const transition = this.#transition;
     const initialBand = bandIndexForZoom(bands, view.zoom);
     const rewritten = rewriteStyle(original, { bands, transition, templates, initialZoom: view.zoom });
+    // I4: the warp feeds MapLibre's Mercator renderer; an original globe would bend it.
+    rewritten.style.projection = { type: 'mercator' };
 
-    // C7: wait for the `styledata` this `setStyle` produces. MapLibre's diff path fires it
-    // inside the call, so listen first; a full rebuild fires it once the style has loaded.
+    // C7: install only once the rewritten style has loaded. Listen first: on the diff path
+    // `style.load` fires inside `setStyle`; on a full rebuild a frame or more later.
     let loaded = false;
+    let resolveLoad!: () => void;
     const styleLoaded = new Promise<void>((resolve) => {
-      this.#host.once('styledata', () => {
-        loaded = true;
-        resolve();
-      });
+      resolveLoad = resolve;
     });
-    this.#applying = true;
-    try {
-      this.#host.setStyle(rewritten.style, { diff: true });
-    } finally {
-      this.#applying = false;
-    }
+    const onLoad = (): void => {
+      loaded = true;
+      resolveLoad();
+    };
+    this.#host.once('style.load', onLoad);
+    this.#setStyle(rewritten.style);
     if (!loaded) {
       const current = this.#readStyle();
-      // Loaded, yet not ours and no `styledata`: MapLibre rejected the style (validation errors
-      // are emitted as `error` events and leave the old style in place).
-      if (current && current.metadata?.[REWRITTEN_METADATA_KEY] === undefined) {
-        throw new Error('Equal Earth: the map did not accept the rewritten style.');
+      if (current) {
+        // Loaded without a `style.load`: either MapLibre found nothing to change (the style is
+        // already ours), or it rejected the style (validation errors are `error` events and
+        // leave the old style in place).
+        this.#host.off('style.load', onLoad);
+        if (!hasOurMetadata(current)) {
+          throw new Error('Equal Earth: the map did not accept the rewritten style.');
+        }
+      } else {
+        await styleLoaded;
       }
     }
-    await styleLoaded;
-    if (generation !== this.#generation) return;
+    if (generation !== this.#generation) return false;
 
     const host = this.#host;
     const { lngLatFactory, onSwitch } = this.#options;
@@ -350,32 +441,55 @@ export class EqualEarthController {
     // offsets, since the hook now runs with the baseline the camera was constructed with.
     const center = geographicToMap(view.geographic, bands[initialBand]!.blend);
     host.jumpTo({ center: lngLatFactory(center[0], center[1]), zoom: view.zoom, bearing: view.bearing });
+    return true;
   }
 
   /**
-   * The application set a style of its own while active: it becomes the original, and is
-   * rewritten in turn. Our own styles carry the metadata key and are ignored.
+   * A full rebuild began that is not ours: the style is about to be unloaded, so stop touching
+   * it at once. The new style is picked up on its `style.load`.
    */
-  readonly #onStyleData = (): void => {
+  readonly #onStyleLoading = (): void => {
+    if (!this.active || this.#applying) return;
+    this.#view = this.#detach();
+    this.#generation++;
+  };
+
+  /**
+   * A style finished loading. Ours (a full rebuild of our own `setStyle`) carries the metadata
+   * key; anything else is the application's, which becomes the original and is rewritten.
+   */
+  readonly #onStyleLoad = (): void => {
     if (!this.active || this.#applying) return;
     const style = this.#readStyle();
-    if (style && style.metadata?.[REWRITTEN_METADATA_KEY] !== undefined) return;
-    // C7: whatever is loading now has no band sources; stop touching it at once, and abandon
-    // any apply still in flight for the style it replaced.
+    if (!style || hasOurMetadata(style)) return;
     this.#view = this.#detach();
+    this.#original = structuredClone(style);
     const generation = ++this.#generation;
-    if (!style) return; // still loading: its own `styledata` follows
-    this.#original = style;
     this.#apply(generation).catch((error: unknown) => {
       if (generation !== this.#generation) return;
       // The application's style stays; Equal Earth is off.
       this.#generation++;
       this.#projection = undefined;
-      this.#host.off('styledata', this.#onStyleData);
+      this.#unsubscribe();
       this.#finishDeactivate(this.#view!);
-      this.#report(error);
+      reportError(this.#host, error);
     });
   };
+
+  #unsubscribe(): void {
+    this.#host.off('styledataloading', this.#onStyleLoading);
+    this.#host.off('style.load', this.#onStyleLoad);
+  }
+
+  /** Our own `setStyle`: its style events are not the application's. */
+  #setStyle(style: StyleLike): void {
+    this.#applying = true;
+    try {
+      this.#host.setStyle(style, { diff: true });
+    } finally {
+      this.#applying = false;
+    }
+  }
 
   /**
    * Tear down the switcher, camera and constraint, returning the camera in geographic terms.
@@ -420,55 +534,59 @@ export class EqualEarthController {
     this.#generation++;
     const view = this.#detach();
     this.#projection = undefined;
-    this.#host.off('styledata', this.#onStyleData);
-    const current = this.#readStyle();
-    if (this.#original && current?.metadata?.[REWRITTEN_METADATA_KEY] !== undefined) {
-      this.#applying = true;
-      try {
-        this.#host.setStyle(this.#original, { diff: true });
-      } finally {
-        this.#applying = false;
-      }
-    }
+    this.#unsubscribe();
+    if (this.#original && hasOurMetadata(this.#readStyle())) this.#setStyle(this.#original);
     this.#finishDeactivate(view);
   }
 
-  /** The vector sources' tile templates, from inline `tiles` or a fetched TileJSON. */
+  /** The vector sources' templates, from the inline source or its fetched TileJSON (P14). */
   async #templates(style: StyleLike): Promise<Record<string, SourceTemplate>> {
     const templates: Record<string, SourceTemplate> = {};
     await Promise.all(
       Object.entries(style.sources).map(async ([id, source]) => {
         if (source['type'] !== 'vector') return;
-        const tiles = source['tiles'];
-        if (Array.isArray(tiles)) {
-          templates[id] = template(tiles, source['maxzoom']);
-          return;
-        }
         const url = source['url'];
-        if (typeof url !== 'string') return;
-        try {
-          let resolved = this.#tileJson.get(url);
-          if (!resolved) {
-            const json = (await this.#fetchJson(url)) as { tiles?: unknown; maxzoom?: unknown } | null;
-            if (!json || !Array.isArray(json.tiles) || json.tiles.length === 0) {
-              throw new Error('the TileJSON lists no tiles');
-            }
-            resolved = template(json.tiles, json.maxzoom);
-            this.#tileJson.set(url, resolved);
-          }
-          templates[id] = resolved;
-        } catch (error) {
-          const reason = error instanceof Error ? error.message : String(error);
-          throw new Error(`Equal Earth: could not resolve TileJSON for source "${id}": ${reason}`, {
-            cause: error,
-          });
+        if (!Array.isArray(source['tiles']) && typeof url !== 'string') return;
+        let resolved: SourceTemplate & { tms?: boolean };
+        if (Array.isArray(source['tiles'])) {
+          resolved = template(source);
+          if (resolved.tiles.length === 0) throw unresolved(id, 'the source lists no tiles');
+        } else {
+          resolved = await this.#tileJsonTemplate(id, url as string);
         }
+        if (source['scheme'] === 'tms' || resolved.tms) {
+          // The eqearth URL's {z}/{x}/{y} are the output tile; MapLibre's TMS y-flip would
+          // corrupt them.
+          throw new Error(`Equal Earth: TMS tile schemes are not supported yet (source "${id}").`);
+        }
+        const kept: SourceTemplate & { tms?: boolean } = { ...resolved };
+        delete kept.tms;
+        if (source['promoteId'] !== undefined) kept.promoteId = source['promoteId'];
+        templates[id] = kept;
       }),
     );
     return templates;
   }
 
-  /** The host's style if it is loaded, else `undefined`. */
+  async #tileJsonTemplate(id: string, url: string): Promise<SourceTemplate & { tms?: boolean }> {
+    const cached = this.#tileJson.get(url);
+    if (cached) return cached;
+    let json: unknown;
+    try {
+      json = await this.#fetchJson(url);
+    } catch (error) {
+      throw unresolved(id, error instanceof Error ? error.message : String(error), error);
+    }
+    if (!json || typeof json !== 'object' || !Array.isArray((json as { tiles?: unknown }).tiles)) {
+      throw unresolved(id, 'the TileJSON lists no tiles');
+    }
+    const resolved = template(json as Record<string, unknown>);
+    if (resolved.tiles.length === 0) throw unresolved(id, 'the TileJSON lists no tiles');
+    this.#tileJson.set(url, resolved);
+    return resolved;
+  }
+
+  /** The host's style if it is loaded, else `undefined`. Not a copy: clone before keeping it. */
   #readStyle(): StyleLike | undefined {
     let style: HostStyle | undefined;
     try {
@@ -487,22 +605,28 @@ export class EqualEarthController {
     return style as StyleLike;
   }
 
-  #nextStyleData(): Promise<void> {
+  #nextEvent(type: string): Promise<void> {
     return new Promise((resolve) => {
-      this.#host.once('styledata', () => resolve());
+      this.#host.once(type, () => resolve());
     });
-  }
-
-  #report(error: unknown): void {
-    if (typeof this.#host.fire === 'function') this.#host.fire({ type: 'error', error });
-    else console.error(error);
   }
 }
 
-function template(tiles: unknown[], maxzoom: unknown): SourceTemplate {
+function unresolved(id: string, reason: string, cause?: unknown): Error {
+  return new Error(`Equal Earth: could not resolve TileJSON for source "${id}": ${reason}`, {
+    cause,
+  });
+}
+
+/** The template fields of an inline source or a TileJSON; `tms` flags a TMS scheme. */
+function template(json: Record<string, unknown>): SourceTemplate & { tms?: boolean } {
+  const { tiles, maxzoom, minzoom, attribution, scheme } = json;
   return {
-    tiles: tiles.map(String),
+    tiles: (tiles as unknown[]).map(String),
     ...(typeof maxzoom === 'number' ? { maxzoom } : {}),
+    ...(typeof minzoom === 'number' ? { minzoom } : {}),
+    ...(typeof attribution === 'string' ? { attribution } : {}),
+    ...(scheme === 'tms' ? { tms: true } : {}),
   };
 }
 

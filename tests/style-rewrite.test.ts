@@ -78,6 +78,19 @@ describe('rewriteStyle', () => {
     expect(result.sourceIdsForBand(2)).toEqual(['openmaptiles__b2']);
   });
 
+  it('copies attribution, minzoom and promoteId onto every band source, but not bounds (P14)', () => {
+    const template = { ...TEMPLATES.openmaptiles, minzoom: 2, attribution: '© OSM', promoteId: { water: 'id' } };
+    const { style } = rewriteStyle(liberty(), {
+      bands: SIX.bands, transition: SIX, templates: { openmaptiles: template }, initialZoom: 4.6,
+    });
+    for (let k = 0; k < 6; k++) {
+      expect(style.sources[`openmaptiles__b${k}`]).toMatchObject({ minzoom: 2, attribution: '© OSM', promoteId: { water: 'id' } });
+      expect(style.sources[`openmaptiles__b${k}`]!['bounds']).toBeUndefined();
+    }
+    // Absent fields stay absent.
+    expect(rewrite().style.sources['openmaptiles__b1']).not.toHaveProperty('attribution');
+  });
+
   it("gives every copy its band's parse range, clipped to the layer's own", () => {
     const { style } = rewrite();
     const water = style.layers.filter((l) => l.id === 'water' || l.id.startsWith('water__b'));

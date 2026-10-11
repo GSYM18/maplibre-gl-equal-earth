@@ -49,10 +49,21 @@ export interface StyleLike {
   [key: string]: unknown;
 }
 
-/** The resolved TileJSON of a vector source. */
+/**
+ * The resolved TileJSON of a vector source, and the source fields every band copy inherits.
+ *
+ * `bounds` is deliberately not carried: it is geographic, and a blended band's source is in
+ * map space, so the upstream bounds would cut off tiles that do contain data.
+ */
 export interface SourceTemplate {
   tiles: string[];
   maxzoom?: number;
+  /** Below it MapLibre requests no tiles, as for the upstream source. */
+  minzoom?: number;
+  /** The upstream credit (a licence requirement for OSM/OpenMapTiles); shown on every band. */
+  attribution?: string;
+  /** The source's own `promoteId`, so feature state keeps working on every band. */
+  promoteId?: unknown;
 }
 
 export interface RewriteOptions {
@@ -214,6 +225,9 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
           }),
         ],
         ...(template.maxzoom === undefined ? {} : { maxzoom: template.maxzoom }),
+        ...(template.minzoom === undefined ? {} : { minzoom: template.minzoom }),
+        ...(template.attribution === undefined ? {} : { attribution: template.attribution }),
+        ...(template.promoteId === undefined ? {} : { promoteId: structuredClone(template.promoteId) }),
       };
     }
   }
