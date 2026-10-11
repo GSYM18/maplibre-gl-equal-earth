@@ -31,6 +31,11 @@ export interface EqualEarthSourceConfig extends TileCoverOptions, WarpTileOption
 
 /** Build the `tiles` entry for a rewritten source. */
 export function encodeSourceUrl(config: EqualEarthSourceConfig): string {
+  // Fail where the URL is built, not later in a worker when it is decoded.
+  const blend: unknown = config.blend;
+  if (blend !== undefined && !(typeof blend === 'number' && blend >= 0 && blend <= 1)) {
+    throw new TypeError(`Equal Earth: blend ${JSON.stringify(blend)} is not a number in [0, 1].`);
+  }
   return `${PROTOCOL_SCHEME}://${encodeConfig(config)}/{z}/{x}/{y}`;
 }
 

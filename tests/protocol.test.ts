@@ -60,6 +60,12 @@ describe('tile URL codec', () => {
     }
   });
 
+  it('rejects a blend outside [0, 1] when encoding', () => {
+    for (const blend of [-0.1, 1.5, NaN, Infinity]) {
+      expect(() => encodeSourceUrl({ url: UPSTREAM, blend })).toThrow(TypeError);
+    }
+  });
+
   it('expands templates', () => {
     expect(expandTemplate(UPSTREAM, { z: 4, x: 2, y: 9 })).toBe(
       'https://tiles.openfreemap.org/planet/latest/4/2/9.pbf',
