@@ -656,12 +656,26 @@ export class FakeControllerHost extends FakeV6Map {
     this.fireMapEvent('render');
   }
 
+  /** Wrappers by listener, so that `off(type, listener)` removes a one-time listener too. */
+  readonly #onceWrappers = new Map<() => void, () => void>();
+
   once(type: string, listener: () => void): this {
     const once = () => {
-      this.off(type, once);
+      this.off(type, listener);
       listener();
     };
+    this.#onceWrappers.set(listener, once);
     return this.on(type, once);
+  }
+
+  /** As `Evented.off`: removes the listener whether it was added with `on` or `once`. */
+  override off(type: string, listener: () => void): this {
+    const once = this.#onceWrappers.get(listener);
+    if (once) {
+      this.#onceWrappers.delete(listener);
+      super.off(type, once);
+    }
+    return super.off(type, listener);
   }
 
   listens(type: string): boolean {

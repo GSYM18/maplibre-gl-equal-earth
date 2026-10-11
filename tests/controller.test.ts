@@ -460,4 +460,168 @@ describe('EqualEarthController', () => {
     expect(host._camera.transformCameraUpdate).not.toBeNull();
     expect(host.style.metadata?.[REWRITTEN_METADATA_KEY]).toBeDefined();
   });
+
+  describe('failures of nested and overtaken applies', () => {
+    /** Every listener the controller, camera or switcher may leave on the Map, plus the Camera's `moveend`. */
+    const LISTENED = ['styledataloading', 'style.load', 'styledata', 'sourcedata', 'idle', 'render', 'moveend', 'dragend', 'zoomend', 'rotateend', 'pitchend', 'rollend'];
+    const listeners = (host: FakeControllerHost) =>
+      LISTENED.reduce((sum, type) => sum + host.listenerCount(type), 0) + host._camera.listenerCount('moveend');
+
+    it("abandons and rejects when the style an application style.load listener swapped in cannot be resolved (F1)", async () => {
+      const host = new FakeControllerHost(TOKYO, 4.6);
+      host.style = liberty();
+      const fetchJson = vi.fn(async (url: string) => {
+        if (url.includes('offline')) throw new Error('offline');
+        return TILEJSON;
+      });
+      const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+      const appStyle = liberty();
+      appStyle.sources['openmaptiles']!['url'] = 'https://offline.example/planet';
+      let swapped = false;
+      host.on('style.load', () => {
+        if (swapped || !host.style?.metadata?.[REWRITTEN_METADATA_KEY]) return;
+        swapped = true;
+        host.setStyle(appStyle, {});
+      });
+      const before = listeners(host);
+      await expect(controller.activate('equal')).rejects.toThrow(/openmaptiles.*offline/);
+      expect(swapped).toBe(true);
+      expect(controller.active).toBe(false);
+      expect(host._camera.transformCameraUpdate).toBeNull();
+      expect(host.constrain).toBeNull();
+      expect(host.style.metadata?.[REWRITTEN_METADATA_KEY]).toBeUndefined();
+      expect(listeners(host)).toBe(before);
+      // Nothing is left half-way: the next activation does the full work again.
+      await expect(controller.activate('equal')).rejects.toThrow(/offline/);
+      expect(controller.active).toBe(false);
+    });
+
+    it('falls back to re-applying the old type when a type switch fails during a stale re-apply (F2)', async () => {
+      const host = new FakeControllerHost(TOKYO, 4.6);
+      host.style = liberty();
+      const held: ((json: unknown) => void)[] = [];
+      let calls = 0;
+      const fetchJson = vi.fn((url: string): Promise<unknown> => {
+        if (!url.includes('other')) return Promise.resolve(TILEJSON);
+        calls++;
+        if (calls === 1) return new Promise((resolve) => { held.push(resolve); }); // the re-apply
+        if (calls === 2) return Promise.reject(new Error('offline')); // the type switch
+        return Promise.resolve(TILEJSON); // the fallback re-apply
+      });
+      const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+      await controller.activate('equal');
+      const replacement = liberty();
+      replacement.sources['openmaptiles']!['url'] = 'https://tiles.example/other';
+      host.setStyle(replacement, {}); // the re-apply starts and waits for its TileJSON
+      await vi.waitFor(() => expect(held).toHaveLength(1));
+      await expect(controller.activate('equal-earth')).rejects.toThrow(/offline/);
+      // The switch failed before committing: the old type is re-applied on the new original.
+      await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+      expect(controller.active).toBe(true);
+      expect(controller.projection).toBe('equal');
+      expect(host.style.metadata?.[REWRITTEN_METADATA_KEY]).toBeDefined();
+      expect(calls).toBe(3); // the fallback fetched the new original's TileJSON itself
+      // The overtaken re-apply resolves stale and changes nothing.
+      const setStyles = host.setStyleCalls.length;
+      held[0]!(TILEJSON);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(host.setStyleCalls).toHaveLength(setStyles);
+      expect(controller.projection).toBe('equal');
+    });
+
+    /**
+     * An activation that a re-apply took over (M3): our rebuild is overtaken by the
+     * application's, whose re-apply waits for a TileJSON (`release` resolves it).
+     */
+    async function overtaken() {
+      const host = new FakeControllerHost(TOKYO, 4.6);
+      host.style = liberty();
+      const held: { resolve: (json: unknown) => void; reject: (error: unknown) => void }[] = [];
+      const fetchJson = vi.fn((url: string): Promise<unknown> =>
+        url.includes('other') ? new Promise((resolve, reject) => { held.push({ resolve, reject }); }) : Promise.resolve(TILEJSON),
+      );
+      const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+      const before = listeners(host);
+      host.deferStyleData = true;
+      const pending = controller.activate('equal');
+      await vi.waitFor(() => expect(host.setStyleCalls).toHaveLength(1));
+      const replacement = liberty();
+      replacement.sources['openmaptiles']!['url'] = 'https://tiles.example/other';
+      host.deferStyleData = false;
+      host.setStyle(replacement, { diff: false });
+      host.render();
+      await vi.waitFor(() => expect(held).toHaveLength(1));
+      return { host, controller, pending, held, before };
+    }
+
+    it('rejects the overtaken activation when the re-apply fails (M3)', async () => {
+      const { host, controller, pending, held, before } = await overtaken();
+      host.on('error', () => {});
+      held[0]!.reject(new Error('offline'));
+      await expect(pending).rejects.toThrow(/openmaptiles.*offline/);
+      expect(controller.active).toBe(false);
+      expect(host.errors).toHaveLength(1);
+      expect(host._camera.transformCameraUpdate).toBeNull();
+      expect(listeners(host)).toBe(before);
+    });
+
+    it('rejects the overtaken activation when a type switch fails after committing (F3)', async () => {
+      const { host, controller, pending, held, before } = await overtaken();
+      // The switch's TileJSON resolves; the map then rejects its rewritten style (as on a
+      // validation error), leaving the application's style in place.
+      await vi.waitFor(() => expect(held).toHaveLength(1));
+      const setStyle = host.setStyle.bind(host);
+      host.setStyle = (style, options) => {
+        if (style.metadata?.[REWRITTEN_METADATA_KEY] !== undefined) {
+          host.setStyleCalls.push({ layers: style.layers.length, diff: options?.diff });
+          return host;
+        }
+        return setStyle(style, options);
+      };
+      const switching = controller.activate('equal-earth');
+      await vi.waitFor(() => expect(held).toHaveLength(2));
+      held[1]!.resolve(TILEJSON);
+      await expect(switching).rejects.toThrow(/did not accept/);
+      await expect(pending).rejects.toThrow(/did not accept/);
+      expect(controller.active).toBe(false);
+      expect(host._camera.transformCameraUpdate).toBeNull();
+      expect(host.center.lat).toBeCloseTo(TOKYO[1], 9);
+      expect(listeners(host)).toBe(before);
+    });
+
+    it('deactivate during the pending re-apply restores the original and rejects the waiter', async () => {
+      const { host, controller, pending, held, before } = await overtaken();
+      await controller.deactivate();
+      await expect(pending).rejects.toMatchObject({ name: 'EqualEarthSupersededError' });
+      expect(controller.active).toBe(false);
+      expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeUndefined();
+      expect(host.style!.sources['openmaptiles']).toMatchObject({ url: 'https://tiles.example/other' });
+      expect(host._camera.transformCameraUpdate).toBeNull();
+      expect(host.worldCopies).toBe(true);
+      expect(host.center.lat).toBeCloseTo(TOKYO[1], 9);
+      expect(listeners(host)).toBe(before);
+      // The re-apply resolves stale and touches nothing.
+      const setStyles = host.setStyleCalls.length;
+      held[0]!.resolve(TILEJSON);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(host.setStyleCalls).toHaveLength(setStyles);
+      expect(controller.active).toBe(false);
+    });
+
+    it('dispose during the pending re-apply touches nothing and rejects the waiter', async () => {
+      const { host, controller, pending, held, before } = await overtaken();
+      const setStyles = host.setStyleCalls.length;
+      const jumps = host.jumps;
+      controller.dispose();
+      await expect(pending).rejects.toMatchObject({ name: 'EqualEarthSupersededError' });
+      expect(controller.active).toBe(false);
+      expect(listeners(host)).toBe(before);
+      held[0]!.resolve(TILEJSON);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(host.setStyleCalls).toHaveLength(setStyles);
+      expect(host.jumps).toBe(jumps);
+      expect(host._camera.transformCameraUpdate).toBeNull();
+      await expect(controller.activate('equal')).rejects.toThrow(/destroyed/);
+    });
+  });
 });
