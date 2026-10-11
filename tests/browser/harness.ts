@@ -7,7 +7,8 @@
  * `load`), `?compensation=`, `?outside=` (colour), `?outline=1` and `?graticule=<step>|1` (all
  * passed to `installEqualEarth` when present). `?control=1` adds the `EqualEarthControl` (and, on v6, MapLibre's `GlobeControl`) top right.
  * `?geoapi=0` passes `geographicApi: false` (map-space reads while active); `?hash=1` creates the
- * map with `hash: true`.
+ * map with `hash: true`. `?geojson=1` adds an inline GeoJSON source `cities` (the fixture's six
+ * places) with a blue `circle` layer `cities` (radius 6) on top of the fixture style.
  */
 import type { StyleSpecification } from 'maplibre-gl';
 
@@ -31,23 +32,40 @@ const graticuleParam = params.get('graticule');
 const graticule = graticuleParam === null ? undefined : graticuleParam === '1' ? true : { step: Number(graticuleParam) };
 const geoApi = params.get('geoapi') !== '0';
 const hash = params.get('hash') === '1';
+const geojson = params.get('geojson') === '1';
 
-const fixtureStyle = (): StyleSpecification => ({
-  version: 8,
-  sources: {
-    fixture: {
-      type: 'vector',
-      tiles: [`${location.origin}/fixture-tiles/{z}/{x}/{y}.pbf`],
-      maxzoom: 14,
+/** The fixture's places (`fixture-tiles.ts`), repeated here so the page does not bundle geojson-vt. */
+const PLACES: [number, number][] = [[8.54, 47.37], [139.69, 35.69], [-122.42, 37.77], [-149.9, 61.22], [103.82, 1.35], [179.5, 0]];
+
+const fixtureStyle = (): StyleSpecification => {
+  const style: StyleSpecification = {
+    version: 8,
+    sources: {
+      fixture: {
+        type: 'vector',
+        tiles: [`${location.origin}/fixture-tiles/{z}/{x}/{y}.pbf`],
+        maxzoom: 14,
+      },
     },
-  },
-  layers: [
-    { id: 'background', type: 'background', paint: { 'background-color': '#f8f4f0' } },
-    { id: 'land', type: 'fill', source: 'fixture', 'source-layer': 'land', paint: { 'fill-color': '#9fd39f' } },
-    { id: 'lines', type: 'line', source: 'fixture', 'source-layer': 'lines', paint: { 'line-color': '#336699', 'line-width': 1 } },
-    { id: 'places', type: 'circle', source: 'fixture', 'source-layer': 'places', paint: { 'circle-color': '#cc3333', 'circle-radius': 4 } },
-  ],
-});
+    layers: [
+      { id: 'background', type: 'background', paint: { 'background-color': '#f8f4f0' } },
+      { id: 'land', type: 'fill', source: 'fixture', 'source-layer': 'land', paint: { 'fill-color': '#9fd39f' } },
+      { id: 'lines', type: 'line', source: 'fixture', 'source-layer': 'lines', paint: { 'line-color': '#336699', 'line-width': 1 } },
+      { id: 'places', type: 'circle', source: 'fixture', 'source-layer': 'places', paint: { 'circle-color': '#cc3333', 'circle-radius': 4 } },
+    ],
+  };
+  if (geojson) {
+    style.sources['cities'] = {
+      type: 'geojson',
+      data: {
+        type: 'FeatureCollection',
+        features: PLACES.map((coordinates, i) => ({ type: 'Feature', id: 200 + i, properties: {}, geometry: { type: 'Point', coordinates } })),
+      },
+    };
+    style.layers.push({ id: 'cities', type: 'circle', source: 'cities', paint: { 'circle-color': '#0000ff', 'circle-radius': 6 } });
+  }
+  return style;
+};
 
 let resolveReady!: () => void;
 let rejectReady!: (error: unknown) => void;

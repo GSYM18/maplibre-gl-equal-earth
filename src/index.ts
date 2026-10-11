@@ -153,6 +153,8 @@ export {
   type StyleLike,
 } from './map/style-rewrite.js';
 
+export { GEOJSON_MAX_DENSIFY_ZOOM, geojsonZoomForBand, warpGeoJSON } from './map/geojson.js';
+
 export { geographicUnder, mapSpaceOf } from './map/geo-api.js';
 
 export {

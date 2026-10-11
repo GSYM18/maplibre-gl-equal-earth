@@ -5,6 +5,8 @@ import { EqualEarthController } from '../src/map/controller.js';
 import { REWRITTEN_METADATA_KEY, type StyleLike } from '../src/map/style-rewrite.js';
 import { geographicToMap, mapToGeographic } from '../src/math/backproject.js';
 import { FakeControllerHost } from './support/fake-maplibre.js';
+import { resolveTransition } from '../src/map/bands.js';
+import { GEOJSON_MAX_DENSIFY_ZOOM, geojsonZoomForBand, warpGeoJSON } from '../src/map/geojson.js';
 
 const liberty = (): StyleLike => JSON.parse(readFileSync(new URL('./fixtures/liberty.json', import.meta.url), 'utf8')) as StyleLike;
 const TILEJSON = { tiles: ['https://tiles.example/planet/{z}/{x}/{y}.pbf'], maxzoom: 14 };
@@ -859,5 +861,165 @@ describe('EqualEarthController', () => {
         info.mockRestore();
       }
     });
+  });
+});
+
+describe('GeoJSON sources (spec §7)', () => {
+  const SIX = resolveTransition();
+  const CITIES_URL = 'https://data.example/cities.json';
+  const LATER_URL = 'https://data.example/later.json';
+  const point = (id: number, coordinates: [number, number]): GeoJSON.Feature => ({ type: 'Feature', id, properties: { id }, geometry: { type: 'Point', coordinates } });
+  const cities = (): GeoJSON.FeatureCollection => ({ type: 'FeatureCollection', features: [point(1, [8.54, 47.37]), point(2, TOKYO)] });
+  const onlyTokyo = (): GeoJSON.FeatureCollection => ({ type: 'FeatureCollection', features: [point(2, TOKYO)] });
+  const warped = (data: GeoJSON.GeoJSON, k: number) => warpGeoJSON(data, k / 6, geojsonZoomForBand(SIX, k));
+  const BANDS = [0, 1, 2, 3, 4, 5];
+
+  /** Liberty plus GeoJSON source `pts` (`data`) and a circle layer on it; `fetched` answers fetchJson by URL. */
+  function geoSetup(data: unknown = cities(), fetched: Record<string, () => Promise<unknown>> = {}) {
+    const style = liberty();
+    style.sources['pts'] = { type: 'geojson', data };
+    style.layers.push({ id: 'dots', type: 'circle', source: 'pts', paint: { 'circle-color': '#0000ff' } });
+    const host = new FakeControllerHost(TOKYO, 4.6);
+    host.style = style;
+    const fetchJson = vi.fn(async (url: string) => (fetched[url] ? fetched[url]() : TILEJSON));
+    const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson });
+    return { host, controller, fetchJson };
+  }
+  const bandIds = (host: FakeControllerHost): string[] => [
+    ...Object.keys(host.style!.sources).filter((id) => id.includes('__b')),
+    ...host.style!.layers.map((l) => l.id).filter((id) => id.includes('__b')),
+  ];
+
+  it('resolves a GeoJSON source given by URL and fans it out warped to every band', async () => {
+    const { host, controller, fetchJson } = geoSetup(CITIES_URL, { [CITIES_URL]: async () => cities() });
+    await controller.activate('equal');
+    expect(fetchJson).toHaveBeenCalledWith(CITIES_URL);
+    for (const k of BANDS) expect(host.style!.sources[`pts__b${k}`]!['data']).toEqual(warped(cities(), k));
+    expect(host.style!.sources['pts']!['data']).toBe(CITIES_URL); // the Mercator band keeps it
+    expect(host.style!.layers.some((l) => l.id === 'dots__b1' && l.source === 'pts__b1')).toBe(true);
+  });
+
+  it('fetches a GeoJSON URL once for the life of the controller', async () => {
+    const { controller, fetchJson } = geoSetup(CITIES_URL, { [CITIES_URL]: async () => cities() });
+    await controller.activate('equal');
+    await controller.deactivate();
+    await controller.activate('equal-earth');
+    expect(fetchJson.mock.calls.filter(([url]) => url === CITIES_URL)).toHaveLength(1);
+  });
+
+  it('rejects, and leaves the map untouched, when a GeoJSON fetch fails', async () => {
+    const { host, controller } = geoSetup(CITIES_URL, { [CITIES_URL]: async () => { throw new Error('offline'); } });
+    await expect(controller.activate('equal')).rejects.toThrow('Equal Earth: could not load GeoJSON for source "pts": offline');
+    expect(host.setStyleCalls).toHaveLength(0);
+    expect(controller.active).toBe(false);
+    expect(host.worldCopies).toBe(true);
+  });
+
+  it("fans the application's setData out to every band; deactivate restores the new data and unwraps", async () => {
+    const { host, controller } = geoSetup();
+    await controller.activate('equal');
+    const source = host.geojsonSource('pts');
+    source.setData(onlyTokyo());
+    expect(source.argsOf('setData')).toEqual([onlyTokyo()]);
+    for (const k of BANDS) expect(host.geojsonSource(`pts__b${k}`).argsOf('setData')).toEqual([warped(onlyTokyo(), k)]);
+    await controller.deactivate();
+    expect(host.style!.sources['pts']!['data']).toEqual(onlyTokyo());
+    expect(bandIds(host)).toEqual([]);
+    expect(host.geojsonSource('pts')).toBe(source);
+    expect(Object.hasOwn(source, 'setData')).toBe(false);
+    expect(Object.hasOwn(source, 'updateData')).toBe(false);
+  });
+
+  it('fans out under pure Equal Earth to the one band', async () => {
+    const { host, controller } = geoSetup();
+    await controller.activate('equal-earth');
+    expect(host.style!.sources['pts__b0']!['data']).toEqual(warpGeoJSON(cities(), 0, GEOJSON_MAX_DENSIFY_ZOOM));
+    host.geojsonSource('pts').setData(onlyTokyo());
+    expect(host.geojsonSource('pts__b0').argsOf('setData')).toEqual([warpGeoJSON(onlyTokyo(), 0, GEOJSON_MAX_DENSIFY_ZOOM)]);
+  });
+
+  it('keeps the data set while active through a re-apply, and wraps the new source objects', async () => {
+    const { host, controller } = geoSetup();
+    await controller.activate('equal');
+    const before = host.geojsonSource('pts');
+    before.setData(onlyTokyo());
+    host.restoreContext(); // a full rebuild of our style: new source objects, re-applied from the original
+    host.render();
+    await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+    expect(host.style!.sources['pts']!['data']).toEqual(onlyTokyo());
+    expect(host.style!.sources['pts__b2']!['data']).toEqual(warped(onlyTokyo(), 2));
+    const after = host.geojsonSource('pts');
+    expect(after).not.toBe(before);
+    after.setData(cities());
+    expect(host.geojsonSource('pts__b3').argsOf('setData')).toEqual([warped(cities(), 3)]);
+  });
+
+  it('setData with a URL fans out what fetchJson returns once it arrives; the original keeps the URL', async () => {
+    let arrive!: (data: unknown) => void;
+    const { host, controller, fetchJson } = geoSetup(cities(), { [LATER_URL]: () => new Promise((resolve) => { arrive = resolve; }) });
+    await controller.activate('equal');
+    host.geojsonSource('pts').setData(LATER_URL);
+    expect(fetchJson).toHaveBeenCalledWith(LATER_URL);
+    expect(host.geojsonSource('pts__b1').argsOf('setData')).toEqual([]);
+    arrive(onlyTokyo());
+    await vi.waitFor(() => expect(host.geojsonSource('pts__b1').argsOf('setData')).toEqual([warped(onlyTokyo(), 1)]));
+    await controller.deactivate();
+    expect(host.style!.sources['pts']!['data']).toBe(LATER_URL);
+  });
+
+  it('drops a URL that arrives after a later setData', async () => {
+    let arrive!: (data: unknown) => void;
+    const { host, controller } = geoSetup(cities(), { [LATER_URL]: () => new Promise((resolve) => { arrive = resolve; }) });
+    await controller.activate('equal');
+    const source = host.geojsonSource('pts');
+    source.setData(LATER_URL);
+    source.setData(onlyTokyo());
+    arrive(cities());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(host.geojsonSource('pts__b4').argsOf('setData')).toEqual([warped(onlyTokyo(), 4)]);
+    await controller.deactivate();
+    expect(host.style!.sources['pts']!['data']).toEqual(onlyTokyo());
+  });
+
+  it('fans the full data out after an updateData has landed, not before', async () => {
+    const { host, controller } = geoSetup();
+    await controller.activate('equal');
+    const source = host.geojsonSource('pts');
+    const merged: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: [...cities().features, point(3, [-122.42, 37.77])] };
+    source.updateData({ add: [point(3, [-122.42, 37.77])] });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(host.geojsonSource('pts__b2').argsOf('setData')).toEqual([]); // the worker has not answered yet
+    source.settleUpdate(merged);
+    await vi.waitFor(() => expect(host.geojsonSource('pts__b2').argsOf('setData')).toEqual([warped(merged, 2)]));
+    for (const k of BANDS) expect(host.geojsonSource(`pts__b${k}`).argsOf('setData')).toEqual([warped(merged, k)]);
+    await controller.deactivate();
+    expect(host.style!.sources['pts']!['data']).toEqual(merged);
+  });
+
+  it("captures an application's setStyle while active without band copies or warped data", async () => {
+    const { host, controller } = geoSetup();
+    await controller.activate('equal');
+    host.geojsonSource('pts').setData(onlyTokyo());
+    const replacement = liberty();
+    replacement.sources['pts'] = { type: 'geojson', data: cities() };
+    replacement.layers.push({ id: 'dots', type: 'circle', source: 'pts', paint: { 'circle-color': '#ff0000' } });
+    host.setStyle(replacement, {}); // diffed: `pts` keeps its object and gets setData(cities)
+    await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+    expect(host.style!.sources['pts__b2']!['data']).toEqual(warped(cities(), 2));
+    expect(host.style!.layers.find((l) => l.id === 'dots__b0')).toMatchObject({ paint: { 'circle-color': '#ff0000' } });
+    expect(host.style!.layers.find((l) => l.id === 'dots__b0')!.minzoom).toBeUndefined();
+    await controller.deactivate();
+    expect(bandIds(host)).toEqual([]);
+    expect(host.style!.sources['pts']!['data']).toEqual(cities());
+    expect(host.style!.layers.find((l) => l.id === 'dots')!.minzoom ?? 0).toBe(0);
+  });
+
+  it('reports a failing fan-out instead of throwing into the application', async () => {
+    const { host, controller } = geoSetup();
+    await controller.activate('equal');
+    host.on('error', () => undefined);
+    expect(() => host.geojsonSource('pts').setData({ type: 'FeatureCollection' })).not.toThrow();
+    expect(host.errors).toHaveLength(1);
+    expect(String(host.errors[0])).toContain('pts');
   });
 });
