@@ -899,12 +899,94 @@ describe('GeoJSON sources (spec §7)', () => {
     expect(host.style!.layers.some((l) => l.id === 'dots__b1' && l.source === 'pts__b1')).toBe(true);
   });
 
-  it('fetches a GeoJSON URL once for the life of the controller', async () => {
-    const { controller, fetchJson } = geoSetup(CITIES_URL, { [CITIES_URL]: async () => cities() });
+  it('fetches a GeoJSON URL afresh on each activation, and once for the re-applies within one', async () => {
+    let feed = cities();
+    const { host, controller, fetchJson } = geoSetup(CITIES_URL, { [CITIES_URL]: async () => feed });
+    const fetches = () => fetchJson.mock.calls.filter(([url]) => url === CITIES_URL).length;
     await controller.activate('equal');
+    expect(fetches()).toBe(1);
+    host.restoreContext(); // a re-apply within the activation: served from the cache
+    host.render();
+    await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+    expect(fetches()).toBe(1);
     await controller.deactivate();
-    await controller.activate('equal-earth');
-    expect(fetchJson.mock.calls.filter(([url]) => url === CITIES_URL)).toHaveLength(1);
+    feed = onlyTokyo(); // a live feed, polled meanwhile in Mercator
+    await controller.activate('equal');
+    expect(fetches()).toBe(2);
+    expect(host.style!.sources['pts__b2']!['data']).toEqual(warped(onlyTokyo(), 2));
+  });
+
+  it('takes an application setData made in the same tick as activate (before the wrappers exist)', async () => {
+    const { host, controller } = geoSetup();
+    const pending = controller.activate('equal'); // e.g. setProjection({ type: 'equal' })
+    host.geojsonSource('pts').setData(onlyTokyo());
+    await pending;
+    expect(host.style!.sources['pts']!['data']).toEqual(onlyTokyo());
+    for (const k of BANDS) expect(host.style!.sources[`pts__b${k}`]!['data']).toEqual(warped(onlyTokyo(), k));
+  });
+
+  it('takes an application setData made in the same tick as its setStyle while active', async () => {
+    const { host, controller } = geoSetup();
+    await controller.activate('equal');
+    const replacement = liberty();
+    replacement.sources['pts'] = { type: 'geojson', data: cities() };
+    replacement.layers.push({ id: 'dots', type: 'circle', source: 'pts', paint: { 'circle-color': '#0000ff' } });
+    host.setStyle(replacement, {});
+    host.geojsonSource('pts').setData(onlyTokyo()); // the wrappers are down until the re-apply installs
+    await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+    expect(host.style!.sources['pts']!['data']).toEqual(onlyTokyo());
+    for (const k of BANDS) expect(host.style!.sources[`pts__b${k}`]!['data']).toEqual(warped(onlyTokyo(), k));
+    await controller.deactivate();
+    expect(host.style!.sources['pts']!['data']).toEqual(onlyTokyo());
+  });
+
+  it('resolves a URL set in the same tick as activate before rewriting', async () => {
+    const { host, controller, fetchJson } = geoSetup(cities(), { [LATER_URL]: async () => onlyTokyo() });
+    const pending = controller.activate('equal');
+    host.geojsonSource('pts').setData(LATER_URL);
+    await pending;
+    expect(fetchJson).toHaveBeenCalledWith(LATER_URL);
+    expect(host.style!.sources['pts']!['data']).toBe(LATER_URL);
+    for (const k of BANDS) expect(host.style!.sources[`pts__b${k}`]!['data']).toEqual(warped(onlyTokyo(), k));
+  });
+
+  it('drops a URL fetch of an earlier activation that arrives after a re-activation', async () => {
+    let arrive!: (data: unknown) => void;
+    const { host, controller } = geoSetup(cities(), { [LATER_URL]: () => new Promise((resolve) => { arrive = resolve; }) });
+    await controller.activate('equal');
+    host.geojsonSource('pts').setData(LATER_URL);
+    await controller.deactivate();
+    host.geojsonSource('pts').setData(onlyTokyo()); // in Mercator: not wrapped
+    await controller.activate('equal');
+    arrive(cities());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    for (const k of BANDS) expect(host.style!.sources[`pts__b${k}`]!['data']).toEqual(warped(onlyTokyo(), k));
+  });
+
+  it('drops the fan-out of an updateData that a later setData overtook', async () => {
+    const { host, controller } = geoSetup();
+    await controller.activate('equal');
+    const source = host.geojsonSource('pts');
+    source.updateData({ add: [point(3, [-122.42, 37.77])] });
+    source.setData(onlyTokyo());
+    source.settleUpdate(onlyTokyo());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    for (const k of BANDS) expect(host.geojsonSource(`pts__b${k}`).argsOf('setData')).toEqual([warped(onlyTokyo(), k)]);
+  });
+
+  it('a fan-out arriving after deactivate touches nothing', async () => {
+    let arrive!: (data: unknown) => void;
+    const { host, controller } = geoSetup(cities(), { [LATER_URL]: () => new Promise((resolve) => { arrive = resolve; }) });
+    await controller.activate('equal');
+    const copies = BANDS.map((k) => host.geojsonSource(`pts__b${k}`));
+    host.geojsonSource('pts').setData(LATER_URL);
+    await controller.deactivate();
+    const style = JSON.stringify(host.style);
+    arrive(onlyTokyo());
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    for (const copy of copies) expect(copy.argsOf('setData')).toEqual([]);
+    expect(JSON.stringify(host.style)).toBe(style);
+    expect(host.errors).toEqual([]);
   });
 
   it('rejects, and leaves the map untouched, when a GeoJSON fetch fails', async () => {

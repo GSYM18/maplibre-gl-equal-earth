@@ -57,3 +57,19 @@ test('an updateData reaches the band copies once MapLibre has applied it', async
   expect(await blueAt(page, TOKYO)).toBe(true);
   expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
 });
+
+test('a setData in the same tick as setProjection reaches every band', async ({ page, mlv }) => {
+  await openHarness(page, { mlv, geojson: true });
+  await page.evaluate((data) => {
+    const { map } = window.__h;
+    map.setProjection({ type: 'equal' });
+    void (map.getSource('cities') as import('maplibre-gl').GeoJSONSource).setData(data);
+  }, ONLY_TOKYO);
+  await page.waitForFunction(() => window.__h.controller?.active === true && window.__h.controller.pendingProjection === undefined);
+  await centreOn(page, ZURICH, 2);
+  expect(await blueAt(page, ZURICH)).toBe(false);
+  await centreOn(page, TOKYO, 2);
+  expect(await blueAt(page, TOKYO)).toBe(true);
+  expect(await page.evaluate(() => (window.__h.map.getSource('cities') as import('maplibre-gl').GeoJSONSource).getData())).toEqual(ONLY_TOKYO);
+  expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
+});

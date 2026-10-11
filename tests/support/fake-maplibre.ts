@@ -594,6 +594,11 @@ export class FakeGeoJSONSource {
     return this;
   }
 
+  /** As `GeoJSONSource.serialize`: the source's options with its current data (a URL or the object). */
+  serialize(): Record<string, unknown> {
+    return structuredClone(this.spec() ?? {});
+  }
+
   getData(): Promise<unknown> {
     this.calls.push({ method: 'getData' });
     return Promise.resolve(structuredClone(this.spec()?.['data']));
