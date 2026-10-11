@@ -202,6 +202,58 @@ describe('installEqualEarth', () => {
     install.uninstall();
   });
 
+  describe('leaving Equal Earth', () => {
+    /** A map whose own setProjection fires `projectiontransition` only when the type changes. */
+    async function leave(nativeType: string, to: string, active = true) {
+      const { module, FakeMap } = fakeModule();
+      const events: unknown[] = [];
+      let current = nativeType;
+      // MapLibre's own setProjection, before the polyfill wraps it.
+      FakeMap.prototype.setProjection = function (this: InstanceType<typeof FakeMap>, p: unknown) {
+        const type = (p as { type: string }).type;
+        if (type !== current) {
+          current = type;
+          (this as unknown as { fire(t: string, p: object): void }).fire('projectiontransition', { newProjection: type });
+        }
+        return this;
+      };
+      const install = await installEqualEarth(module);
+      const listeners: (() => void)[] = [];
+      const map = Object.assign(new FakeMap(), {
+        listens: () => false,
+        on: (_t: string, l: () => void) => { listeners.push(l); },
+        off: (_t: string, l: () => void) => { listeners.splice(listeners.indexOf(l), 1); },
+        fire: (type: string, props?: unknown) => {
+          if (type === 'projectiontransition') events.push(props);
+          for (const l of [...listeners]) l();
+        },
+      });
+      const controller = install.controllerFor(map as never);
+      vi.spyOn(controller, 'projection', 'get').mockReturnValue(active ? 'equal' : undefined);
+      vi.spyOn(controller, 'deactivate').mockResolvedValue(undefined);
+      map.setProjection({ type: to });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      install.uninstall();
+      return { events, listeners };
+    }
+
+    it('announces mercator when MapLibre stays silent (mercator to mercator)', async () => {
+      const { events, listeners } = await leave('mercator', 'mercator');
+      expect(events).toEqual([{ newProjection: 'mercator' }]);
+      expect(listeners).toHaveLength(0);
+    });
+
+    it('does not double the event MapLibre fires itself (globe)', async () => {
+      const { events } = await leave('mercator', 'globe');
+      expect(events).toEqual([{ newProjection: 'globe' }]);
+    });
+
+    it('fires nothing when Equal Earth was not on', async () => {
+      const { events } = await leave('mercator', 'mercator', false);
+      expect(events).toEqual([]);
+    });
+  });
+
   it('does not report an activation a later setProjection superseded (M3)', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {

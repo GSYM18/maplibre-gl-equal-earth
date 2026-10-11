@@ -44,3 +44,24 @@ test("MapLibre's GlobeControl turns Equal Earth off, and the button follows", as
   expect(await page.evaluate(() => window.__h.map.getProjection()?.type)).toBe('mercator');
   await expect(button).toHaveAttribute('aria-pressed', 'false');
 });
+
+for (const target of ['mercator', 'globe'] as const) {
+  test(`an application's setProjection(${target}) announces itself and the button follows`, async ({ page, mlv }) => {
+    test.skip(target === 'globe' && mlv !== 6, 'globe is exercised on v6');
+    await openHarness(page, { mlv, control: true });
+    const button = page.locator(BUTTON);
+    await button.click();
+    await page.waitForFunction(() => window.__h.controller?.active === true);
+    await idle(page);
+    await expect(button).toHaveAttribute('aria-pressed', 'true');
+    // Synchronously after the call: no wait for the style restore's `styledata`.
+    const result = await page.evaluate((type) => {
+      const { map } = window.__h;
+      const seen: string[] = [];
+      map.on('projectiontransition', (event) => seen.push((event as unknown as { newProjection: string }).newProjection));
+      map.setProjection({ type });
+      return { seen, pressed: document.querySelector('.maplibregl-ctrl-equal-earth')!.getAttribute('aria-pressed') };
+    }, target);
+    expect(result).toEqual({ seen: [target], pressed: 'false' });
+  });
+}
