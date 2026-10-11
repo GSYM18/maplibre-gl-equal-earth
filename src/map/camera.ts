@@ -431,10 +431,10 @@ function thresholdBands(options: ThresholdCameraOptions): BandCameraOptions {
  */
 function wrapLongitude(lng: number): number {
   if (!Number.isFinite(lng)) return lng;
-  let wrapped = lng;
-  while (wrapped > 180) wrapped -= 360;
-  while (wrapped < -180) wrapped += 360;
-  return wrapped;
+  // Closed form, not a loop: beyond 2^53 `lng - 360` is `lng`, so a loop never terminates.
+  if (lng > 180) return lng - 360 * Math.ceil((lng - 180) / 360);
+  if (lng < -180) return lng + 360 * Math.ceil((-180 - lng) / 360);
+  return lng;
 }
 
 /** Clamp to ±limit. NaN passes through, so a genuinely broken centre is still reported. */
