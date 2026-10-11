@@ -29,6 +29,17 @@
  * it. Pass `fetchJson` for authenticated endpoints, PMTiles and the like. TMS sources are not
  * supported yet.
  *
+ * **GeoJSON** (spec §7). A GeoJSON source is fanned out into one warped copy per band
+ * (`style-rewrite.ts`, `geojson.ts`); one given by URL is fetched with `fetchJson` first, once per
+ * URL for the controller's life. While installed, the live source object's `setData` and
+ * `updateData` are wrapped (`wrapMethod`) so that the copies follow: `setData` warps the new data
+ * into every copy at once (a URL is fetched afresh with `fetchJson` first, and a fetch that a
+ * later `setData` overtook is dropped); `updateData` waits until MapLibre has applied the diff,
+ * then fans out the source's full `getData()`, a full re-warp of that source per update. The new
+ * data also becomes the original's (a URL stays a URL), so a re-apply and the restore keep it.
+ * A `setData` in the gap between a teardown and the next install (a re-apply in progress) is not
+ * seen.
+ *
  * Like every `map/` module this has no runtime dependency on `maplibre-gl`; the host is typed
  * structurally ({@link ControllerHost}).
  */
@@ -39,6 +50,7 @@ import { similarityOffsets, type CompensationMode, type SimilarityOffsets } from
 import {
   EQUAL_EARTH_BANDS,
   bandIndexForZoom,
+  bandSourceId,
   continuousBlend,
   parseRange,
   resolveTransition,
@@ -49,6 +61,8 @@ import {
 import type { CartographyOptions } from './cartography.js';
 import { BandCamera, type CameraHost, type LngLatFactory } from './camera.js';
 import { installEqualEarthConstrain, type ConstrainHost } from './constrain.js';
+import { geojsonZoomForBand, warpGeoJSON } from './geojson.js';
+import { wrapMethod } from './instance-wrap.js';
 import {
   geographicUnder,
   installGeoApi,
@@ -65,6 +79,7 @@ import {
   restorableStyle,
   rewriteStyle,
   withoutRewriteBounds,
+  type RewriteOptions,
   type SourceTemplate,
   type StyleLike,
 } from './style-rewrite.js';
@@ -111,6 +126,25 @@ export interface ControllerHost extends CameraHost, ConstrainHost, SwitcherHost,
   fire?(event: unknown, properties?: object): unknown;
   /** Both majors: whether anything listens for an event type (`Evented.listens`). */
   listens?(type: string): boolean;
+  /** The live source object (both majors); read structurally ({@link GeoJSONSourceLike}). */
+  getSource(id: string): unknown;
+}
+
+/** The parts of a MapLibre `GeoJSONSource` the controller wraps and reads (v5.24+, v6). */
+interface GeoJSONSourceLike {
+  setData?(data: unknown, ...rest: unknown[]): unknown;
+  updateData?(diff: unknown, ...rest: unknown[]): unknown;
+  getData?(): Promise<unknown>;
+  /** `false` while a data update is with the worker or pending (`GeoJSONSource.loaded`). */
+  loaded?(): boolean;
+  once?(type: string, listener: () => void): unknown;
+}
+
+/** What a style's sources resolve to before it is rewritten: vector templates and GeoJSON data. */
+interface ResolvedSources {
+  templates: Record<string, SourceTemplate>;
+  /** Fetched data of the GeoJSON sources given by URL, by source id. */
+  geojson: Record<string, GeoJSON.GeoJSON>;
 }
 
 /**
@@ -175,6 +209,8 @@ interface Installed {
   switcher: BandSwitcher;
   camera: BandCamera;
   uninstallConstrain: () => void;
+  /** Removes the `setData`/`updateData` wrappers of the GeoJSON sources. */
+  unwrapGeoJSON: () => void;
 }
 
 /** The name of the error an activation rejects with when a later call superseded it. */
@@ -243,6 +279,10 @@ export class EqualEarthController {
   readonly #fetchJson: (url: string) => Promise<unknown>;
   /** Resolved TileJSONs by URL: a re-apply after the application's `setStyle` does not refetch. */
   readonly #tileJson = new Map<string, SourceTemplate & { tms?: boolean }>();
+  /** Fetched GeoJSON by URL, likewise; a `setData(url)` while active refreshes its entry. */
+  readonly #geojson = new Map<string, GeoJSON.GeoJSON>();
+  /** Per GeoJSON source id, bumped by each `setData`/`updateData`: a late result is dropped. */
+  readonly #dataVersions = new Map<string, number>();
 
   #projection: EqualEarthProjection | undefined;
   #bands: readonly Band[] = EQUAL_EARTH_BANDS;
@@ -432,6 +472,7 @@ export class EqualEarthController {
       installed.switcher.destroy();
       installed.camera.destroy();
       installed.uninstallConstrain();
+      installed.unwrapGeoJSON();
     }
     this.#projection = undefined;
     this.#view = undefined;
@@ -486,6 +527,7 @@ export class EqualEarthController {
     this.#original = undefined;
     this.#rewritten = undefined;
     this.#tileJson.clear();
+    this.#geojson.clear();
   }
 
   #deactivateNow(): void {
@@ -504,7 +546,7 @@ export class EqualEarthController {
 
   async #activate(type: EqualEarthProjection, generation: number): Promise<void> {
     let original: StyleLike;
-    let templates: Record<string, SourceTemplate>;
+    let resolved: ResolvedSources;
     try {
       for (;;) {
         // 1. A loaded style.
@@ -516,7 +558,7 @@ export class EqualEarthController {
         }
         // 2. The original: the previously captured one if this style is already ours.
         original = hasOurMetadata(style) && this.#original ? this.#original : this.#capture(style);
-        // 4. Templates; a failure rejects before anything on the map has changed. A style set
+        // 4. Templates and GeoJSON; a failure rejects before anything on the map has changed. A style set
         // meanwhile (I3, N2) restarts from step 1: every swap fires `styledataloading` or
         // `style.load`, so listening suffices and nothing is serialised to compare.
         let changed = false;
@@ -526,7 +568,7 @@ export class EqualEarthController {
         this.#host.on('styledataloading', onChange);
         this.#host.on('style.load', onChange);
         try {
-          templates = await this.#templates(original);
+          resolved = await this.#resolveSources(original);
         } finally {
           this.#host.off('styledataloading', onChange);
           this.#host.off('style.load', onChange);
@@ -574,7 +616,7 @@ export class EqualEarthController {
     this.#transition = transition;
     let applied: boolean;
     try {
-      applied = await this.#apply(generation, templates);
+      applied = await this.#apply(generation, resolved);
     } catch (error) {
       if (generation === this.#generation) this.#abandon(error);
       throw error;
@@ -655,10 +697,10 @@ export class EqualEarthController {
    * camera and the constraint and move the camera into the initial band (steps 5–8). Expects
    * nothing installed and {@link #view} set. Resolves `false` when superseded.
    */
-  async #apply(generation: number, templates?: Record<string, SourceTemplate>): Promise<boolean> {
+  async #apply(generation: number, resolved?: ResolvedSources): Promise<boolean> {
     this.#inFlight = generation;
     try {
-      return await this.#applyNow(generation, templates);
+      return await this.#applyNow(generation, resolved);
     } finally {
       if (this.#inFlight === generation) this.#inFlight = undefined;
     }
@@ -673,22 +715,31 @@ export class EqualEarthController {
     };
   }
 
-  async #applyNow(generation: number, templates?: Record<string, SourceTemplate>): Promise<boolean> {
+  /**
+   * The options of every `rewriteStyle` call (Ruling R2): the bands and transition of the type
+   * shown, the cartography, and `resolved` (the TileJSON templates and fetched GeoJSON).
+   */
+  #rewriteOptions(resolved: ResolvedSources, initialZoom: number): RewriteOptions {
+    return {
+      bands: this.#bands,
+      transition: this.#transition,
+      templates: resolved.templates,
+      geojson: resolved.geojson,
+      initialZoom,
+      cartography: this.#cartography(),
+    };
+  }
+
+  async #applyNow(generation: number, resolved?: ResolvedSources): Promise<boolean> {
     const original = this.#original!;
-    templates ??= await this.#templates(original);
+    resolved ??= await this.#resolveSources(original);
     if (generation !== this.#generation) return false;
 
     const view = this.#view!;
     const bands = this.#bands;
     const transition = this.#transition;
     const initialBand = bandIndexForZoom(bands, view.zoom);
-    const rewritten = rewriteStyle(original, {
-      bands,
-      transition,
-      templates,
-      initialZoom: view.zoom,
-      cartography: this.#cartography(),
-    });
+    const rewritten = rewriteStyle(original, this.#rewriteOptions(resolved, view.zoom));
     // I4: the warp feeds MapLibre's Mercator renderer; an original globe would bend it.
     rewritten.style.projection = { type: 'mercator' };
 
@@ -753,7 +804,8 @@ export class EqualEarthController {
       isActive: () => this.active,
     });
     switcher.start();
-    this.#installed = { switcher, camera, uninstallConstrain };
+    const unwrapGeoJSON = this.#wrapGeoJSONSources(rewritten.geojsonSources);
+    this.#installed = { switcher, camera, uninstallConstrain, unwrapGeoJSON };
     this.#view = undefined;
     this.#settle();
 
@@ -856,6 +908,7 @@ export class EqualEarthController {
     switcher.destroy();
     camera.destroy();
     installed.uninstallConstrain();
+    installed.unwrapGeoJSON();
     this.#installed = undefined;
     return view;
   }
@@ -889,6 +942,152 @@ export class EqualEarthController {
     if (this.#original && hasOurMetadata(live)) this.#setStyle(restorableStyle(this.#original, live));
     this.#rewritten = undefined;
     this.#finishDeactivate(view);
+  }
+
+  /**
+   * Wrap the live `setData`/`updateData` of each banded GeoJSON source (spec §7, rule 4) so every
+   * band copy follows. The Mercator band keeps the original id, so `getSource(id)` is the
+   * application's own source object under either type. Returns the undo.
+   */
+  #wrapGeoJSONSources(ids: readonly string[]): () => void {
+    type Method = (first: unknown, ...rest: unknown[]) => unknown;
+    const restores: (() => void)[] = [];
+    for (const id of ids) {
+      const source = this.#host.getSource(id);
+      if (typeof source !== 'object' || source === null) continue;
+      restores.push(
+        wrapMethod<Method>(source, 'setData', (original) => (data, ...rest) => {
+          const result = original(data, ...rest);
+          this.#onSetData(id, data);
+          return result;
+        }),
+        wrapMethod<Method>(source, 'updateData', (original) => (diff, ...rest) => {
+          const result = original(diff, ...rest);
+          this.#onUpdateData(id, source);
+          return result;
+        }),
+      );
+    }
+    return () => {
+      for (const restore of restores) restore();
+    };
+  }
+
+  /** The next data version of GeoJSON source `id`: a result for an older one is stale. */
+  #nextDataVersion(id: string): number {
+    const version = (this.#dataVersions.get(id) ?? 0) + 1;
+    this.#dataVersions.set(id, version);
+    return version;
+  }
+
+  /** The application set `data` on GeoJSON source `id`: keep it as the original's and fan it out. */
+  #onSetData(id: string, data: unknown): void {
+    const version = this.#nextDataVersion(id);
+    this.#keepOriginalData(id, data);
+    if (typeof data !== 'string') {
+      this.#fanOut(id, data);
+      return;
+    }
+    // A URL: MapLibre loads it for the source itself; the copies need it here. Fetched afresh
+    // (an application polling one URL expects new content) and cached for a re-apply.
+    this.#loadGeoJSON(id, data, true).then(
+      (resolved) => {
+        if (this.#dataVersions.get(id) === version) this.#fanOut(id, resolved);
+      },
+      (error: unknown) => {
+        if (this.#dataVersions.get(id) === version && this.active) reportError(this.#host, error);
+      },
+    );
+  }
+
+  /**
+   * The application sent a diff to GeoJSON source `id`. MapLibre applies it to the source's data
+   * only once the worker has answered (`_dispatchWorkerUpdate` → `_applyDiffToSource`, v6 and
+   * v5.24), so a `getData()` right away would still read the old data: wait until the source is
+   * loaded again, then fan the full data out. Should the worker fail (no `data` event), the wait
+   * ends with the source's next update, whose own fan-out supersedes this one.
+   */
+  #onUpdateData(id: string, source: GeoJSONSourceLike): void {
+    const version = this.#nextDataVersion(id);
+    const settled = async (): Promise<unknown> => {
+      while (source.loaded?.() === false && typeof source.once === 'function') {
+        await new Promise<void>((resolve) => source.once!('data', () => resolve()));
+        if (this.#dataVersions.get(id) !== version) return undefined;
+      }
+      return source.getData?.();
+    };
+    settled().then(
+      (data) => {
+        if (this.#dataVersions.get(id) !== version || data === undefined) return;
+        this.#keepOriginalData(id, data);
+        this.#fanOut(id, data);
+      },
+      (error: unknown) => {
+        if (this.#dataVersions.get(id) === version && this.active) reportError(this.#host, error);
+      },
+    );
+  }
+
+  /** Make `data` the original's for GeoJSON source `id`, so a re-apply and the restore keep it. */
+  #keepOriginalData(id: string, data: unknown): void {
+    const source = this.active ? this.#original?.sources[id] : undefined;
+    if (source?.['type'] === 'geojson') source['data'] = data;
+  }
+
+  /**
+   * `setData` on every band copy of GeoJSON source `id`, with `data` warped for that band. A
+   * failure (malformed GeoJSON) is reported, never thrown into the application's `setData`.
+   */
+  #fanOut(id: string, data: unknown): void {
+    if (!this.active) return;
+    const bands = this.#bands;
+    const transition = this.#transition;
+    try {
+      bands.forEach((band, k) => {
+        if (band.blend >= 1) return;
+        const copy = this.#host.getSource(bandSourceId(id, bands, k)) as GeoJSONSourceLike | undefined;
+        copy?.setData?.(warpGeoJSON(data as GeoJSON.GeoJSON, band.blend, geojsonZoomForBand(transition, k)));
+      });
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      reportError(this.#host, new Error(`Equal Earth: could not warp the GeoJSON of source "${id}": ${reason}`, { cause: error }));
+    }
+  }
+
+  /** The templates of the vector sources and the data of the GeoJSON sources given by URL. */
+  async #resolveSources(style: StyleLike): Promise<ResolvedSources> {
+    const [templates, geojson] = await Promise.all([this.#templates(style), this.#geojsonData(style)]);
+    return { templates, geojson };
+  }
+
+  /** The fetched data of every GeoJSON source of `style` given by URL, by source id. */
+  async #geojsonData(style: StyleLike): Promise<Record<string, GeoJSON.GeoJSON>> {
+    const resolved: Record<string, GeoJSON.GeoJSON> = {};
+    await Promise.all(
+      Object.entries(style.sources).map(async ([id, source]) => {
+        const url = source['data'];
+        if (source['type'] !== 'geojson' || typeof url !== 'string') return;
+        resolved[id] = await this.#loadGeoJSON(id, url, false);
+      }),
+    );
+    return resolved;
+  }
+
+  /** GeoJSON source `id`'s data at `url`: from the cache unless `fresh`; cached either way. */
+  async #loadGeoJSON(id: string, url: string, fresh: boolean): Promise<GeoJSON.GeoJSON> {
+    const cached = fresh ? undefined : this.#geojson.get(url);
+    if (cached) return cached;
+    let json: unknown;
+    try {
+      json = await this.#fetchJson(url);
+    } catch (error) {
+      throw unloaded(id, error instanceof Error ? error.message : String(error), error);
+    }
+    if (!json || typeof json !== 'object' || typeof (json as { type?: unknown }).type !== 'string') {
+      throw unloaded(id, 'the response is not GeoJSON');
+    }
+    this.#geojson.set(url, json as GeoJSON.GeoJSON);
+    return json as GeoJSON.GeoJSON;
   }
 
   /** The vector sources' templates, from the inline source or its fetched TileJSON (P14). */
@@ -970,6 +1169,10 @@ function unresolved(id: string, reason: string, cause?: unknown): Error {
   return new Error(`Equal Earth: could not resolve TileJSON for source "${id}": ${reason}`, {
     cause,
   });
+}
+
+function unloaded(id: string, reason: string, cause?: unknown): Error {
+  return new Error(`Equal Earth: could not load GeoJSON for source "${id}": ${reason}`, { cause });
 }
 
 /** The template fields of an inline source or a TileJSON; `tms` flags a TMS scheme. */

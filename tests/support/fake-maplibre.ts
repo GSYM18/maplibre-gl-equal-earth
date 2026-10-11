@@ -547,6 +547,64 @@ export class FakeSwitcherHost {
   listenerCount(type: string): number { return (this.#listeners.get(type) ?? []).length; }
 }
 
+/**
+ * A GeoJSON source object as `map.getSource(id)` returns it (v6 `source/geojson_source.ts`, v5
+ * alike). `setData` takes effect at once here; `updateData` models the worker round trip: the
+ * diff reaches the source's data, `loaded()` turns true and `data` fires only on
+ * {@link settleUpdate} (`_dispatchWorkerUpdate` applies the diff once the worker has answered,
+ * v6 `geojson_source.ts:505`), so a `getData()` right after `updateData` still reads the old data.
+ */
+export class FakeGeoJSONSource {
+  readonly type = 'geojson';
+  readonly calls: { method: 'setData' | 'updateData' | 'getData'; arg?: unknown }[] = [];
+  #updating = false;
+  #onData: (() => void)[] = [];
+
+  constructor(readonly id: string, readonly spec: () => Record<string, unknown> | undefined) {}
+
+  setData(data: unknown): this {
+    this.calls.push({ method: 'setData', arg: data });
+    const spec = this.spec();
+    if (spec) spec['data'] = data;
+    return this;
+  }
+
+  updateData(diff: unknown): this {
+    this.calls.push({ method: 'updateData', arg: diff });
+    this.#updating = true;
+    return this;
+  }
+
+  /** The worker answers the pending `updateData`: the data becomes `data`, then `data` fires. */
+  settleUpdate(data: unknown): void {
+    const spec = this.spec();
+    if (spec) spec['data'] = data;
+    this.#updating = false;
+    const listeners = this.#onData;
+    this.#onData = [];
+    for (const listener of listeners) listener();
+  }
+
+  loaded(): boolean {
+    return !this.#updating;
+  }
+
+  once(type: string, listener: () => void): this {
+    if (type === 'data') this.#onData.push(listener);
+    return this;
+  }
+
+  getData(): Promise<unknown> {
+    this.calls.push({ method: 'getData' });
+    return Promise.resolve(structuredClone(this.spec()?.['data']));
+  }
+
+  /** The calls of one method, by argument. */
+  argsOf(method: 'setData' | 'updateData'): unknown[] {
+    return this.calls.filter((call) => call.method === method).map((call) => call.arg);
+  }
+}
+
 /** What `jumpTo` accepts on a controller host: a `LngLat`-like centre as well as a tuple. */
 export type ControllerJump = Omit<Frame, 'center'> & { center?: readonly [number, number] | LngLat };
 
@@ -613,13 +671,29 @@ export class FakeControllerHost extends FakeV6Map {
     if (this.deferStyleData || options?.diff === false || !this.style) {
       this.#pendingStyle = structuredClone(style);
       this.style = undefined;
+      this.#sources.clear(); // a rebuild creates every source object anew
       this.fireMapEvent('styledataloading');
       return this;
     }
     // A diff with no operations changes nothing and fires nothing.
     if (JSON.stringify(this.style) === JSON.stringify(style)) return this;
     const before = new Map(this.style.layers.map((layer) => [layer.id, layer]));
+    const sourcesBefore = this.style.sources;
     this.style = structuredClone(style);
+    // A source whose only change is its GeoJSON `data` keeps its object and gets `setData`
+    // (`diffSources` → `setGeoJSONSourceData`, `style/style_diff.ts`); any other change removes
+    // it and adds a new one.
+    for (const [id, source] of [...this.#sources]) {
+      const next = this.style.sources[id];
+      const { data: oldData, ...oldRest } = sourcesBefore[id] ?? {};
+      const { data: newData, ...newRest } = next ?? {};
+      if (!next || JSON.stringify(oldRest) !== JSON.stringify(newRest)) {
+        this.#sources.delete(id);
+      } else if (source instanceof FakeGeoJSONSource && JSON.stringify(oldData) !== JSON.stringify(newData)) {
+        next['data'] = oldData; // as before the operation; `setData` writes the new data
+        source.setData(newData);
+      }
+    }
     // A changed zoom range diffs to `setLayerZoomRange(id, minzoom, maxzoom)`, which skips an
     // absent bound (`style/style.ts` `setLayerZoomRange`: `if (minzoom != null)`): a layer kept
     // under its id keeps the bound the new style leaves out.
@@ -633,6 +707,28 @@ export class FakeControllerHost extends FakeV6Map {
     this.#styleChanged = true;
     this.fireMapEvent('style.load');
     return this;
+  }
+
+  /** Source objects handed out, by id: kept while the style keeps the source unchanged. */
+  readonly #sources = new Map<string, FakeGeoJSONSource | { type: string }>();
+
+  /** As `Map.getSource`: the style's source object, the same one until the source is replaced. */
+  getSource(id: string): FakeGeoJSONSource | { type: string } | undefined {
+    const spec = this.style?.sources[id];
+    if (!spec) return undefined;
+    let source = this.#sources.get(id);
+    if (!source) {
+      source = spec['type'] === 'geojson' ? new FakeGeoJSONSource(id, () => this.style?.sources[id]) : { type: String(spec['type']) };
+      this.#sources.set(id, source);
+    }
+    return source;
+  }
+
+  /** {@link getSource} for a GeoJSON source, which must exist. */
+  geojsonSource(id: string): FakeGeoJSONSource {
+    const source = this.getSource(id);
+    if (!(source instanceof FakeGeoJSONSource)) throw new Error(`No GeoJSON source "${id}".`);
+    return source;
   }
 
   /** Finish a pending rebuild: the style loads, `styledata` and `style.load` fire. */

@@ -17,7 +17,12 @@
  * still draws a flat highlight tint (MapLibre 6.6's hillshade shader at zero derivative).
  *
  * Rules, in short:
- * 1. Every vector source with a template gets one source per band with blend < 1.
+ * 1. Every vector source with a template gets one source per band with blend < 1. So does every
+ *    GeoJSON source whose data is inline or resolved in `options.geojson` (spec §7): the copy
+ *    carries every field of the source, with `data` warped into the band's map space
+ *    ({@link warpGeoJSON}, densified for {@link geojsonZoomForBand}). A GeoJSON source given by
+ *    URL without resolved data stays unbanded, its layers untouched (the controller always
+ *    resolves them).
  * 2. Every layer of such a source gets one copy per band, ranged to the band's parse range
  *    intersected with the layer's own; the Mercator band keeps the original id and source.
  *    Copies with an empty range are dropped.
@@ -39,6 +44,7 @@
 
 import { bandIndexForZoom, bandSourceId, parseRange, type Band, type ResolvedTransition } from './bands.js';
 import { encodeSourceUrl } from '../tiles/protocol.js';
+import { geojsonZoomForBand, warpGeoJSON } from './geojson.js';
 import {
   CARTOGRAPHY_PREFIX,
   graticule,
@@ -96,6 +102,11 @@ export interface RewriteOptions {
   symbolFadeMs?: number;
   /** Outside colour, world polygon, outline and graticule (spec §5). */
   cartography?: CartographyOptions;
+  /**
+   * Resolved data of GeoJSON sources whose `data` is a URL, by source id (the controller fetches
+   * them). Such a source is banded only with an entry here.
+   */
+  geojson?: Record<string, GeoJSON.GeoJSON>;
 }
 
 export interface LayerGate {
@@ -129,7 +140,10 @@ export interface GateHost {
 
 export interface RewrittenStyle {
   style: StyleLike;
+  /** Every source fanned out per band: vector sources, then GeoJSON sources. */
   bandedSources: string[];
+  /** The GeoJSON sources among {@link bandedSources}. */
+  geojsonSources: string[];
   /**
    * Ids of layers that ended with no copy: relief layers when there is no Mercator band (or
    * their own zoom range never reaches it) and vector layers whose range reaches no band.
@@ -450,13 +464,22 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
   const initial = bandIndexForZoom(bands, options.initialZoom);
   const style = structuredClone(original);
 
-  const bandedSources = Object.keys(templates).filter(
+  const vectorSources = Object.keys(templates).filter(
     (id) => original.sources[id]?.['type'] === 'vector',
   );
+  const geojsonData = (id: string): GeoJSON.GeoJSON | undefined => {
+    const source = original.sources[id]!;
+    if (source['type'] !== 'geojson') return undefined;
+    const data = source['data'];
+    if (typeof data === 'string') return options.geojson?.[id];
+    return typeof data === 'object' && data !== null ? (data as GeoJSON.GeoJSON) : undefined;
+  };
+  const geojsonSources = Object.keys(original.sources).filter((id) => geojsonData(id) !== undefined);
+  const bandedSources = [...vectorSources, ...geojsonSources];
   const banded = new Set(bandedSources);
   const layerIds = new Set(original.layers.map((l) => l.id));
 
-  for (const id of bandedSources) {
+  for (const id of vectorSources) {
     const template = templates[id]!;
     if (template.tiles.length === 0) {
       throw new TypeError(`rewriteStyle: the template for source "${id}" has no tiles.`);
@@ -482,6 +505,21 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
         ...(template.attribution === undefined ? {} : { attribution: template.attribution }),
         ...(template.promoteId === undefined ? {} : { promoteId: structuredClone(template.promoteId) }),
       };
+    }
+  }
+
+  for (const id of geojsonSources) {
+    const data = geojsonData(id)!;
+    const fields = { ...original.sources[id]! };
+    delete fields['data'];
+    for (let k = 0; k < bands.length; k++) {
+      const { blend } = bands[k]!;
+      if (blend >= 1) continue;
+      const bandId = bandSourceId(id, bands, k);
+      if (bandId in original.sources) {
+        throw new TypeError(`rewriteStyle: source id "${bandId}" already exists in the style.`);
+      }
+      style.sources[bandId] = { ...structuredClone(fields), data: warpGeoJSON(data, blend, geojsonZoomForBand(transition, k)) };
     }
   }
 
@@ -559,6 +597,7 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
   return {
     style,
     bandedSources: [...bandedSources],
+    geojsonSources: [...geojsonSources],
     removedLayers,
     gates,
     sourceIdsForBand: (band) => bandedSources.map((id) => bandSourceId(id, bands, band)),

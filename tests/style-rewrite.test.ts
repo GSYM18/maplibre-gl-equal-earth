@@ -16,6 +16,8 @@ import {
   type StyleLike,
 } from '../src/map/style-rewrite.js';
 import { parseTileUrl } from '../src/tiles/protocol.js';
+import { geojsonZoomForBand, warpGeoJSON } from '../src/map/geojson.js';
+import { geographicToMap } from '../src/math/backproject.js';
 
 const liberty = (): StyleLike =>
   JSON.parse(readFileSync(new URL('./fixtures/liberty.json', import.meta.url), 'utf8')) as StyleLike;
@@ -292,8 +294,12 @@ describe('rewriteStyle', () => {
     const { style } = rewrite();
     expect(style.layers.find((l) => l.id === 'background')).toMatchObject({ type: 'background', paint: liberty().layers[0]!.paint });
     expect(style.state).toEqual(liberty().state);
-    const geo: StyleLayerLike = { id: 'g', type: 'fill', source: 'geo', paint: { 'fill-opacity': 0.3 } };
-    expect(rewrite(tiny(geo)).style.layers).toEqual([geo]);
+    // A GeoJSON source given by URL without resolved data stays unbanded.
+    const remote = tiny();
+    remote.sources['remote'] = { type: 'geojson', data: 'https://data.example/remote.json' };
+    const geo: StyleLayerLike = { id: 'g', type: 'fill', source: 'remote', paint: { 'fill-opacity': 0.3 } };
+    remote.layers.push(geo);
+    expect(rewrite(remote).style.layers).toEqual([geo]);
   });
 
   it('records metadata without aliasing the result', () => {
@@ -610,5 +616,105 @@ describe('cartography base layers (R7)', () => {
     expect(host.calls).toEqual([]);
     applyGate(host, gate, 'hidden');
     expect(host.calls).toEqual([['paint', 'b', 'fill-opacity', 0]]);
+  });
+});
+
+describe('GeoJSON sources (spec §7)', () => {
+  const CITIES: [number, number][] = [[8.54, 47.37], [139.69, 35.69], [-122.42, 37.77], [-149.9, 61.22], [103.82, 1.35]];
+  const cities = (): GeoJSON.FeatureCollection => ({
+    type: 'FeatureCollection',
+    features: CITIES.map((coordinates, i) => ({ type: 'Feature', id: i, properties: { i }, geometry: { type: 'Point', coordinates } })),
+  });
+  const dots: StyleLayerLike = { id: 'dots', type: 'circle', source: 'pts', paint: { 'circle-color': '#0000ff', 'circle-radius': 6 } };
+  /** A style with GeoJSON source `pts` (inline cities unless given) and a circle layer on it. */
+  function withPts(source: Record<string, unknown> = { type: 'geojson', data: cities() }): StyleLike {
+    const style = tiny(structuredClone(dots));
+    style.sources['pts'] = source;
+    return style;
+  }
+
+  it('fans an inline GeoJSON source out to one warped copy per Equal Earth band; the Mercator band keeps it', () => {
+    const original = withPts();
+    const result = rewrite(original);
+    expect(result.bandedSources).toContain('pts');
+    expect(result.geojsonSources).toEqual(['geo', 'pts']);
+    for (let k = 0; k < 6; k++) {
+      const copy = result.style.sources[`pts__b${k}`]!;
+      expect(copy['type']).toBe('geojson');
+      const data = copy['data'] as GeoJSON.FeatureCollection;
+      expect(data).toEqual(warpGeoJSON(cities(), k / 6, geojsonZoomForBand(SIX, k)));
+      const zurich = (data.features[0]!.geometry as GeoJSON.Point).coordinates;
+      const expected = geographicToMap(CITIES[0]!, k / 6);
+      expect(zurich[0]).toBeCloseTo(expected[0], 12);
+      expect(zurich[1]).toBeCloseTo(expected[1], 12);
+    }
+    expect(result.style.sources['pts']).toEqual(original.sources['pts']);
+    expect(result.style.sources['pts__b6']).toBeUndefined();
+    expect(result.sourceIdsForBand(2)).toContain('pts__b2');
+    expect(result.sourceIdsForBand(6)).toContain('pts');
+  });
+
+  it("copies a banded GeoJSON source's layers like a vector layer's, with parse ranges and gates", () => {
+    const result = rewrite(withPts());
+    const copies = result.style.layers.filter((l) => l.id === 'dots' || l.id.startsWith('dots__b'));
+    expect(copies.map((l) => l.id)).toEqual(['dots__b0', 'dots__b1', 'dots__b2', 'dots__b3', 'dots__b4', 'dots__b5', 'dots']);
+    expect(copies.map((l) => l.source)).toEqual(['pts__b0', 'pts__b1', 'pts__b2', 'pts__b3', 'pts__b4', 'pts__b5', 'pts']);
+    expect(copies[0]!.maxzoom).toBeCloseTo(4.8, 9);
+    expect(copies[6]!.minzoom).toBeCloseTo(7.2, 9);
+    // z4.6 is band 1: its copy keeps the paint, every other copy is faded out.
+    expect(copies[1]!.paint!['circle-opacity']).toBeUndefined();
+    expect(copies[2]!.paint!['circle-opacity']).toBe(0);
+    for (const copy of copies) expect(result.gates.some((g) => g.layerId === copy.id)).toBe(true);
+  });
+
+  it('bands a GeoJSON source given by URL only when options.geojson resolves it', () => {
+    const url = 'https://data.example/cities.json';
+    const style = withPts({ type: 'geojson', data: url });
+    const unresolved = rewrite(style);
+    expect(unresolved.style.sources['pts__b0']).toBeUndefined();
+    expect(unresolved.geojsonSources).toEqual(['geo']);
+    expect(unresolved.style.layers.filter((l) => l.source === 'pts').map((l) => l.id)).toEqual(['dots']);
+    const resolved = rewriteStyle(style, { bands: SIX.bands, transition: SIX, templates: TEMPLATES, initialZoom: 4.6, geojson: { pts: cities() } });
+    expect(resolved.geojsonSources).toEqual(['geo', 'pts']);
+    expect(resolved.style.sources['pts__b3']!['data']).toEqual(warpGeoJSON(cities(), 3 / 6, geojsonZoomForBand(SIX, 3)));
+    // The Mercator band keeps the source as the application gave it, URL and all.
+    expect(resolved.style.sources['pts']).toEqual({ type: 'geojson', data: url });
+  });
+
+  it('carries cluster and the other source fields onto every copy', () => {
+    const fields = {
+      cluster: true,
+      clusterRadius: 40,
+      clusterMaxZoom: 9,
+      clusterProperties: { sum: ['+', ['get', 'i']] },
+      promoteId: 'i',
+      lineMetrics: true,
+      buffer: 32,
+      tolerance: 0.5,
+      attribution: '© Somebody',
+      maxzoom: 16,
+    };
+    const result = rewrite(withPts({ type: 'geojson', data: cities(), ...fields }));
+    for (let k = 0; k < 6; k++) expect(result.style.sources[`pts__b${k}`]).toMatchObject({ type: 'geojson', ...fields });
+  });
+
+  it('pure Equal Earth: one copy, densified for the cap, and the source kept under its id', () => {
+    const bands = [{ minZoom: -Infinity, blend: 0 }];
+    const { style } = rewriteStyle(withPts(), { bands, transition: null, templates: TEMPLATES, initialZoom: 2 });
+    expect(style.sources['pts__b0']!['data']).toEqual(warpGeoJSON(cities(), 0, 12));
+    expect(style.sources['pts']).toBeDefined();
+    expect(style.layers.filter((l) => l.source?.startsWith('pts')).map((l) => l.id)).toEqual(['dots__b0']);
+  });
+
+  it('records GeoJSON sources in the metadata and refuses a colliding copy id', () => {
+    const result = rewrite(withPts());
+    expect((result.style.metadata![REWRITTEN_METADATA_KEY] as { sources: string[] }).sources).toEqual(['openmaptiles', 'geo', 'pts']);
+    const clash = withPts();
+    clash.sources['pts__b2'] = { type: 'geojson', data: { type: 'FeatureCollection', features: [] } };
+    expect(() => rewrite(clash)).toThrow(/pts__b2/);
+  });
+
+  it('produces a style the style spec accepts', () => {
+    expect(validateStyleMin(rewrite(withPts({ type: 'geojson', data: cities(), cluster: true })).style as never)).toEqual([]);
   });
 });
