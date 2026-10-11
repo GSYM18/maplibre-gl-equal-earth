@@ -530,7 +530,9 @@ export class FakeSwitcherHost {
     this.writes.push({ kind: 'layout', layerId, name, value });
   }
   isMoving(): boolean { return this.moving; }
-  jumpTo(): void { this.jumps++; }
+  /** Called by `jumpTo`, as MapLibre runs the camera hook synchronously inside it. */
+  onJump?: () => void;
+  jumpTo(): void { this.jumps++; this.onJump?.(); }
   on(type: string, listener: () => void): void { this.#listeners.set(type, [...(this.#listeners.get(type) ?? []), listener]); }
   off(type: string, listener: () => void): void { this.#listeners.set(type, (this.#listeners.get(type) ?? []).filter((l) => l !== listener)); }
   fire(type: string): void { for (const l of this.#listeners.get(type) ?? []) l(); }

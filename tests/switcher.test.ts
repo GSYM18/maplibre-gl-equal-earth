@@ -35,6 +35,7 @@ function setup(initialBand = 1, zoom = 4.4, extra: Partial<SwitcherOptions> = {}
     requestedZoom: () => requested, now: c.now, schedule: c.schedule, onSwitch: (e) => events.push(e), ...extra,
   });
   switcher.start();
+  host.onJump = () => { switcher.decide(requested); };
   switcher.decide(zoom); // the first render: readiness is judged against the last decided zoom
   return { host, c, events, switcher, zoomTo: (z: number) => { requested = z; return switcher.decide(z); } };
 }
@@ -100,16 +101,15 @@ describe('BandSwitcher', () => {
   });
 
   it('holds while the next band loads, then wakes the camera once when it is ready', () => {
-    const { host, zoomTo, c } = setup(1, 4.4);
+    const { host, zoomTo, switcher } = setup(1, 4.4);
     expect(zoomTo(4.9)).toBe(1);
     host.fire('sourcedata');
     expect(host.jumps).toBe(0);
     host.loaded.add('openmaptiles__b2');
     host.fire('sourcedata');
     host.fire('sourcedata');
-    expect(host.jumps).toBe(1);
-    c.advance(400);
-    expect(zoomTo(4.9)).toBe(2);
+    expect(host.jumps).toBe(1); // the first wake's decide switched, so the second finds nothing to do
+    expect(switcher.current()).toBe(2);
   });
 
   it('does not wake the camera while the map is moving (the next frame decides anyway)', () => {
