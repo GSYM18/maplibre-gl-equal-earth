@@ -8,6 +8,7 @@ import {
   geographicToMap,
   geographicToMapWorld,
   mapSpaceMaxLatitude,
+  mapSpaceMaxLongitude,
   mapToGeographic,
   mapWorldToGeographic,
   worldYRange,
@@ -116,5 +117,14 @@ describe('blended warp', () => {
     const edges = [0, 1 / 3, 2 / 3, 1].map((t) => mapSpaceMaxLatitude(t));
     for (let i = 1; i < edges.length; i++) expect(edges[i]!).toBeGreaterThan(edges[i - 1]!);
     expect(edges[3]).toBe(MERCATOR_MAX_LATITUDE);
+  });
+
+  it('mapSpaceMaxLongitude follows the Equal Earth outline', () => {
+    expect(mapSpaceMaxLongitude(0, 0)).toBeCloseTo(180, 6);
+    // Half-way up, the outline is well inside ±180°, and it widens with the blend.
+    const mid = mapSpaceMaxLongitude(50, 0);
+    expect(mid).toBeLessThan(170);
+    expect(mapSpaceMaxLongitude(50, 0.5)).toBeGreaterThan(mid);
+    expect(mapSpaceMaxLongitude(50, 1)).toBeCloseTo(180, 9);
   });
 });

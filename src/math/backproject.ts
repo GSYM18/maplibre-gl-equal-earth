@@ -111,6 +111,21 @@ export function mapSpaceMaxLatitude(blend = 0): number {
 export const MAP_SPACE_MAX_LATITUDE = mapSpaceMaxLatitude(0);
 
 /**
+ * Map-space longitude of the ±180° meridian at map-space latitude `mapLat`: the outline's
+ * half-width. 180° at the equator, narrowing towards the poles (Equal Earth's outline is
+ * rounded, not rectangular), and 180° everywhere at blend 1.
+ *
+ * A centre beyond it lies in the empty corner outside the world. At blend 0 such a point still
+ * converts to a finite geographic coordinate (`fromEqualEarth` clamps its parametric latitude),
+ * just one outside ±180°, so it must be brought onto the outline before converting.
+ */
+export function mapSpaceMaxLongitude(mapLat: number, blend = 0): number {
+  const geographicLat = mapToGeographic([0, mapLat], blend)[1];
+  if (!Number.isFinite(geographicLat)) return 180;
+  return Math.min(180, Math.abs(geographicToMap([180, geographicLat], blend)[0]));
+}
+
+/**
  * A point in normalised Mercator world space: `[0,1]²`, origin at the top-left
  * (north-west) corner, y increasing southward. This is MapLibre's tile coordinate space —
  * tile `(z, x, y)` covers `[x, x+1] × [y, y+1]` divided by `2^z`.
