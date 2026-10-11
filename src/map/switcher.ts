@@ -91,6 +91,11 @@ const defaultSchedule = (fn: () => void, ms: number): (() => void) => {
   return () => clearTimeout(id);
 };
 
+/**
+ * Before the first `decide`, `#lastZoom` is null and no band counts as ready, so the installer
+ * should run one camera update right after construction (the controller does this via its
+ * initial `jumpTo`).
+ */
 export class BandSwitcher implements BandSelector {
   readonly #host: SwitcherHost;
   readonly #o: SwitcherOptions;
@@ -179,12 +184,11 @@ export class BandSwitcher implements BandSelector {
       return;
     }
     this.#wakePending = true;
-    let ok = false;
     try {
+      // `jumpTo` runs the camera hook synchronously, so `decide` has run when it returns.
       this.#host.jumpTo({});
-      ok = true;
     } finally {
-      if (!ok) this.#wakePending = false;
+      this.#wakePending = false;
     }
   };
 
