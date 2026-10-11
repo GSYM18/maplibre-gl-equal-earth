@@ -161,10 +161,6 @@ const defaultFetchJson = async (url: string): Promise<unknown> => {
 const hasOurMetadata = (style: StyleLike | undefined): boolean =>
   style?.metadata?.[REWRITTEN_METADATA_KEY] !== undefined;
 
-/** Cheap identity of a style: enough to tell that the application replaced it. */
-const fingerprint = (style: StyleLike): string =>
-  JSON.stringify([Object.keys(style.sources), style.layers.map((l) => l.id), hasOurMetadata(style)]);
-
 /**
  * Owns the Equal Earth state of one map.
  *
@@ -198,6 +194,10 @@ export class EqualEarthController {
   #pending: { type: EqualEarthProjection; promise: Promise<void> } | undefined;
   /** True while our own `setStyle` runs: its style events are not the application's. */
   #applying = false;
+  /** Generation of the `#apply` in progress, if any. */
+  #inFlight: number | undefined;
+  /** Activations waiting for a re-apply that took them over (M3). */
+  #waiters: { resolve: () => void; reject: (error: unknown) => void }[] = [];
   #destroyed = false;
 
   constructor(host: ControllerHost, options: ControllerOptions) {
@@ -235,8 +235,11 @@ export class EqualEarthController {
    *
    * Rejects when a TileJSON cannot be resolved or a source uses TMS (the map is then
    * untouched), and with an error named {@link SUPERSEDED_ERROR_NAME} when a later
-   * `activate`/`deactivate` overtook it. A type switch (`equal` ↔ `equal-earth`) that fails
-   * after the old type was torn down leaves Equal Earth off, with the original style restored.
+   * `activate`/`deactivate` overtook it. When the application sets a style of its own while
+   * this is pending, the activation starts again from that style (or, once committed, waits for
+   * the re-apply it triggers). A type switch (`equal` ↔ `equal-earth`) that fails before it
+   * commits leaves the old type showing; one that fails after the old type was torn down leaves
+   * Equal Earth off, with the original style restored.
    */
   activate(type: EqualEarthProjection): Promise<void> {
     if (this.#destroyed) return Promise.reject(new Error('Equal Earth: this controller was destroyed.'));
@@ -276,6 +279,7 @@ export class EqualEarthController {
   dispose(): void {
     this.#generation++;
     this.#pending = undefined;
+    this.#settle(superseded());
     this.#installed?.switcher.destroy();
     this.#installed = undefined;
     this.#projection = undefined;
@@ -292,6 +296,7 @@ export class EqualEarthController {
   #deactivateNow(): void {
     this.#generation++;
     this.#pending = undefined;
+    this.#settle(superseded());
     if (!this.active) return;
     const view = this.#detach();
     const original = this.#original;
@@ -304,23 +309,47 @@ export class EqualEarthController {
   async #activate(type: EqualEarthProjection, generation: number): Promise<void> {
     let original: StyleLike;
     let templates: Record<string, SourceTemplate>;
-    for (;;) {
-      // 1. A loaded style.
-      let style = this.#readStyle();
-      while (!style) {
-        await this.#nextEvent('styledata');
+    try {
+      for (;;) {
+        // 1. A loaded style.
+        let style = this.#readStyle();
+        while (!style) {
+          await this.#nextEvent('styledata');
+          if (generation !== this.#generation) throw superseded();
+          style = this.#readStyle();
+        }
+        // 2. The original: the previously captured one if this style is already ours.
+        original = hasOurMetadata(style) && this.#original ? this.#original : structuredClone(style);
+        // 4. Templates; a failure rejects before anything on the map has changed. A style set
+        // meanwhile (I3, N2) restarts from step 1: every swap fires `styledataloading` or
+        // `style.load`, so listening suffices and nothing is serialised to compare.
+        let changed = false;
+        const onChange = (): void => {
+          changed = true;
+        };
+        this.#host.on('styledataloading', onChange);
+        this.#host.on('style.load', onChange);
+        try {
+          templates = await this.#templates(original);
+        } finally {
+          this.#host.off('styledataloading', onChange);
+          this.#host.off('style.load', onChange);
+        }
         if (generation !== this.#generation) throw superseded();
-        style = this.#readStyle();
+        if (!changed) break;
       }
-      // 2. The original: the previously captured one if this style is already ours.
-      original = hasOurMetadata(style) && this.#original ? this.#original : structuredClone(style);
-      // 4. Templates; a failure rejects before anything on the map has changed.
-      const seen = fingerprint(style);
-      templates = await this.#templates(original);
-      if (generation !== this.#generation) throw superseded();
-      // I3: the application may have set another style meanwhile; start again from it.
-      const now = this.#readStyle();
-      if (now && fingerprint(now) === seen) break;
+    } catch (error) {
+      // N3: a type switch deferred a style the application set meanwhile (`#onStyleLoad`);
+      // failing before it commits, it leaves the old type installed on that style.
+      if (
+        !(error instanceof Error && error.name === SUPERSEDED_ERROR_NAME) &&
+        this.active &&
+        !this.#installed &&
+        this.#inFlight === undefined
+      ) {
+        this.#reapply();
+      }
+      throw error;
     }
     // 3. Bands.
     const transition = type === 'equal' ? resolveTransition(this.#options.transition) : null;
@@ -351,8 +380,40 @@ export class EqualEarthController {
       if (generation === this.#generation) this.#abandon();
       throw error;
     }
-    // A re-apply after the application's own `setStyle` may have taken over: still this type.
-    if (!applied && !(this.#pending?.type === type && this.#projection === type)) throw superseded();
+    if (applied) return;
+    // A re-apply (the application's own `setStyle`, or a rebuild of ours) took over: if it is
+    // still this type, resolve once it has installed, and fail if it fails (M3).
+    if (!(this.#pending?.type === type && this.#projection === type)) throw superseded();
+    await this.#whenInstalled();
+    if (this.#projection !== type) throw superseded();
+  }
+
+  #whenInstalled(): Promise<void> {
+    if (this.#installed) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      this.#waiters.push({ resolve, reject });
+    });
+  }
+
+  /** Release the activations waiting for a re-apply: resolved on install, else rejected. */
+  #settle(error?: unknown): void {
+    const waiters = this.#waiters;
+    this.#waiters = [];
+    for (const waiter of waiters) {
+      if (error === undefined) waiter.resolve();
+      else waiter.reject(error);
+    }
+  }
+
+  /** Re-apply {@link #original} with the current type; on failure turn off and report. */
+  #reapply(): void {
+    const generation = ++this.#generation;
+    this.#apply(generation).catch((error: unknown) => {
+      if (generation !== this.#generation) return;
+      this.#abandon();
+      this.#settle(error);
+      reportError(this.#host, error);
+    });
   }
 
   /**
@@ -361,6 +422,15 @@ export class EqualEarthController {
    * nothing installed and {@link #view} set. Resolves `false` when superseded.
    */
   async #apply(generation: number, templates?: Record<string, SourceTemplate>): Promise<boolean> {
+    this.#inFlight = generation;
+    try {
+      return await this.#applyNow(generation, templates);
+    } finally {
+      if (this.#inFlight === generation) this.#inFlight = undefined;
+    }
+  }
+
+  async #applyNow(generation: number, templates?: Record<string, SourceTemplate>): Promise<boolean> {
     const original = this.#original!;
     templates ??= await this.#templates(original);
     if (generation !== this.#generation) return false;
@@ -401,6 +471,14 @@ export class EqualEarthController {
       }
     }
     if (generation !== this.#generation) return false;
+    // Re-entrancy: an application `style.load` listener may have set a style of its own inside
+    // our `setStyle`, whose events `#applying` hid. Never install over it.
+    const live = this.#readStyle();
+    if (!hasOurMetadata(live)) {
+      if (!live) return false; // a rebuild: its `style.load` re-applies (`#onStyleLoad`)
+      this.#original = structuredClone(live);
+      return this.#apply(++this.#generation);
+    }
 
     const host = this.#host;
     const { lngLatFactory, onSwitch } = this.#options;
@@ -432,6 +510,7 @@ export class EqualEarthController {
     switcher.start();
     this.#installed = { switcher, camera, uninstallConstrain };
     this.#view = undefined;
+    this.#settle();
 
     if (this.#worldCopies === undefined) {
       this.#worldCopies = host.getRenderWorldCopies();
@@ -445,35 +524,52 @@ export class EqualEarthController {
   }
 
   /**
+   * A type switch is pending but has not committed: it starts again from whatever style is
+   * live (its change listeners saw the swap), so a re-apply of the old type would only
+   * supersede it (N3).
+   */
+  #switchPending(): boolean {
+    return this.#pending !== undefined && this.#pending.type !== this.#projection;
+  }
+
+  /**
    * A full rebuild began that is not ours: the style is about to be unloaded, so stop touching
-   * it at once. The new style is picked up on its `style.load`.
+   * it at once, and abandon an apply waiting for a load. The new style is picked up on its
+   * `style.load`.
    */
   readonly #onStyleLoading = (): void => {
     if (!this.active || this.#applying) return;
     this.#view = this.#detach();
-    this.#generation++;
+    if (!this.#switchPending()) this.#generation++;
   };
 
   /**
-   * A style finished loading. Ours (a full rebuild of our own `setStyle`) carries the metadata
-   * key; anything else is the application's, which becomes the original and is rewritten.
+   * A style finished loading that is not the result of our own diffed `setStyle`.
+   *
+   * - The application's (no metadata key): it becomes the original and is rewritten.
+   * - Ours, rebuilt (N1): MapLibre restores a lost WebGL context with
+   *   `setStyle(serialised, { diff: false })` (`ui/map.ts:4153`; `serialize` keeps `metadata`),
+   *   and an application may do the same with `getStyle()`. If nothing is installed and no apply
+   *   is waiting for this load, re-apply from the original. Re-applying, rather than re-attaching
+   *   to the live rewritten style, costs one diff (normally with no operations) and makes the
+   *   gates, the switcher's initial band and the centre agree again: the serialised style
+   *   carries the paint of whatever switch was in progress, and pending symbol hides were
+   *   cancelled with the old switcher.
    */
   readonly #onStyleLoad = (): void => {
     if (!this.active || this.#applying) return;
     const style = this.#readStyle();
-    if (!style || hasOurMetadata(style)) return;
+    if (!style) return;
+    if (hasOurMetadata(style)) {
+      if (this.#installed || this.#inFlight === this.#generation || this.#switchPending()) return;
+      this.#view = this.#detach();
+      this.#reapply();
+      return;
+    }
     this.#view = this.#detach();
     this.#original = structuredClone(style);
-    const generation = ++this.#generation;
-    this.#apply(generation).catch((error: unknown) => {
-      if (generation !== this.#generation) return;
-      // The application's style stays; Equal Earth is off.
-      this.#generation++;
-      this.#projection = undefined;
-      this.#unsubscribe();
-      this.#finishDeactivate(this.#view!);
-      reportError(this.#host, error);
-    });
+    if (this.#switchPending()) return;
+    this.#reapply();
   };
 
   #unsubscribe(): void {

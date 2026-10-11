@@ -345,4 +345,119 @@ describe('EqualEarthController', () => {
     await expect(pending).rejects.toMatchObject({ name: 'EqualEarthSupersededError', message: 'Equal Earth: activation superseded' });
     expect(controller.active).toBe(false);
   });
+
+  describe('rebuilds of our own style (N1)', () => {
+    async function expectReinstalled(host: FakeControllerHost, controller: EqualEarthController) {
+      await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+      expect(host.constrain).not.toBeNull();
+      expect(controller.toGeographic([host.center.lng, host.center.lat])[1]).toBeCloseTo(TOKYO[1], 9);
+      // The switcher is back: the next frame crosses into band 2 as usual.
+      host.loaded.add('openmaptiles__b2');
+      host.applyFrame({ zoomDelta: 0.4 });
+      expect(controller.blend).toBeCloseTo(2 / 6, 12);
+      expect(controller.toGeographic([host.center.lng, host.center.lat])[1]).toBeCloseTo(TOKYO[1], 6);
+    }
+
+    it('re-installs after a WebGL context restore, with a diff that changes nothing (M4)', async () => {
+      const { host, controller } = setup();
+      await controller.activate('equal');
+      host.restoreContext(); // styledataloading: everything is detached
+      expect(host._camera.transformCameraUpdate).toBeNull();
+      let loads = 0;
+      host.on('style.load', () => { loads++; });
+      host.render(); // the rebuild loads: styledata, style.load
+      await expectReinstalled(host, controller);
+      // Our re-apply's diff had no operations, so MapLibre fired nothing for it.
+      expect(loads).toBe(1);
+      expect(controller.active).toBe(true);
+    });
+
+    it("re-installs after the application's setStyle(getStyle(), { diff: false })", async () => {
+      const { host, controller } = setup();
+      await controller.activate('equal');
+      host.setStyle(host.getStyle(), { diff: false });
+      expect(host._camera.transformCameraUpdate).toBeNull();
+      host.render();
+      await expectReinstalled(host, controller);
+      await controller.deactivate();
+      expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeUndefined();
+    });
+  });
+
+  it('starts again when the application changes only content during the TileJSON fetch (N2)', async () => {
+    const host = new FakeControllerHost(TOKYO, 4.6);
+    host.style = liberty();
+    let release!: (json: unknown) => void;
+    const fetchJson = vi.fn(() => new Promise<unknown>((resolve) => { release = resolve; }));
+    const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+    const pending = controller.activate('equal');
+    await vi.waitFor(() => expect(fetchJson).toHaveBeenCalledOnce());
+    const dark = liberty(); // same sources and layer ids, different paint
+    dark.layers[0]!.paint = { 'background-color': '#000' };
+    host.setStyle(dark, {});
+    release(TILEJSON);
+    await pending;
+    await controller.deactivate();
+    expect(host.style.layers[0]!.paint).toEqual({ 'background-color': '#000' });
+  });
+
+  it('a type switch survives an application setStyle while it awaits its templates (N3)', async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    const switching = controller.activate('equal-earth');
+    const replacement = liberty();
+    replacement.layers = replacement.layers.slice(0, 10);
+    host.setStyle(replacement, {}); // style.load while the switch has not committed
+    await switching;
+    expect(controller.projection).toBe('equal-earth');
+    expect(controller.blend).toBe(0);
+    expect(host._camera.transformCameraUpdate).not.toBeNull();
+    await controller.deactivate();
+    expect(host.style!.layers).toHaveLength(10);
+  });
+
+  it("does not install over a style an application style.load listener set inside our setStyle", async () => {
+    const { host, controller } = setup();
+    const appStyle = liberty();
+    appStyle.layers = appStyle.layers.slice(0, 10);
+    let swapped = false;
+    host.on('style.load', () => {
+      if (swapped || !host.style?.metadata?.[REWRITTEN_METADATA_KEY]) return;
+      swapped = true;
+      host.setStyle(appStyle, {});
+    });
+    await controller.activate('equal');
+    expect(swapped).toBe(true);
+    expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeDefined();
+    expect(host.style!.layers.length).toBeGreaterThan(10);
+    await controller.deactivate();
+    expect(host.style!.layers).toHaveLength(10);
+  });
+
+  it('an activation a re-apply took over resolves only once that re-apply has installed (M3)', async () => {
+    const host = new FakeControllerHost(TOKYO, 4.6);
+    host.style = liberty();
+    let release!: (json: unknown) => void;
+    const fetchJson = vi.fn((url: string) =>
+      url.includes('other') ? new Promise<unknown>((resolve) => { release = resolve; }) : Promise.resolve(TILEJSON),
+    );
+    const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+    host.deferStyleData = true; // our setStyle rebuilds: the activation waits for its load
+    const pending = controller.activate('equal');
+    let settled = false;
+    void pending.then(() => { settled = true; });
+    await vi.waitFor(() => expect(host.setStyleCalls).toHaveLength(1));
+    // The application's rebuild overtakes ours; its re-apply must fetch another TileJSON.
+    const replacement = liberty();
+    replacement.sources['openmaptiles']!['url'] = 'https://tiles.example/other';
+    host.deferStyleData = false;
+    host.setStyle(replacement, { diff: false });
+    host.render(); // the replacement loads: the re-apply starts and waits for its TileJSON
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(settled).toBe(false);
+    release(TILEJSON);
+    await pending;
+    expect(host._camera.transformCameraUpdate).not.toBeNull();
+    expect(host.style.metadata?.[REWRITTEN_METADATA_KEY]).toBeDefined();
+  });
 });
