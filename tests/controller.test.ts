@@ -63,6 +63,17 @@ describe('EqualEarthController', () => {
     expect(host.worldCopies).toBe(true);
   });
 
+  it('requestedZoom is the zoom without the band offset, and getZoom() while inactive', async () => {
+    const { host, controller } = setup();
+    expect(controller.requestedZoom).toBe(4.6);
+    await controller.activate('equal');
+    // The rendered zoom carries band 1's compensation offset; the requested one does not.
+    expect(host.getZoom()).not.toBeCloseTo(4.6, 6);
+    expect(controller.requestedZoom).toBeCloseTo(4.6, 9);
+    await controller.deactivate();
+    expect(controller.requestedZoom).toBe(host.getZoom());
+  });
+
   it('dispose releases the camera hook and the constraint as well as the switcher', async () => {
     const { host, controller } = setup();
     await controller.activate('equal');
@@ -75,10 +86,16 @@ describe('EqualEarthController', () => {
 
   it('deactivates: restores the original style, the centre, world copies and the hooks', async () => {
     const { host, controller } = setup();
-    const original = JSON.stringify(host.style);
+    const original = structuredClone(host.style!);
     await controller.activate('equal');
     await controller.deactivate();
-    expect(JSON.stringify(host.style)).toBe(original);
+    // The diff cannot take away the minzoom the Mercator band put on the layers it kept under
+    // their own ids (the fake models `setLayerZoomRange`), so those are restored at an explicit
+    // 0: they draw from zoom 0 again, as before.
+    const lifted = host.style!.layers.filter((l, i) => l.minzoom === 0 && original.layers[i]!.minzoom === undefined);
+    expect(lifted.length).toBeGreaterThan(0);
+    for (const layer of lifted) delete layer.minzoom;
+    expect(host.style).toEqual(original);
     expect(host.center.lng).toBeCloseTo(TOKYO[0], 9);
     expect(host.center.lat).toBeCloseTo(TOKYO[1], 9);
     expect(host.worldCopies).toBe(true);

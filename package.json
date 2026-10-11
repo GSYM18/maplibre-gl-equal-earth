@@ -25,7 +25,10 @@
     "url": "https://github.com/GSYM18/maplibre-gl-equal-earth/issues"
   },
   "homepage": "https://github.com/GSYM18/maplibre-gl-equal-earth#readme",
-  "sideEffects": ["./dist/worker.mjs", "./dist/worker.iife.js"],
+  "sideEffects": [
+    "./dist/worker.mjs",
+    "./dist/worker.iife.js"
+  ],
   "types": "./dist/index.d.ts",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
@@ -60,10 +63,11 @@
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:browser": "playwright test --config tests/browser/playwright.config.ts",
     "preview": "vite preview",
     "check:exports": "node scripts/check-exports.mjs && node scripts/check-worker-bundles.mjs",
     "probe:transition": "node scripts/probe-transition.mjs",
-    "verify": "npm run lint && npm run typecheck && npm test && npm run build && npm run check:exports",
+    "verify": "npm run lint && npm run typecheck && npm test && npm run build && npm run check:exports && npm run test:browser",
     "prepublishOnly": "npm run verify"
   },
   "peerDependencies": {
@@ -72,6 +76,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@maplibre/maplibre-gl-style-spec": "^26.4.1",
+    "@playwright/test": "1.62.1",
     "@types/geojson-vt": "^3.2.5",
     "eslint": "^10.9.1",
     "geojson-vt": "^4.0.3",

@@ -54,6 +54,7 @@ import { BandCamera, type CameraHost, type LngLatFactory } from './camera.js';
 import { installEqualEarthConstrain, type ConstrainHost } from './constrain.js';
 import {
   REWRITTEN_METADATA_KEY,
+  restorableStyle,
   rewriteStyle,
   type SourceTemplate,
   type StyleLike,
@@ -234,6 +235,16 @@ export class EqualEarthController {
     return this.#installed ? this.#installed.camera.blend : (this.#view?.blend ?? 1);
   }
 
+  /**
+   * The zoom the application asked for: the rendered `getZoom()` minus the band's compensation
+   * offset (spec §4.2). `getZoom()` itself while inactive; during a re-apply, the zoom captured
+   * when the camera was torn down.
+   */
+  get requestedZoom(): number {
+    if (this.#installed) return this.#installed.camera.requestedZoom;
+    return this.active && this.#view ? this.#view.zoom : this.#host.getZoom();
+  }
+
   /** A geographic position in the map space of the band shown now. */
   toMapSpace(lngLat: LngLatTuple): LngLatTuple {
     return this.active ? geographicToMap(lngLat, this.blend) : [lngLat[0], lngLat[1]];
@@ -322,7 +333,7 @@ export class EqualEarthController {
     const original = this.#original;
     this.#projection = undefined;
     this.#unsubscribe();
-    if (original) this.#setStyle(original);
+    if (original) this.#setStyle(restorableStyle(original, this.#readStyle()));
     this.#finishDeactivate(view);
   }
 
@@ -688,7 +699,8 @@ export class EqualEarthController {
     const view = this.#detach();
     this.#projection = undefined;
     this.#unsubscribe();
-    if (this.#original && hasOurMetadata(this.#readStyle())) this.#setStyle(this.#original);
+    const live = this.#readStyle();
+    if (this.#original && hasOurMetadata(live)) this.#setStyle(restorableStyle(this.#original, live));
     this.#finishDeactivate(view);
   }
 
