@@ -284,6 +284,7 @@ export class EqualEarthController {
     this.#installed = undefined;
     this.#projection = undefined;
     this.#view = undefined;
+    this.#unsubscribe(); // `off` only: the map's state is not touched
     this.#release();
   }
 
@@ -340,12 +341,13 @@ export class EqualEarthController {
       }
     } catch (error) {
       // N3: a type switch deferred a style the application set meanwhile (`#onStyleLoad`);
-      // failing before it commits, it leaves the old type installed on that style.
+      // failing before it commits, it leaves the old type installed on that style. An apply
+      // of an older generation still in flight is stale and will install nothing.
       if (
         !(error instanceof Error && error.name === SUPERSEDED_ERROR_NAME) &&
         this.active &&
         !this.#installed &&
-        this.#inFlight === undefined
+        this.#inFlight !== this.#generation
       ) {
         this.#reapply();
       }
@@ -377,7 +379,7 @@ export class EqualEarthController {
     try {
       applied = await this.#apply(generation, templates);
     } catch (error) {
-      if (generation === this.#generation) this.#abandon();
+      if (generation === this.#generation) this.#abandon(error);
       throw error;
     }
     if (applied) return;
@@ -410,8 +412,7 @@ export class EqualEarthController {
     const generation = ++this.#generation;
     this.#apply(generation).catch((error: unknown) => {
       if (generation !== this.#generation) return;
-      this.#abandon();
-      this.#settle(error);
+      this.#abandon(error);
       reportError(this.#host, error);
     });
   }
@@ -472,12 +473,14 @@ export class EqualEarthController {
     }
     if (generation !== this.#generation) return false;
     // Re-entrancy: an application `style.load` listener may have set a style of its own inside
-    // our `setStyle`, whose events `#applying` hid. Never install over it.
+    // our `setStyle`, whose events `#applying` hid. Never install over it: apply again from
+    // that style, under the caller's generation, so a failure still reaches the owner that
+    // abandons and reports.
     const live = this.#readStyle();
     if (!hasOurMetadata(live)) {
       if (!live) return false; // a rebuild: its `style.load` re-applies (`#onStyleLoad`)
       this.#original = structuredClone(live);
-      return this.#apply(++this.#generation);
+      return this.#applyNow(generation);
     }
 
     const host = this.#host;
@@ -625,9 +628,13 @@ export class EqualEarthController {
     });
   }
 
-  /** An activation failed after committing: put back whatever it had changed. */
-  #abandon(): void {
+  /**
+   * An apply failed after committing: put back whatever it had changed, and fail the
+   * activations waiting for it (M3) with its error.
+   */
+  #abandon(error: unknown): void {
     this.#generation++;
+    this.#settle(error);
     const view = this.#detach();
     this.#projection = undefined;
     this.#unsubscribe();
