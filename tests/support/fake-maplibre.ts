@@ -504,3 +504,33 @@ export class OpaqueV6Map extends FakeMapBase {
     this.#events.fire(type);
   }
 }
+
+/** A host for the switcher: scripted readiness, recorded paint/layout writes and wake-ups. */
+export class FakeSwitcherHost {
+  readonly loaded = new Set<string>();
+  /** Last value written per layer and paint property. */
+  readonly paint: Record<string, Record<string, unknown>> = {};
+  /** Last value written per layer and layout property. */
+  readonly layout: Record<string, Record<string, unknown>> = {};
+  /** Every write, in order. */
+  readonly writes: { kind: 'paint' | 'layout'; layerId: string; name: string; value: unknown }[] = [];
+  jumps = 0;
+  moving = false;
+  readonly #listeners = new Map<string, (() => void)[]>();
+
+  isSourceLoaded(id: string): boolean { return this.loaded.has(id); }
+  setPaintProperty(layerId: string, name: string, value: unknown): void {
+    (this.paint[layerId] ??= {})[name] = value;
+    this.writes.push({ kind: 'paint', layerId, name, value });
+  }
+  setLayoutProperty(layerId: string, name: string, value: unknown): void {
+    (this.layout[layerId] ??= {})[name] = value;
+    this.writes.push({ kind: 'layout', layerId, name, value });
+  }
+  isMoving(): boolean { return this.moving; }
+  jumpTo(): void { this.jumps++; }
+  on(type: string, listener: () => void): void { this.#listeners.set(type, [...(this.#listeners.get(type) ?? []), listener]); }
+  off(type: string, listener: () => void): void { this.#listeners.set(type, (this.#listeners.get(type) ?? []).filter((l) => l !== listener)); }
+  fire(type: string): void { for (const l of this.#listeners.get(type) ?? []) l(); }
+  listenerCount(type: string): number { return (this.#listeners.get(type) ?? []).length; }
+}
