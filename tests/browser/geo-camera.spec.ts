@@ -171,6 +171,13 @@ test('jumpTo, setCenter, easeTo, flyTo and panTo land exactly on a geographic ta
   await expectExact(page, G, 'flyTo from z5.5 to z2');
 });
 
+test('a target beyond ±180° lands on its place in the one world', async ({ page, mlv }) => {
+  await openHarness(page, { mlv, projection: 'equal' });
+  await page.evaluate(() => window.__h.map.jumpTo({ center: [190, 10], zoom: 6 }));
+  await idle(page);
+  await expectExact(page, [-170, 10], 'jumpTo([190, 10])');
+});
+
 test('flyTo interrupting an easeTo that crossed a band lands exactly', async ({ page, mlv }) => {
   await openHarness(page, { mlv, projection: 'equal' });
   await centreOn(page, G, 2);

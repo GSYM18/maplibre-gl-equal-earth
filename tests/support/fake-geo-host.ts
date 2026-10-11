@@ -198,6 +198,11 @@ export class FakeGeoHost {
   cameraForBounds(bounds: unknown, options?: FakeCameraOptions): { center: FakeLngLat; zoom: number; bearing: number } | undefined {
     this.calls.push({ name: 'cameraForBounds', args: [bounds, options] });
     const [sw, ne] = bounds as [unknown, unknown];
+    return this.fitBox(sw, ne, options);
+  }
+
+  /** The fit itself: what v5's `_cameraForBoxAndBearing` computes. */
+  protected fitBox(sw: unknown, ne: unknown, options?: FakeCameraOptions): { center: FakeLngLat; zoom: number; bearing: number } | undefined {
     const [x0, y1] = geographicToMapWorld(toTuple(sw), 1);
     const [x1, y0] = geographicToMapWorld(toTuple(ne), 1);
     const padding = options?.padding ?? 0;
@@ -231,6 +236,18 @@ export class FakeV5GeoHost extends FakeGeoHost {
   override setCenter(center: unknown, eventData?: unknown): this {
     this.calls.push({ name: 'setCenter', args: [center, eventData] });
     return this.jumpTo({ center }, eventData);
+  }
+
+  /** As v5's Camera: `cameraForBounds` runs the box fit through the instance. */
+  override cameraForBounds(bounds: unknown, options?: FakeCameraOptions): { center: FakeLngLat; zoom: number; bearing: number } | undefined {
+    this.calls.push({ name: 'cameraForBounds', args: [bounds, options] });
+    const [sw, ne] = bounds as [unknown, unknown];
+    return this._cameraForBoxAndBearing(sw, ne, options?.bearing ?? 0, options);
+  }
+
+  _cameraForBoxAndBearing(p0: unknown, p1: unknown, bearing: number, options?: FakeCameraOptions): { center: FakeLngLat; zoom: number; bearing: number } | undefined {
+    this.calls.push({ name: '_cameraForBoxAndBearing', args: [p0, p1, bearing, options] });
+    return this.fitBox(p0, p1, { ...options, bearing });
   }
 
   override panBy(offset: unknown, options?: FakeCameraOptions, eventData?: unknown): this {

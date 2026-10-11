@@ -166,6 +166,14 @@ describe('geographic reads', () => {
     }
   });
 
+  it("uninstall restores a v5 map's _cameraForBoxAndBearing", () => {
+    const host = new FakeV5GeoHost();
+    const api = installGeoApi(host, state(), factories);
+    expect(Object.prototype.hasOwnProperty.call(host, '_cameraForBoxAndBearing')).toBe(true);
+    api.uninstall();
+    expect(Object.prototype.hasOwnProperty.call(host, '_cameraForBoxAndBearing')).toBe(false);
+  });
+
   it('raw reads stay map space', () => {
     const host = new FakeGeoHost();
     host.center = new FakeLngLat(...geographicToMap(G, 0));
@@ -412,7 +420,13 @@ describe('geographic targets', () => {
   it('marks what the TransformProvider hands the handlers, once per prototype', () => {
     const host = new FakeGeoHost();
     installGeoApi(host, state(), factories);
+    const proto = Object.getPrototypeOf(host.keyboard._tr) as object;
+    const unproject = Object.getOwnPropertyDescriptor(proto, 'unproject');
+    const center = Object.getOwnPropertyDescriptor(proto, 'center');
     installGeoApi(new FakeGeoHost(), state(), factories); // second map, same prototype
+    // Not patched again: a second patch would wrap the first (and a third the second, …).
+    expect(Object.getOwnPropertyDescriptor(proto, 'unproject')).toEqual(unproject); // functions compare by identity
+    expect(Object.getOwnPropertyDescriptor(proto, 'center')).toEqual(center);
     expect(isMarkedMapSpace(host.keyboard._tr.unproject([1, 2]))).toBe(true);
     expect(isMarkedMapSpace(host.keyboard._tr.center)).toBe(true);
     host.easeTo({ around: host.keyboard._tr.unproject([1, 2]) });
@@ -616,7 +630,36 @@ describe('fitBounds and cameraForBounds', () => {
     const host = new FakeGeoHost();
     installGeoApi(host, state(), factories);
     expect(host.fitBounds([[5, 45], [11, 48]], { padding: 1000 })).toBe(host);
-    expect(host.calls.filter((c) => ['flyTo', 'easeTo'].includes(c.name))).toHaveLength(0);
+    // As MapLibre's `_fitInternal`: no fit, no stop (a running animation goes on).
+    expect(host.calls.filter((c) => ['flyTo', 'easeTo', 'stop'].includes(c.name))).toHaveLength(0);
+  });
+
+  it('a cameraForBounds result taken under Mercator is converted once Equal Earth is active (v5)', () => {
+    const host = new FakeV5GeoHost();
+    const live = { ...state(), active: false };
+    installGeoApi(host, live, factories);
+    const cam = host.cameraForBounds([[5, 45], [11, 48]])!; // Mercator: MapLibre's own fit, geographic
+    expect(host.calls.some((c) => c.name === '_cameraForBoxAndBearing')).toBe(true);
+    live.active = true; // setProjection({ type: 'equal' })
+    host.flyTo(cam);
+    const passed = host.lastCall('flyTo')[0] as { center: FakeLngLat };
+    const expected = geographicToMap([cam.center.lng, cam.center.lat], 0);
+    expect(passed.center.lng).toBeCloseTo(expected[0], 9);
+    expect(passed.center.lat).toBeCloseTo(expected[1], 9);
+  });
+
+  it('a target beyond ±180° lands on its place in the one world', () => {
+    const host = new FakeGeoHost();
+    host.zoom = 6;
+    installGeoApi(host, state(), factories);
+    host.jumpTo({ center: [190, 10] });
+    const c = host.getCenter();
+    expect(c.lng).toBeCloseTo(-170, 9);
+    expect(c.lat).toBeCloseTo(10, 9);
+    host.panTo([-200, 10], { around: [-190, 5] });
+    const [lngLat, options] = host.lastCall('panTo') as [FakeLngLat, { around: FakeLngLat }];
+    expect([lngLat.lng, lngLat.lat]).toEqual(geographicToMap([160, 10], 0));
+    expect([options.around.lng, options.around.lat]).toEqual(geographicToMap([170, 5], 0));
   });
 });
 
@@ -650,7 +693,15 @@ describe('compensation-aware fit (Ruling R11)', () => {
     expect(rendered.bearing).toBeCloseTo(10, 9);
   });
 
-  it('fitBounds stops before it reads the baseline offsets', () => {
+  it('fitBounds fits once when its stop changes nothing', () => {
+    const host = new FakeGeoHost();
+    installGeoApi(host, state({ offsets: fakeOffsets }), factories);
+    host.fitBounds(BOUNDS, { padding: 20 });
+    expect(host.calls.filter((c) => c.name === 'cameraForBounds')).toHaveLength(1);
+    expect(host.calls[1]!.name).toBe('stop');
+  });
+
+  it('fitBounds fits again when its stop re-based the camera', () => {
     const plain = new FakeGeoHost();
     installGeoApi(plain, state(), factories);
     const fit = plain.cameraForBounds(BOUNDS, { padding: 20 })!;
@@ -659,7 +710,8 @@ describe('compensation-aware fit (Ruling R11)', () => {
     host.onStop = () => { s.baselineOffsets = { deltaZoom: 0.04, deltaBearing: -1 }; }; // the stop re-bases
     installGeoApi(host, s, factories);
     host.fitBounds(BOUNDS, { padding: 20 });
-    expect(host.calls[0]!.name).toBe('stop');
+    // Fit, stop (which re-bases), fit again against the new baseline, then fly.
+    expect(host.calls.slice(0, 3).map((c) => c.name)).toEqual(['cameraForBounds', 'stop', 'cameraForBounds']);
     const fly = host.lastCall('flyTo')[0] as { zoom: number; bearing: number };
     const centre: LngLatTuple = [fit.center.lng, fit.center.lat];
     const rendered = render(fly, centre, 0, s.baselineOffsets);

@@ -442,7 +442,11 @@ function convertTargets(
   for (const key of pending) {
     const tuple = lngLatTuple(values[key]);
     // MapLibre throws its own error for what it cannot read; a latitude beyond ±90° as well.
-    if (tuple && Math.abs(tuple[1]) <= 90) copy[key] = markMapSpace(ctx.toLngLat(mapSpaceOf(tuple, blend)));
+    if (!tuple || Math.abs(tuple[1]) > 90) continue;
+    // World copies are off while active: one world, so a longitude beyond ±180° is its place in
+    // it (as `project`, Ruling R8). Kept as a copy it would be clamped to the world's edge.
+    const onTheWorld: LngLatTuple = [wrapLongitude(tuple[0]), tuple[1]];
+    copy[key] = markMapSpace(ctx.toLngLat(mapSpaceOf(onTheWorld, blend)));
   }
   return copy;
 }
@@ -764,13 +768,24 @@ export function installGeoApi(host: GeoApiHost, state: GeoApiState, factories: G
       if (!state.active) return original(...args);
       // MapLibre's `_fitInternal`, through the wrapped methods: the geographic centre is then
       // converted with the baseline band like any other target.
-      // Stop first (Ruling R11): the original's flyTo/easeTo would, and that stop can re-base the
-      // camera; the fit must read the baseline offsets the animation will run against.
-      raw.stop();
       const [bounds, options, eventData] = args;
       const fitOptions = isObject(options) ? options : undefined;
-      const camera = host.cameraForBounds(bounds, fitOptions);
+      // As `_fitInternal`: nothing to fit, nothing done (a running animation goes on).
+      let camera = host.cameraForBounds(bounds, fitOptions);
       if (!camera) return host;
+      // The flyTo/easeTo below stops first, and that stop can re-base the camera. Stop now, and
+      // fit again if it did: the fit must use the baseline the animation runs against (R11).
+      const before = { offsets: state.baselineOffsets, blend: state.baselineBlend };
+      raw.stop();
+      const after = state.baselineOffsets;
+      if (
+        after.deltaZoom !== before.offsets.deltaZoom ||
+        after.deltaBearing !== before.offsets.deltaBearing ||
+        state.baselineBlend !== before.blend
+      ) {
+        camera = host.cameraForBounds(bounds, fitOptions);
+        if (!camera) return host;
+      }
       // The fit's bearing is `options.bearing`, already in `camera` with the compensation applied.
       const animation: Record<string, unknown> = { ...camera, ...fitOptions, bearing: camera.bearing };
       delete animation['padding'];
@@ -780,9 +795,11 @@ export function installGeoApi(host: GeoApiHost, state: GeoApiState, factories: G
     }),
     // v5 only (a v6 `Map` has no such method): box zoom's `fitScreenCoordinates` runs
     // `_fitInternal` through the map's own `easeTo`, with this fresh map-space centre (B6).
+    // Only while active: under Mercator the centre is geographic, and an application may keep a
+    // `cameraForBounds` result and fly to it once Equal Earth is on; marked, it would pass unconverted.
     wrapMethod<Read<CameraFit | undefined>>(host, '_cameraForBoxAndBearing', (original) => (...args) => {
       const result = original(...args);
-      if (isObject(result?.center)) markMapSpace(result.center);
+      if (state.active && isObject(result?.center)) markMapSpace(result.center);
       return result;
     }),
   ];
