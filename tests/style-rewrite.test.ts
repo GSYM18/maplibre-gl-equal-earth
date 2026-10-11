@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { validateStyleMin } from '@maplibre/maplibre-gl-style-spec';
 import { describe, expect, it } from 'vitest';
 
+import type { CartographyOptions } from '../src/map/cartography.js';
 import { EQUAL_EARTH_BANDS, resolveTransition } from '../src/map/bands.js';
 import {
   REWRITTEN_METADATA_KEY,
@@ -287,10 +288,9 @@ describe('rewriteStyle', () => {
     }
   });
 
-  it('leaves background, non-banded sources and state alone', () => {
+  it('leaves non-banded sources and state alone, and keeps the Mercator background under its id', () => {
     const { style } = rewrite();
-    expect(style.layers[0]).toEqual(liberty().layers[0]);
-    expect(style.layers[0]!.type).toBe('background');
+    expect(style.layers.find((l) => l.id === 'background')).toMatchObject({ type: 'background', paint: liberty().layers[0]!.paint });
     expect(style.state).toEqual(liberty().state);
     const geo: StyleLayerLike = { id: 'g', type: 'fill', source: 'geo', paint: { 'fill-opacity': 0.3 } };
     expect(rewrite(tiny(geo)).style.layers).toEqual([geo]);
@@ -478,5 +478,110 @@ describe('withoutRewriteBounds', () => {
     const style = tiny(vec('water', 'fill', { minzoom: 9 }));
     expect(withoutRewriteBounds(style, undefined, style)).toBe(style);
     expect(withoutRewriteBounds(style, rewrite(tiny(vec('water', 'fill'))).style, undefined)).toBe(style);
+  });
+});
+
+describe('cartography', () => {
+  const cart = (options: CartographyOptions, style = liberty(), zoom = 4.6) =>
+    rewriteStyle(style, { bands: SIX.bands, transition: SIX, templates: TEMPLATES, initialZoom: zoom, cartography: options });
+  const libertyBackground = (): StyleLayerLike => liberty().layers[0]!;
+
+  it('recolours the background copies of Equal Earth bands and puts the world polygon above them', () => {
+    const { style } = cart({ outsideColor: '#123456' });
+    const ids = style.layers.map((l) => l.id);
+    const first = ids.indexOf('background__b0');
+    expect(ids.slice(first, first + 7)).toEqual(['background__b0', 'background__b1', 'background__b2', 'background__b3', 'background__b4', 'background__b5', 'background']);
+    expect(ids[first + 7]).toBe('equal-earth:world__b0');
+    const layer = (id: string) => style.layers.find((l) => l.id === id)!;
+    expect(layer('background__b0').paint!['background-color']).toBe('#123456');
+    expect(layer('background').paint!['background-color']).toBe(libertyBackground().paint!['background-color']);
+    expect(layer('equal-earth:world__b3').paint!['fill-color']).toEqual(libertyBackground().paint!['background-color']);
+    expect(style.sources['equal-earth:world__b3']).toMatchObject({ type: 'geojson', buffer: 0, tolerance: 0 });
+    expect(style.sources['equal-earth:world__b6']).toBeUndefined();
+  });
+
+  it('defaults the outside colour to transparent', () => {
+    const { style } = cart({});
+    expect(style.layers.find((l) => l.id === 'background__b2')!.paint!['background-color']).toBe('transparent');
+  });
+
+  it('carries a background expression and pattern onto the world polygon', () => {
+    const style = liberty();
+    const colour = ['interpolate', ['linear'], ['zoom'], 0, '#eee', 6, '#ddd'];
+    style.layers[0]!.paint = { 'background-color': colour, 'background-pattern': 'dots', 'background-opacity': 0.9 };
+    const out = cart({}, style).style;
+    const world = out.layers.find((l) => l.id === 'equal-earth:world__b1')!;
+    expect(world.paint).toMatchObject({ 'fill-color': colour, 'fill-pattern': 'dots', 'fill-opacity': 0.9, 'fill-antialias': false });
+    const copy = out.layers.find((l) => l.id === 'background__b1')!;
+    expect(copy.paint!['background-pattern']).toBeUndefined();
+    expect(copy.paint!['background-opacity']).toBe(0.9);
+  });
+
+  it('omits the world polygon without a background layer, and adds the outside colour as one', () => {
+    const style = liberty();
+    style.layers = style.layers.filter((l) => l.type !== 'background');
+    const out = cart({ outsideColor: '#000' }, style).style;
+    expect(out.layers.some((l) => l.id.startsWith('equal-earth:world'))).toBe(false);
+    expect(out.layers[0]).toMatchObject({ id: 'equal-earth:background__b0', type: 'background', paint: { 'background-color': '#000' } });
+    expect(out.layers.filter((l) => l.id.startsWith('equal-earth:background'))).toHaveLength(6);
+    expect(cart({}, style).style.layers.some((l) => l.id.startsWith('equal-earth:background'))).toBe(false);
+  });
+
+  it('puts graticule then outline right below the first symbol layer; graticule in every band, outline not in Mercator', () => {
+    const { style } = cart({ outline: true, graticule: { step: 15 } });
+    const ids = style.layers.map((l) => l.id);
+    const firstSymbol = style.layers.findIndex((l) => l.type === 'symbol');
+    const generated = ids.slice(0, firstSymbol).filter((id) => /^equal-earth:(graticule|outline)/.test(id));
+    expect(generated).toEqual([
+      ...[0, 1, 2, 3, 4, 5, 6].map((k) => `equal-earth:graticule__b${k}`),
+      ...[0, 1, 2, 3, 4, 5].map((k) => `equal-earth:outline__b${k}`),
+    ]);
+    expect(ids.indexOf('equal-earth:outline__b5')).toBe(firstSymbol - 1);
+    expect(style.layers.find((l) => l.id === 'equal-earth:outline__b2')).toMatchObject({
+      type: 'line',
+      layout: { 'line-cap': 'round' },
+      paint: { 'line-color': '#9a9a9a', 'line-width': 1 },
+    });
+  });
+
+  it('appends the lines at the end without a symbol layer, and emits nothing unless asked', () => {
+    const style = tiny(vec('water', 'fill'));
+    const out = cart({ graticule: true }, style).style;
+    expect(out.layers.filter((l) => l.id.startsWith('equal-earth:graticule'))).toHaveLength(7);
+    expect(out.layers.at(-1)!.id).toBe('equal-earth:graticule__b6');
+    expect(cart({}, liberty()).style.layers.some((l) => /^equal-earth:(graticule|outline)/.test(l.id))).toBe(false);
+  });
+
+  it('gates every generated layer like a band copy', () => {
+    const r = cart({ outline: true, graticule: true }, liberty(), 4.6); // initial band 1
+    for (const id of ['background__b0', 'equal-earth:world__b0', 'equal-earth:outline__b0', 'equal-earth:graticule__b0']) {
+      const gate = r.gates.find((g) => g.layerId === id);
+      expect(gate, id).toBeDefined();
+      expect(gate!.band).toBe(0);
+    }
+    const hidden = r.style.layers.find((l) => l.id === 'equal-earth:world__b0')!;
+    expect(hidden.paint!['fill-opacity']).toBe(0);
+    const shown = r.style.layers.find((l) => l.id === 'equal-earth:world__b1')!;
+    expect(shown.paint!['fill-opacity']).toBeUndefined(); // own value: the Liberty background has none
+    expect(r.style.layers.find((l) => l.id === 'background')!.paint!['background-opacity']).toBe(0);
+    expect(r.gatesForBand(6).some((g) => g.layerId === 'equal-earth:graticule__b6')).toBe(true);
+    expect(r.gatesForBand(6).some((g) => g.layerId.startsWith("equal-earth:outline"))).toBe(false);
+  });
+
+  it('throws on a collision with an existing generated id', () => {
+    const style = liberty();
+    style.sources['equal-earth:world__b1'] = { type: 'geojson', data: { type: 'FeatureCollection', features: [] } };
+    expect(() => cart({}, style)).toThrow(TypeError);
+  });
+
+  it('validates with every option on', () => {
+    expect(validateStyleMin(cart({ outsideColor: '#123', outline: { color: '#000', width: 2 }, graticule: { step: 10 } }).style as never)).toEqual([]);
+  });
+
+  it('works under pure Equal Earth (one band)', () => {
+    const r = rewriteStyle(liberty(), { bands: EQUAL_EARTH_BANDS, transition: null, templates: TEMPLATES, initialZoom: 2, cartography: { outline: true } });
+    expect(r.style.layers.filter((l) => l.id.startsWith('equal-earth:outline'))).toHaveLength(1);
+    expect(r.style.layers.some((l) => l.id === 'background__b0')).toBe(true);
+    expect(r.style.layers.some((l) => l.id === 'background')).toBe(false);
   });
 });

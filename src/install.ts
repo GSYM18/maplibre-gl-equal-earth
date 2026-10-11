@@ -60,6 +60,12 @@ export interface InstallOptions {
   compensation?: CompensationMode;
   fetchJson?: ControllerOptions['fetchJson'];
   onSwitch?: ControllerOptions['onSwitch'];
+  /** Colour outside the Equal Earth world, in bands with blend < 1 (spec §5). @defaultValue 'transparent' */
+  outsideColor?: ControllerOptions['outsideColor'];
+  /** The edge of the world as a line, in bands with blend < 1 (spec §5). Off unless given. */
+  outline?: ControllerOptions['outline'];
+  /** Meridians and parallels in every band (spec §5). Off unless given. */
+  graticule?: ControllerOptions['graticule'];
 }
 
 export interface EqualEarthInstall {
@@ -181,6 +187,9 @@ async function install(
     ...(options.compensation ? { compensation: options.compensation } : {}),
     ...(options.fetchJson ? { fetchJson: options.fetchJson } : {}),
     ...(options.onSwitch ? { onSwitch: options.onSwitch } : {}),
+    ...(options.outsideColor === undefined ? {} : { outsideColor: options.outsideColor }),
+    ...(options.outline === undefined ? {} : { outline: options.outline }),
+    ...(options.graticule === undefined ? {} : { graticule: options.graticule }),
   };
   const controllers = new WeakMap<object, EqualEarthController>();
   const live = new Set<EqualEarthController>();

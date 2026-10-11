@@ -48,6 +48,12 @@ export interface HarnessOptions {
   /** @defaultValue 'mercator' */
   projection?: HarnessProjection;
   compensation?: CompensationMode;
+  /** `outsideColor` of `installEqualEarth`. */
+  outside?: string;
+  /** `outline: true`. */
+  outline?: boolean;
+  /** `graticule: { step }`, or `true` for the default. */
+  graticule?: number | true;
 }
 
 /** `test` with the per-project `mlv` option (`playwright.config.ts` sets it). */
@@ -67,6 +73,9 @@ export async function openHarness(page: Page, options: HarnessOptions): Promise<
   if (options.dpr !== undefined) params.set('dpr', String(options.dpr));
   if (options.projection && options.projection !== 'mercator') params.set('projection', options.projection);
   if (options.compensation) params.set('compensation', options.compensation);
+  if (options.outside) params.set('outside', options.outside);
+  if (options.outline) params.set('outline', '1');
+  if (options.graticule !== undefined) params.set('graticule', options.graticule === true ? '1' : String(options.graticule));
   await page.goto(`/tests/browser/harness.html?${params.toString()}`);
   await page.waitForFunction(() => window.__h !== undefined);
   let timer: ReturnType<typeof setTimeout> | undefined;

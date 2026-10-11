@@ -102,3 +102,60 @@ for (const dpr of [1, 2]) {
     console.log(report.join('\n'));
   });
 }
+
+/** The canvas colour at a CSS pixel, as `[r, g, b, a]`. */
+async function colourAtPixel(page: Page, x: number, y: number): Promise<number[]> {
+  return page.evaluate(
+    ({ x, y }) => {
+      const canvas = window.__h.map.getCanvas();
+      const scale = canvas.width / canvas.clientWidth;
+      const copy = document.createElement('canvas');
+      copy.width = canvas.width;
+      copy.height = canvas.height;
+      const context = copy.getContext('2d')!;
+      context.drawImage(canvas, 0, 0);
+      return [...context.getImageData(Math.round(x * scale), Math.round(y * scale), 1, 1).data];
+    },
+    { x, y },
+  );
+}
+
+const near = (actual: number[], expected: number[], tolerance = TOLERANCE): boolean =>
+  expected.every((value, i) => Math.abs(actual[i]! - value) <= tolerance);
+
+const BACKGROUND = [0xf8, 0xf4, 0xf0];
+
+test('outside colour fills the corners of the canvas; the world and the Arctic gap keep the background', async ({ page, mlv }) => {
+  test.setTimeout(240_000);
+  await openHarness(page, { mlv, projection: 'equal-earth', outside: '#ff00ff' });
+  await centreOn(page, [0, 0], 0);
+  expect(near(await colourAtPixel(page, 2, 2), [0xff, 0x00, 0xff]), 'top-left corner').toBe(true);
+  const ocean = await pixelOf(page, [0, -45]);
+  expect(near(await colourAtPixel(page, ocean[0], ocean[1]), BACKGROUND), 'open ocean').toBe(true);
+  // Polar sea above land box 4, below the pole: only the pole snapping and the world polygon close it.
+  const arctic = await pixelOf(page, [-175, 82]);
+  expect(near(await colourAtPixel(page, arctic[0], arctic[1]), BACKGROUND), 'Arctic gap').toBe(true);
+  expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
+});
+
+test('without an outside colour the corners show the page behind the canvas', async ({ page, mlv }) => {
+  test.setTimeout(240_000);
+  await openHarness(page, { mlv, projection: 'equal-earth' });
+  await centreOn(page, [0, 0], 0);
+  expect((await colourAtPixel(page, 2, 2))[3], 'corner is transparent').toBeLessThan(TOLERANCE);
+  const ocean = await pixelOf(page, [0, -45]);
+  expect(near(await colourAtPixel(page, ocean[0], ocean[1]), BACKGROUND), 'open ocean').toBe(true);
+});
+
+test('the outline and the graticule are drawn on the world', async ({ page, mlv }) => {
+  test.setTimeout(240_000);
+  await openHarness(page, { mlv, projection: 'equal-earth', outline: true, graticule: 30 });
+  await centreOn(page, [0, 0], 0);
+  const layers = await page.evaluate(() => window.__h.map.getStyle().layers.map((l) => l.id));
+  expect(layers).toContain('equal-earth:outline__b0');
+  expect(layers).toContain('equal-earth:graticule__b0');
+  // Open ocean on the -150° meridian: only the graticule darkens it.
+  const [x, y] = await pixelOf(page, [-150, -45]);
+  expect(near(await colourAtPixel(page, x, y), BACKGROUND, 2), 'graticule meridian darkens the ocean').toBe(false);
+  expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
+});
