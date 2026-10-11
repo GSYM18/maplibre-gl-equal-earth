@@ -130,21 +130,29 @@ is copied only into bands its own zoom range overlaps.
 `floor(minzoom) ≤ z < maxzoom`, so a copy whose range begins at its band boundary has nothing
 drawable in tiles loaded before the crossing (spike finding 3: a ~2 s blank at every step).
 Therefore a copy's **zoom range is only the parse range**: the band's range widened by one
-spacing `s` on each side, clamped to the layer's own range. Whether a copy is *shown* is a
-runtime decision (§4) carried by **global state**:
+spacing `s` on each side, clamped to the layer's own range; a copy whose clamped range is
+empty is dropped. Whether a copy is *shown* is a runtime decision (§4) carried by **literal
+paint values** that the switcher sets through `setPaintProperty` / `setLayoutProperty`:
 
-- `fill`, `line`, `fill-extrusion` copies: the opacity property becomes
-  `["case", ["global-state", "eqe-show-<k>"], <original value>, 0]` (zoom curves keep `zoom`
-  at the top level by wrapping each stop output), with a 250 ms paint transition unless the
-  layer declares its own. Flipping the state is a paint update: main thread, no re-parse.
-- `symbol` copies: `layout.visibility` becomes
-  `["case", ["global-state", "eqe-sym-<k>"], "visible", "none"]`. Transparent labels would
-  still take part in collision, so symbols must really be hidden, which re-parses (not
-  re-warps) the two affected sources. Their `text-opacity`/`icon-opacity` are gated like paint
-  above, so the outgoing band's labels fade before they are hidden.
-- `raster` layers (relief) exist only in the Mercator band, gated by `eqe-show-<steps>`.
-- The rewritten style declares `state` defaults so a fresh style renders the band of its
-  initial zoom; the Mercator band's original layers are gated the same way as copies.
+- `fill`, `line`, `fill-extrusion`, `circle`, `heatmap`, `raster`, `hillshade` copies: the
+  layer's opacity-like properties (`OPACITY` per type) hold the **original value** while the
+  band is shown and the constant `0` while it is hidden, with a 250 ms `*-transition` unless
+  the layer declares its own. A switch is a paint update: main thread, no re-parse. MapLibre
+  interpolates from the evaluated prior value to the new one, so the bands cross-fade.
+- `symbol` copies: `layout.visibility` is the layer's own value while shown and `"none"` while
+  hidden. Transparent labels would still take part in collision, so symbols must really be
+  hidden, which re-parses (not re-warps) the two affected sources. Their
+  `text-opacity`/`icon-opacity` are gated like paint above with a 300 ms transition, so the
+  outgoing band's labels fade before they are hidden.
+- `raster` / `hillshade` layers (relief) exist only in the Mercator band.
+- The rewrite emits every copy in the state for its initial zoom's band and returns a **gate
+  table** (layer id, band, gated paint originals, own visibility) that the switcher applies.
+
+Why not `global-state`: MapLibre re-evaluates a transition's *prior* expression against the
+live global state on every frame (`TransitioningPropertyValue.possiblyEvaluate`), so a flip of
+`["case", ["global-state", k], v, 0]` yields prior = final and switches instantly. Literal
+values are also valid for every paint shape (legacy functions, `let`, `coalesce`), where
+wrapping an expression per stop output was not.
 
 The spec's earlier hidden *prefetch layers* are dropped: they load tiles but cannot make them
 drawable.
@@ -160,9 +168,9 @@ drawable.
 | `tiles/clip.ts` | new | direct polygon/line/point clipping to the buffered output tile, replacing geojson-vt (§6) |
 | `map/bands.ts` | extend | `Band`, `validateBands`, `bandIndexForZoom` (done); `transitionBands`, `continuousBlend`, `parseRange`, `bandSourceId` |
 | `map/camera.ts` | extend | `BandCamera`: baseline model (done) + similarity compensation + a band *selector* hook (§4) |
-| `map/switcher.ts` | new | ready-gated band selection, hysteresis, dwell, global-state flips, symbol fade sequence |
+| `map/switcher.ts` | new | ready-gated band selection, hysteresis, dwell, gate application, symbol fade sequence |
 | `map/constrain.ts` | done | world bounds per band |
-| `map/style-rewrite.ts` | new | pure: (style, bands, options) → rewritten style (sources, copies, parse ranges, global-state gating, transitions, raster gating, `state` defaults) |
+| `map/style-rewrite.ts` | new | pure: (style, bands, options) → rewritten style (sources, copies, parse ranges, initial shown/hidden paint, transitions, raster gating) + gate table and `applyGate` |
 | `map/controller.ts` | new | per-map: intercepts `setProjection`/`getProjection`, listens to `projectiontransition` and `styledata`, applies and restores the rewrite, owns camera + switcher + constrain, toggles `renderWorldCopies` |
 | `map/geo-api.ts` | new (Plan 3) | per-instance wrappers and GeoJSON fan-out (§7) |
 | `map/graticule.ts` | moved (Plan 3) | from `demo/graticule.ts` |
@@ -259,9 +267,10 @@ conversion and the style flip happen in the same frame. Rules, evaluated on the 
 6. A **minimum dwell** of 300 ms between switches, except forced ones, so a fast zoom through
    several bands does not cascade one blink per band.
 
-A switch flips `eqe-show-<old>` off and `eqe-show-<new>` on (paint cross-fade), sets
-`eqe-sym-<new>` on (re-parse begins; labels fade in as placed) and `eqe-sym-<old>` off after
-one fade (300 ms), so labels cross-fade rather than blink. While the map is idle no camera
+A switch applies the new band's gates as *shown* (original paint values restored, symbols
+visible: re-parse begins and labels fade in as placed) and the old band's as *fading* (gated
+paint to `0`, a 250/300 ms cross-fade), then as *hidden* (symbol `visibility: "none"`) after
+one symbol fade (300 ms), so labels cross-fade rather than blink. While the map is idle no camera
 frame runs the hook, so when a waited-for band becomes loaded (`sourcedata`) the switcher asks
 the camera to run one update (`host.jumpTo({})`, which fires `movestart`/`moveend` as any
 camera change does — documented). Readiness and band parse ranges come from public API
