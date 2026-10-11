@@ -56,6 +56,7 @@ import {
   REWRITTEN_METADATA_KEY,
   restorableStyle,
   rewriteStyle,
+  withoutRewriteBounds,
   type SourceTemplate,
   type StyleLike,
 } from './style-rewrite.js';
@@ -186,6 +187,11 @@ export class EqualEarthController {
   #transition: ResolvedTransition | null = null;
   /** The style to restore: the application's, never a rewritten one. */
   #original: StyleLike | undefined;
+  /**
+   * The rewritten style we last set, until it is restored away: the base MapLibre diffs the
+   * application's next style against, whose in-place zoom bounds that style may inherit.
+   */
+  #rewritten: StyleLike | undefined;
   #installed: Installed | undefined;
   /** The camera while nothing is installed (during an apply). */
   #view: View | undefined;
@@ -321,6 +327,7 @@ export class EqualEarthController {
   #release(): void {
     this.#destroyed = true;
     this.#original = undefined;
+    this.#rewritten = undefined;
     this.#tileJson.clear();
   }
 
@@ -334,6 +341,7 @@ export class EqualEarthController {
     this.#projection = undefined;
     this.#unsubscribe();
     if (original) this.#setStyle(restorableStyle(original, this.#readStyle()));
+    this.#rewritten = undefined;
     this.#finishDeactivate(view);
   }
 
@@ -350,7 +358,7 @@ export class EqualEarthController {
           style = this.#readStyle();
         }
         // 2. The original: the previously captured one if this style is already ours.
-        original = hasOurMetadata(style) && this.#original ? this.#original : structuredClone(style);
+        original = hasOurMetadata(style) && this.#original ? this.#original : this.#capture(style);
         // 4. Templates; a failure rejects before anything on the map has changed. A style set
         // meanwhile (I3, N2) restarts from step 1: every swap fires `styledataloading` or
         // `style.load`, so listening suffices and nothing is serialised to compare.
@@ -516,6 +524,7 @@ export class EqualEarthController {
     // `style.load` fires inside `setStyle`; on a full rebuild a frame or more later, or never
     // when the rebuild is aborted, in which case the generation has moved on (M2).
     const styleLoad = this.#nextEvent('style.load');
+    this.#rewritten = rewritten.style;
     this.#setStyle(rewritten.style);
     if (!styleLoad.fired()) {
       const current = this.#readStyle();
@@ -539,7 +548,7 @@ export class EqualEarthController {
     const live = this.#readStyle();
     if (!hasOurMetadata(live)) {
       if (!live) return false; // a rebuild: its `style.load` re-applies (`#onStyleLoad`)
-      this.#original = structuredClone(live);
+      this.#original = this.#capture(live);
       return this.#applyNow(generation);
     }
 
@@ -631,7 +640,7 @@ export class EqualEarthController {
       return;
     }
     this.#view = this.#detach();
-    this.#original = structuredClone(style);
+    this.#original = this.#capture(style);
     if (this.#switchPending()) return;
     this.#reapply();
   };
@@ -701,6 +710,7 @@ export class EqualEarthController {
     this.#unsubscribe();
     const live = this.#readStyle();
     if (this.#original && hasOurMetadata(live)) this.#setStyle(restorableStyle(this.#original, live));
+    this.#rewritten = undefined;
     this.#finishDeactivate(view);
   }
 
@@ -749,6 +759,14 @@ export class EqualEarthController {
     if (resolved.tiles.length === 0) throw unresolved(id, 'the TileJSON lists no tiles');
     this.#tileJson.set(url, resolved);
     return resolved;
+  }
+
+  /**
+   * A copy of the application's style, read from the map, to keep as the original: without the
+   * zoom bounds a diff over our rewritten style left on it ({@link withoutRewriteBounds}).
+   */
+  #capture(style: StyleLike): StyleLike {
+    return withoutRewriteBounds(structuredClone(style), this.#rewritten, this.#original);
   }
 
   /** The host's style if it is loaded, else `undefined`. Not a copy: clone before keeping it. */

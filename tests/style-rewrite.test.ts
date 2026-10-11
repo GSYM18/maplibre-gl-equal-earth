@@ -7,6 +7,7 @@ import {
   REWRITTEN_METADATA_KEY,
   applyGate,
   restorableStyle,
+  withoutRewriteBounds,
   rewriteStyle,
   type GateHost,
   type LayerGate,
@@ -428,5 +429,54 @@ describe('restorableStyle', () => {
     // Pure Equal Earth renames every copy: the originals are re-added, not diffed.
     const pure = rewriteStyle(original, { bands: EQUAL_EARTH_BANDS, transition: null, templates: TEMPLATES, initialZoom: 2 }).style;
     expect(restorableStyle(original, pure)).toBe(original);
+  });
+});
+
+describe('withoutRewriteBounds', () => {
+  /** What MapLibre serialises after diffing `next` over `live`: `setLayerZoomRange` skips absent bounds. */
+  const diffed = (live: StyleLike, next: StyleLike): StyleLike => ({
+    ...next,
+    layers: next.layers.map((layer) => {
+      const old = live.layers.find((l) => l.id === layer.id && l.type === layer.type && l.source === layer.source);
+      return {
+        ...layer,
+        ...(layer.minzoom === undefined && old?.minzoom !== undefined ? { minzoom: old.minzoom } : {}),
+        ...(layer.maxzoom === undefined && old?.maxzoom !== undefined ? { maxzoom: old.maxzoom } : {}),
+      };
+    }),
+  });
+
+  it("drops the Mercator band's in-place bounds that the diff left on the application's new style", () => {
+    const original = tiny(vec('water', 'fill'), vec('road', 'line', { minzoom: 3 }), vec('wetland', 'fill', { minzoom: 12 }));
+    const rewritten = rewrite(original).style;
+    const next = tiny(vec('water', 'fill', { paint: { 'fill-color': '#4477aa' } }), vec('road', 'line', { minzoom: 3 }), vec('wetland', 'fill', { minzoom: 12 }));
+    const captured = diffed(rewritten, next);
+    expect(captured.layers[0]!.minzoom).toBe(rewritten.layers.find((l) => l.id === 'water')!.minzoom);
+    const cleaned = withoutRewriteBounds(captured, rewritten, original);
+    expect(cleaned).toEqual(next);
+    expect(captured.layers[0]!.minzoom).toBeGreaterThan(0); // not mutated
+    // Rewritten again, every band has its copy of `water` once more; from `captured`, the low
+    // bands would have none.
+    expect(rewrite(cleaned).style.layers.filter((l) => l.id.startsWith('water'))).toHaveLength(SIX.bands.length);
+    expect(rewrite(captured).style.layers.some((l) => l.id === 'water__b0')).toBe(false);
+  });
+
+  it('keeps bounds the original had, bounds that differ from ours, and replaced layers', () => {
+    const original = tiny(vec('water', 'fill'), vec('road', 'line'), vec('rail', 'line'));
+    const rewritten = rewrite(original).style;
+    const band = rewritten.layers.find((l) => l.id === 'water')!.minzoom!;
+    const captured = tiny(
+      vec('water', 'fill', { minzoom: band + 1 }), // a bound of the application's own
+      vec('road', 'fill', { minzoom: band }), // type changed: re-added, so the bound is its own
+      vec('rail', 'line', { minzoom: band }),
+    );
+    const withRailBound = tiny(vec('water', 'fill'), vec('road', 'line'), vec('rail', 'line', { minzoom: band }));
+    expect(withoutRewriteBounds(captured, rewritten, withRailBound)).toBe(captured);
+  });
+
+  it('returns the captured style itself without a rewritten style or an original', () => {
+    const style = tiny(vec('water', 'fill', { minzoom: 9 }));
+    expect(withoutRewriteBounds(style, undefined, style)).toBe(style);
+    expect(withoutRewriteBounds(style, rewrite(tiny(vec('water', 'fill'))).style, undefined)).toBe(style);
   });
 });

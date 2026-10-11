@@ -117,6 +117,24 @@ describe('EqualEarthController', () => {
     expect(host.style!.layers).toHaveLength(10); // the new original is what deactivate restores
   });
 
+  it("does not capture the Mercator band's zoom bounds from the application's diffed style", async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    const bandMin = host.style!.layers.find((l) => l.id === 'park')!.minzoom;
+    expect(bandMin).toBeGreaterThan(0); // the Mercator band keeps the id, bounded in place
+    const replacement = liberty();
+    replacement.layers.find((l) => l.id === 'park')!.paint = { 'fill-color': '#4477aa' };
+    host.setStyle(replacement, {}); // diffed: the fake, like MapLibre, keeps `park`'s minzoom
+    await vi.waitFor(() => expect(host.style!.metadata![REWRITTEN_METADATA_KEY]).toBeDefined());
+    // Every band below the Mercator one still has its copy, in the new colour.
+    expect(host.style!.layers.find((l) => l.id === 'park__b0')).toMatchObject({ paint: { 'fill-color': '#4477aa' } });
+    expect(host.style!.layers.find((l) => l.id === 'park__b0')!.minzoom).toBeUndefined();
+    await controller.deactivate();
+    expect(host.style!.layers.find((l) => l.id === 'park')!.minzoom ?? 0).toBe(0);
+    // A bound the application's style really has is kept.
+    expect(host.style!.layers.find((l) => l.id === 'landcover_wetland')!.minzoom).toBe(12);
+  });
+
   it('equal-earth: one band, no compensation, raster relief removed', async () => {
     const { host, controller } = setup(2);
     await controller.activate('equal-earth');
