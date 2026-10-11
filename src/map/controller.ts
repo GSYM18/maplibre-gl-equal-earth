@@ -78,9 +78,14 @@
  * - Edits made while an activation fetches its TileJSON are taken before it commits; edits made
  *   while a re-apply is in flight reach the original it rewrites, and an amend follows the apply
  *   once it has finished (R17).
- * - The application's `setStyle` is wrapped too (R16): from the call until `#onStyleLoad` has
- *   captured the new style, the wrappers pass straight through, so a `style.load` listener that
- *   re-adds its layers to the new basemap edits the live style, where the capture finds them.
+ * - The live style decides (R19): the wrappers keep edits in the original, translate ids and
+ *   refuse as MapLibre would only while the live style is our rewrite, told by one raw `getLayer`
+ *   of a layer only the rewrite has (its sentinel). Otherwise, as for a basemap the application
+ *   switched to (`setStyle(url)` diffs it in from MapLibre's own fetch, so the call is long over),
+ *   they pass straight through: a `style.load` listener that re-adds its layers edits the live
+ *   style, where the capture finds them, and an edit made after the capture but before the
+ *   re-apply is found by the re-apply's second look at the live style. The application's
+ *   `setStyle` is still tracked (R16), but only a rewrite without a sentinel depends on it.
  * - `getLayer`, `getPaintProperty`, `getLayoutProperty`, `getFilter` and the `layers` of
  *   `queryRenderedFeatures` read an original id that is not live (pure Equal Earth, or outside
  *   the Mercator band's range) as its copy in the band shown, else its first live copy (R18): the
@@ -108,7 +113,7 @@ import {
   type ResolvedTransition,
   type Transition,
 } from './bands.js';
-import type { CartographyOptions } from './cartography.js';
+import { CARTOGRAPHY_PREFIX, type CartographyOptions } from './cartography.js';
 import { BandCamera, type CameraHost, type LngLatFactory } from './camera.js';
 import { installEqualEarthConstrain, type ConstrainHost } from './constrain.js';
 import { geojsonZoomForBand, warpGeoJSON } from './geojson.js';
@@ -472,10 +477,14 @@ export class EqualEarthController {
   /** Set around an amend's `setStyle`: the `style.load` events it fires, swallowed (R15). */
   #amendLoads: { count: number } | undefined;
   /**
-   * An application `setStyle` while active (R16): `call` during the call, `loading` while its
-   * rebuild loads, `none` once `#onStyleLoad` has captured it (or nothing changed).
+   * An application `setStyle` while active (R16): `call` during the call, `awaiting` until the
+   * style it asked for arrives (a URL, or a rebuild) or fails (an `error`), `none` once
+   * `#onStyleLoad` has run. Bookkeeping only: the live style decides (R19, {@link #liveIsOurs});
+   * this is consulted only for a rewrite without a sentinel.
    */
-  #appStyle: 'none' | 'call' | 'loading' = 'none';
+  #appStyle: 'none' | 'call' | 'awaiting' = 'none';
+  /** Per rewrite, the id of a layer it adds that no original has (R19, {@link #liveIsOurs}). */
+  readonly #sentinels = new WeakMap<RewrittenStyle, string | undefined>();
   /** Warped GeoJSON by data object and band (`blend/zoom`): an amend re-warps only new data. */
   readonly #warped = new WeakMap<object, Map<string, GeoJSON.GeoJSON>>();
   /** Source specs whose resolution failed synchronously (TMS, no tiles): reported once. */
@@ -914,6 +923,13 @@ export class EqualEarthController {
     const rewritten = rewriteStyle(original, this.#rewriteOptions(resolved, initialZoom, initialBand));
     // I4: the warp feeds MapLibre's Mercator renderer; an original globe would bend it.
     rewritten.style.projection = { type: 'mercator' };
+    // R19: a layer only this rewrite has, preferably a cartography layer (`equal-earth:*`, which no
+    // application addresses), else a band copy. Every rewrite with something to translate has one:
+    // the world polygon whenever there is a background and a band below Mercator (pure Equal Earth
+    // included), a band copy whenever a layer is banded.
+    const own = new Set(original.layers.map((layer) => layer.id));
+    const added = rewritten.style.layers.filter((layer) => !own.has(layer.id));
+    this.#sentinels.set(rewritten, (added.find((layer) => layer.id.startsWith(CARTOGRAPHY_PREFIX)) ?? added[0])?.id);
     return rewritten;
   }
 
@@ -939,11 +955,22 @@ export class EqualEarthController {
   };
 
   async #applyNow(generation: number, resolved?: ResolvedSources): Promise<boolean> {
-    const original = this.#original!;
-    // An edit from here on reaches `original` (the wrappers keep it), but perhaps after the rewrite.
-    const edits = this.#edits;
+    let original = this.#original!;
+    // An edit from here on reaches `original` while the live style is ours (the wrappers keep it),
+    // perhaps after the rewrite; the live style otherwise (it is the captured original).
+    let edits = this.#edits;
     resolved ??= await this.#resolveSources(original);
     if (generation !== this.#generation) return false;
+    // R19: edits made since the capture while the live style was the application's went to the
+    // live style alone. Capture it again (and resolve what it added) so the rewrite keeps them.
+    for (;;) {
+      const live = this.#edits === edits ? undefined : this.#readStyle();
+      if (!live || hasOurMetadata(live)) break;
+      edits = this.#edits;
+      original = this.#original = this.#capture(live);
+      resolved = await this.#resolveSources(original);
+      if (generation !== this.#generation) return false;
+    }
     // The application may have set GeoJSON data since the original was captured (its
     // `setProjection` and `setData` in one tick, a `setData` right after its own `setStyle`): the
     // wrappers only exist once installed. Take the live data, so the rewrite neither warps nor
@@ -1063,7 +1090,7 @@ export class EqualEarthController {
    */
   readonly #onStyleLoading = (): void => {
     if (!this.active || this.#applying) return;
-    if (this.#appStyle === 'call') this.#appStyle = 'loading';
+    if (this.#appStyle === 'call') this.#appStyle = 'awaiting';
     this.#view = this.#detach();
     if (!this.#switchPending()) this.#nextGeneration();
   };
@@ -1226,11 +1253,14 @@ export class EqualEarthController {
     // fires (`Style.setState`, bubbling through the Map's `fire`) is counted, not delivered.
     restores.push(
       wrapMethod<Edit>(host, 'fire', (original) => (event, ...rest) => {
+        const type = eventType(event);
         const loads = this.#amendLoads;
-        if (loads && eventType(event) === 'style.load') {
+        if (loads && type === 'style.load') {
           loads.count++;
           return host;
         }
+        // A style the application asked for that failed to load (R16 bookkeeping).
+        if (type === 'error' && this.#appStyle === 'awaiting') this.#appStyle = 'none';
         return original(event, ...rest);
       }),
     );
@@ -1240,23 +1270,38 @@ export class EqualEarthController {
   }
 
   /**
-   * The original while Equal Earth is active, unless an application `setStyle` awaits capture
-   * (R16): the application's edits are kept in it. While that style is pending, edits go straight
-   * to the live style, where the capture finds them.
+   * The original while Equal Earth is active and the live style is ours (R19): the application's
+   * edits are kept in it, and its ids are translated and refused against it. Otherwise (an
+   * application style not captured yet, such as a basemap a `setStyle(url)` diffed in from
+   * MapLibre's own fetch, or one captured and awaiting its re-apply) edits go straight to the
+   * live style, where the capture, or the re-apply's second look (`#applyNow`), finds them.
    */
   #following(): StyleLike | undefined {
-    return this.active && this.#appStyle === 'none' ? this.#original : undefined;
+    return this.active && this.#liveIsOurs() ? this.#original : undefined;
   }
 
-  /** The application's `setStyle`: marks its style pending capture while active (R16). */
+  /**
+   * Whether the live style is our rewrite: its sentinel layer ({@link #rewrite}) is live, one raw
+   * `getLayer`. A rewrite without one (no banded layer, no cartography: nothing to translate) falls
+   * back to the `setStyle` bookkeeping.
+   */
+  #liveIsOurs(): boolean {
+    const rewritten = this.#rewritten;
+    const sentinel = rewritten ? this.#sentinels.get(rewritten) : undefined;
+    if (sentinel === undefined) return this.#appStyle === 'none';
+    return this.#rawStyle.getLayer(sentinel) !== undefined;
+  }
+
+  /** The application's `setStyle`: bookkeeping until the style it asked for has arrived (R16). */
   #appSetStyle(style: unknown, rest: unknown[]): unknown {
     if (!this.active) return this.#rawStyle.setStyle(style, ...rest);
     this.#appStyle = 'call';
     try {
       return this.#rawStyle.setStyle(style, ...rest);
     } finally {
-      // A diff captured it (`#onStyleLoad`) or changed nothing; a rebuild stays pending until it loads.
-      if (this.#appStyle === 'call') this.#appStyle = 'none';
+      // An object diffed in synchronously (captured by `#onStyleLoad`, or nothing changed); a URL
+      // arrives later, through MapLibre's own diff or rebuild.
+      if (this.#appStyle === 'call') this.#appStyle = typeof style === 'string' ? 'awaiting' : 'none';
     }
   }
 

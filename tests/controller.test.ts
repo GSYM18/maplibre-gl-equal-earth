@@ -1613,6 +1613,61 @@ describe('live style edits (Task 9)', () => {
       expect(layerOf(host, 'extra__b1')).toBeDefined();
     });
 
+    for (const [type, zoom, copy] of [['equal', 4.6, 'mine__b1'], ['equal-earth', 2, 'mine__b0']] as const) {
+      it(`a basemap switch by URL (an async diff) is followed: a guarded listener registered first is neither refused nor thrown into, under ${type} (R19)`, async () => {
+        const { host, controller } = setup(zoom, withMine());
+        host.on('error', () => undefined);
+        host.on('style.load', guarding(host)); // before the controller's own listener
+        await controller.activate(type);
+        // `setStyle(url)`: MapLibre fetches the style, then diffs it in through `Style.setState`,
+        // which fires `style.load` from inside MapLibre, not from the application's call.
+        const basemap = liberty();
+        basemap.layers = basemap.layers.slice(0, 20);
+        expect(() => FakeControllerHost.prototype.setStyle.call(host, basemap, {})).not.toThrow();
+        await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+        await vi.waitFor(() => expect(layerOf(host, copy)).toBeDefined());
+        await tick();
+        expect(host.errors).toEqual([]);
+        expect(host.styleErrors).toEqual([]);
+        expect(controller.active).toBe(true);
+        expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeDefined();
+        await controller.deactivate();
+        expect(host.style!.layers.map((l) => l.id)).toEqual([...basemap.layers.map((l) => l.id), 'mine']); // captured
+      });
+    }
+
+    it('a guarded listener registered after the controller re-adds its layer to a new basemap, banded (R19)', async () => {
+      const { host, controller } = setup(4.6, withMine());
+      host.on('error', () => undefined);
+      await controller.activate('equal');
+      host.on('style.load', guarding(host)); // after the controller's own: runs once the basemap is captured
+      const basemap = liberty();
+      basemap.layers = basemap.layers.slice(0, 20);
+      host.setStyle(basemap, {});
+      await vi.waitFor(() => expect(layerOf(host, 'mine__b1')).toBeDefined());
+      await tick();
+      expect(host.errors).toEqual([]);
+      expect(host.styleErrors).toEqual([]);
+      await controller.deactivate();
+      expect(layerOf(host, 'mine')).toBeDefined();
+    });
+
+    it('an edit right after a basemap switch, while the re-apply resolves, is kept (R19)', async () => {
+      const { host, controller } = setup();
+      host.on('error', () => undefined);
+      await controller.activate('equal');
+      const basemap = liberty();
+      basemap.layers = basemap.layers.slice(0, 20);
+      host.setStyle(basemap, {}); // captured inside the call; the re-apply now awaits its templates
+      host.addSource('minesrc', structuredClone(MINE_SOURCE)); // the live style is the application's
+      host.addLayer(structuredClone(MINE));
+      await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+      await tick();
+      expect(layerOf(host, 'mine__b1')).toBeDefined();
+      expect(host.errors).toEqual([]);
+      expect(host.styleErrors).toEqual([]);
+    });
+
     it('removeSource and addSource of an original source that is not live behave as natively (R18)', async () => {
       const { host, controller } = setup(4.6, withMine());
       host.on('error', () => undefined);

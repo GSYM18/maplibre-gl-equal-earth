@@ -71,3 +71,39 @@ test('addLayer, setPaintProperty and removeLayer while active reach the band sho
   expect(await page.evaluate(() => (window as unknown as { __loads: number }).__loads)).toBe(0);
   expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
 });
+
+test('a basemap switch by URL is followed: a guarded style.load listener registered before activation re-adds its layer, banded', async ({ page, mlv }) => {
+  await openHarness(page, { mlv });
+  await page.evaluate(() => {
+    const { map } = window.__h;
+    // The common pattern: re-add my layer whenever a style loads, guarded by `getSource`/`getLayer`.
+    map.on('style.load', () => {
+      if (!map.getSource('mine')) {
+        map.addSource('mine', {
+          type: 'geojson',
+          data: { type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: [139.69, 35.69] } },
+        });
+      }
+      if (!map.getLayer('mine')) {
+        map.addLayer({ id: 'mine', type: 'circle', source: 'mine', paint: { 'circle-color': '#ff0000', 'circle-radius': 8 } });
+      }
+    });
+    map.setProjection({ type: 'equal' });
+  });
+  await page.waitForFunction(() => window.__h.controller?.active === true && window.__h.controller.pendingProjection === undefined);
+  await centreOn(page, TOKYO, 2);
+
+  // `setStyle(url)` with MapLibre's default diff: fetched, then diffed in from MapLibre's own code.
+  await page.evaluate(() => {
+    const style = window.__h.fixtureStyle();
+    style.layers = style.layers.filter((layer) => layer.id !== 'places');
+    const url = URL.createObjectURL(new Blob([JSON.stringify(style)], { type: 'application/json' }));
+    window.__h.map.setStyle(url);
+  });
+  await page.waitForFunction(() => window.__h.map.getStyle().layers.some((layer) => layer.id === 'mine__b0'));
+  await idle(page);
+  expect(await page.evaluate(() => window.__h.controller?.active)).toBe(true);
+  expect(await page.evaluate(() => window.__h.map.getStyle().layers.some((layer) => layer.id.startsWith('places')))).toBe(false);
+  expect(await colourIs(page, [255, 0, 0])).toBe(true);
+  expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
+});
