@@ -4,6 +4,12 @@ import { defineConfig } from 'vite';
 const resolveFromRoot = (path: string) => fileURLToPath(new URL(path, import.meta.url));
 
 export default defineConfig({
+  optimizeDeps: {
+    // maplibre-gl v6 locates its worker as a sibling file via `import.meta.url`. Pre-bundling
+    // moves the main module into node_modules/.vite/deps/, where that sibling does not exist,
+    // so the dev server would leave the worker request pending forever.
+    exclude: ['maplibre-gl'],
+  },
   build: {
     target: 'es2022',
     sourcemap: true,
