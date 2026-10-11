@@ -35,10 +35,11 @@
 
 import { geographicToMap, wrapLongitude } from '../math/backproject.js';
 import type { LngLatTuple } from '../math/equal-earth.js';
-import type { CompensationMode } from '../math/jacobian.js';
+import { similarityOffsets, type CompensationMode, type SimilarityOffsets } from '../math/jacobian.js';
 import {
   EQUAL_EARTH_BANDS,
   bandIndexForZoom,
+  continuousBlend,
   parseRange,
   resolveTransition,
   type Band,
@@ -56,6 +57,7 @@ import {
   type GeoApi,
   type GeoApiHost,
   type GeoApiState,
+  type GeoCameraMethods,
   type RawCamera,
 } from './geo-api.js';
 import {
@@ -87,7 +89,7 @@ export interface HostStyle {
  * The bits of a MapLibre `Map` (v5 or v6) the controller touches. `tests/host-types.test.ts`
  * checks that real maps of both majors satisfy it.
  */
-export interface ControllerHost extends CameraHost, ConstrainHost, SwitcherHost {
+export interface ControllerHost extends CameraHost, ConstrainHost, SwitcherHost, Partial<GeoCameraMethods> {
   on(type: string, listener: () => void): unknown;
   off(type: string, listener: () => void): unknown;
   once(type: string, listener: () => void): unknown;
@@ -112,10 +114,11 @@ export interface ControllerHost extends CameraHost, ConstrainHost, SwitcherHost 
 }
 
 /**
- * Options of one map's controller. The cartography options (spec §5) are those of
- * {@link CartographyOptions}: `outsideColor`, `outline` and `graticule`.
+ * The options of one map's controller other than the geographic API's ({@link ControllerOptions}).
+ * The cartography options (spec §5) are those of {@link CartographyOptions}: `outsideColor`,
+ * `outline` and `graticule`.
  */
-export interface ControllerOptions extends CartographyOptions {
+export interface ControllerBaseOptions extends CartographyOptions {
   /** Builds the centre objects handed to MapLibre. Pass `(lng, lat) => new maplibregl.LngLat(lng, lat)`. */
   lngLatFactory: LngLatFactory;
   /** The `equal` transition (spec §3). */
@@ -131,23 +134,32 @@ export interface ControllerOptions extends CartographyOptions {
   fetchJson?: (url: string) => Promise<unknown>;
   /** Called on every band switch. */
   onSwitch?: (event: SwitchEvent) => void;
-  /**
-   * Builds the bounds `getBounds()` returns while active. Pass
-   * `(sw, ne) => new maplibregl.LngLatBounds(sw, ne)`.
-   *
-   * @defaultValue `[sw, ne]`, a `LngLatBoundsLike`
-   */
-  lngLatBoundsFactory?: (sw: LngLatTuple, ne: LngLatTuple) => unknown;
-  /**
-   * Whether `project`, `unproject`, `getCenter` and `getBounds` speak geographic coordinates
-   * while Equal Earth is active (spec §7). They are wrapped on the map instance at its first
-   * activation and restored by `destroy()`/`dispose()`; `false` wraps nothing, and those
-   * methods then report the map space the renderer is fed.
-   *
-   * @defaultValue true
-   */
-  geographicApi?: boolean;
 }
+
+/** Builds the bounds the geographic `getBounds()` returns. */
+export type LngLatBoundsFactory = (sw: LngLatTuple, ne: LngLatTuple) => unknown;
+
+/**
+ * Options of one map's controller: {@link ControllerBaseOptions} plus the geographic API's.
+ *
+ * `geographicApi` (default `true`): whether the map's reads (`project`, `unproject`,
+ * `getCenter`, `getBounds`) and camera targets (`jumpTo`, `easeTo`, `flyTo`, `setCenter`,
+ * `panTo`, `cameraForBounds`, `fitBounds`, and `center`/`around` in the options of `panBy`,
+ * `zoomTo`, `zoomIn`, `zoomOut`, `rotateTo`, `resetNorth`, `resetNorthPitch`, `snapToNorth`)
+ * speak geographic coordinates while Equal Earth is active (spec §7). They are wrapped on the
+ * map instance at its first activation and restored by `destroy()`/`dispose()`; `false` wraps
+ * nothing, and those methods then speak the map space the renderer is fed.
+ *
+ * `lngLatBoundsFactory` builds the bounds `getBounds()` returns while active: pass
+ * `(sw, ne) => new maplibregl.LngLatBounds(sw, ne)`. Like `lngLatFactory` it is required, unless
+ * `geographicApi` is `false`: MapLibre's `getBounds` returns a `LngLatBounds`, so the wrapped one
+ * must as well. The constructor throws without it.
+ */
+export type ControllerOptions = ControllerBaseOptions &
+  (
+    | { geographicApi?: true; lngLatBoundsFactory: LngLatBoundsFactory }
+    | { geographicApi: false; lngLatBoundsFactory?: LngLatBoundsFactory }
+  );
 
 /** The camera, geographically: what survives a teardown and is restored after it. */
 interface View {
@@ -167,6 +179,8 @@ interface Installed {
 
 /** The name of the error an activation rejects with when a later call superseded it. */
 export const SUPERSEDED_ERROR_NAME = 'EqualEarthSupersededError';
+
+const NO_OFFSETS: SimilarityOffsets = { deltaZoom: 0, deltaBearing: 0 };
 
 const UNWARPED_TYPES: ReadonlySet<string> = new Set(['raster', 'hillshade', 'color-relief']);
 let reliefAnnounced = false;
@@ -275,6 +289,11 @@ export class EqualEarthController {
     this.#host = host;
     this.#options = options;
     this.#fetchJson = options.fetchJson ?? defaultFetchJson;
+    if (options.geographicApi !== false && typeof options.lngLatBoundsFactory !== 'function') {
+      throw new TypeError(
+        'EqualEarthController: lngLatBoundsFactory is required unless geographicApi is false; pass (sw, ne) => new maplibregl.LngLatBounds(sw, ne).',
+      );
+    }
     this.#raw = rawCamera(host as GeoApiHost);
   }
 
@@ -304,6 +323,24 @@ export class EqualEarthController {
   get baselineBlend(): number {
     const installed = this.#installed;
     return installed ? this.#bands[installed.camera.baselineBand]!.blend : this.blend;
+  }
+
+  /** The offsets the requested camera state carries (`BandCamera.baselineOffsets`); zero while nothing is installed. */
+  get baselineOffsets(): SimilarityOffsets {
+    return this.#installed?.camera.baselineOffsets ?? NO_OFFSETS;
+  }
+
+  /**
+   * The zoom and bearing offsets the camera hook renders band `band` with at `geographic` for
+   * the requested zoom `requestedZoom`: what `BandCamera` computes from the compensation it was
+   * given (spec §4.2). Zero without compensation (`'none'`, `equal-earth`) and while inactive.
+   */
+  offsetsAt(geographic: LngLatTuple, band: number, requestedZoom: number): SimilarityOffsets {
+    const mode = this.#options.compensation ?? 'zoom+bearing';
+    const transition = this.#transition;
+    const blend = this.#bands[band]?.blend;
+    if (!this.active || !transition || mode === 'none' || blend === undefined) return NO_OFFSETS;
+    return similarityOffsets(geographic, blend, continuousBlend(transition, requestedZoom), mode);
   }
 
   /** The bands of the type shown (or last shown); {@link EQUAL_EARTH_BANDS} before that. */
@@ -413,6 +450,7 @@ export class EqualEarthController {
       blend: () => this.blend,
       baselineBlend: () => this.baselineBlend,
       bands: () => this.bands,
+      baselineOffsets: () => this.baselineOffsets,
     };
     const state: GeoApiState = {
       get active() {
@@ -427,11 +465,16 @@ export class EqualEarthController {
       get bands() {
         return read.bands();
       },
+      get baselineOffsets() {
+        return read.baselineOffsets();
+      },
+      offsets: (geographic, band, requestedZoom) => this.offsetsAt(geographic, band, requestedZoom),
     };
     const { lngLatFactory, lngLatBoundsFactory } = this.#options;
+    if (!lngLatBoundsFactory) return; // the constructor guarantees it while geographicApi is on
     this.#geoApi = installGeoApi(this.#host as GeoApiHost, state, {
       lngLat: lngLatFactory,
-      lngLatBounds: lngLatBoundsFactory ?? ((sw, ne) => [sw, ne]),
+      lngLatBounds: lngLatBoundsFactory,
     });
     this.#raw = this.#geoApi.raw;
   }

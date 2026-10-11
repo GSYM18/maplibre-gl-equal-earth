@@ -158,10 +158,12 @@ export { geographicUnder, mapSpaceOf } from './map/geo-api.js';
 export {
   EqualEarthController,
   SUPERSEDED_ERROR_NAME,
+  type ControllerBaseOptions,
   type ControllerHost,
   type ControllerOptions,
   type EqualEarthProjection,
   type HostStyle,
+  type LngLatBoundsFactory,
 } from './map/controller.js';
 
 export {

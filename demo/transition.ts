@@ -190,7 +190,7 @@ for (const [name, lngLat] of Object.entries(CITIES)) {
   button.type = 'button';
   button.textContent = name;
   button.addEventListener('click', () => {
-    map.jumpTo({ center: controller.toMapSpace(lngLat) });
+    map.jumpTo({ center: lngLat });
   });
   cities.append(button);
 }
@@ -200,7 +200,7 @@ const world = document.createElement('button');
 world.type = 'button';
 world.textContent = 'world z2';
 world.addEventListener('click', () => {
-  map.jumpTo({ center: controller.toMapSpace([0, 0]), zoom: 2 });
+  map.jumpTo({ center: [0, 0], zoom: 2 });
 });
 const toggle = document.createElement('button');
 toggle.type = 'button';
