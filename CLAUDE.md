@@ -28,13 +28,18 @@ reintroduce). `scripts/check-worker-bundles.mjs` asserts both worker bundles are
 and actually register `eqearth` when loaded the way MapLibre v5 (`importScripts`) and v6
 (`import()`) load them. `prepublishOnly` runs both.
 
-`npm run probe:transition` (`scripts/probe-transition.mjs`, flags `--city`, `--steps`, `--url`,
-`--chrome`) needs local Chrome, the network, a fresh `npm run build:js` and `npm run dev`
-already running. It drives the transition demo with real wheel events and exits 1 on centre
-drift above 0.001° or any map `error`. Headless Chrome renders through SwiftShader, 5–15 s per
-band: use it for correctness (switches happen, nothing drifts, nothing errors), never for
-timing. **Do not edit anything under `src/` or `demo/` while it runs**: Vite reloads the page
-and the probe dies mid-run.
+`npm run probe:transition` (`scripts/probe-transition.mjs`; flags `--city`, `--steps`,
+`--anchor dx,dy`, `--url`, `--chrome`, `--port`, `--timeout`) needs Node ≥ 22 (global
+`WebSocket`), local Chrome, the network, a fresh `npm run build:js` and `npm run dev` already
+running. It drives the transition demo with real wheel events. Exit 1 means a finding: centre
+drift above 0.001°, a map `error` or an uncaught page exception; exit 2 means the probe could
+not run. With the wheel at the centre (default) the centre must not drift; `--anchor 300,0`
+wheels off-centre and reports the per-step snap of the place under the pointer, the ceiling
+the README states. Headless Chrome renders through SwiftShader, 5–15 s per band: use it for
+correctness and geometry (switches happen, nothing drifts, nothing errors, snap sizes), never
+for timing. Its empty-cell count is a rough hole detector (opacity-blind; see the header).
+**Do not edit anything under `src/` or `demo/` while it runs**: Vite reloads the page and the
+probe dies mid-run.
 
 ESLint's type-aware rules are confined to `**/*.ts`. `no-undef` is off there (tsc covers it),
 which is why `scripts/*.mjs` needs an explicit `globals.node` block.
@@ -68,7 +73,9 @@ most design decisions here:
 
 1. **"Map space" is not geographic.** While Equal Earth is active, `map.getCenter()`,
    `map.project()`, `getBounds()`, popup anchors and `queryRenderedFeatures()` all return map
-   space. Anything crossing that boundary must go through `geographicToMap` / `mapToGeographic`.
+   space, and under `equal` that space is the *shown band's*. Anything crossing that boundary
+   must go through the controller's `toMapSpace` / `toGeographic`; the bare `geographicToMap` /
+   `mapToGeographic` default to blend 0 and are right only for pure `equal-earth`.
 2. **Equal Earth and globe are mutually exclusive.** Globe treats lng/lat as real geodetic
    coordinates, so warped input renders as a distorted sphere. The plugin disengages under globe.
 3. **The renderer still believes it is Mercator**, which is the technique's hidden strength:
