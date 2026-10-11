@@ -121,6 +121,10 @@ mechanism, with line references:
   on the `moveend` that deletes `R`. On v6 that is only the **Camera's own** `moveend`
   (`host._camera`). A `moveend` the Map fires itself (a gesture ending without inertia, which
   includes every scroll zoom) does not bubble down, so `R` survives it.
+- **Baseline offsets.** The hook also returns continuous zoom and bearing offsets (spec §4.2)
+  and `R` is cloned from the rendered `T`, which carries them, so the baseline records the
+  offsets in effect when `R` was created and the hook subtracts them before deciding the band
+  and converting. A *selector* (the switcher, spec §4.3) may pick the band instead of the zoom.
 - **Closing that v6 gap.** v5 deletes `R` on every `moveend`, v6 only on Camera-fired ones. A
   surviving `R` keeps the old band's space, so an app's `jumpTo({ center })` in the rendered
   band was misread (Guadalajara 1.74° off). So on a Map-fired `moveend` the camera deletes `R`
@@ -139,7 +143,8 @@ mechanism, with line references:
   **rendered** `T`. That ease ran on the surviving `R`, still in the baseline band's space: a
   double conversion (1.74° at Guadalajara). So on each `*end` the camera deletes `R` (on v5
   too) and re-bases, and the inertial ease clones a fresh `R` from `T`. The Camera fires
-  `zoomend` itself just before its own `moveend` (`_afterEase`, `jumpTo`). After an ease frame,
+  `zoomend`, `rotateend`, `pitchend` and `rollend` itself just before its own `moveend`
+  (`_afterEase`, `jumpTo`). After an ease frame,
   that `*end` is ignored: a gesture interrupting the ease holds that ease's `R`, and re-basing
   on the `*end` and again on the `moveend` would lose its space. The fakes model all of this.
 - **Construct the camera before adding `moveend` listeners that move the map** (m11). An app

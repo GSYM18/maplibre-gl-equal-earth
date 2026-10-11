@@ -35,10 +35,12 @@ describe('relativeJacobian', () => {
     // Equal Earth world displacement for the same steps:
     const [ex0, ey0] = geographicToMapWorld(ZURICH, 0);
     const [ex1, ey1] = geographicToMapWorld([ZURICH[0] + 0.01, ZURICH[1]], 0);
-    // M · (Mercator displacement) ≈ Equal Earth displacement for the lng step.
+    const [ex2, ey2] = geographicToMapWorld([ZURICH[0], ZURICH[1] + 0.01], 0);
+    // M · (Mercator displacement) ≈ Equal Earth displacement, for the lng step and the lat step.
     expect(a * dMerc[0]! + b * dMerc[1]!).toBeCloseTo(ex1 - ex0, 7);
     expect(c * dMerc[0]! + d * dMerc[1]!).toBeCloseTo(ey1 - ey0, 7);
-    void [ex0, ey0, ey1, x2, y2];
+    expect(a * dMerc[2]! + b * dMerc[3]!).toBeCloseTo(ex2 - ex0, 7);
+    expect(c * dMerc[2]! + d * dMerc[3]!).toBeCloseTo(ey2 - ey0, 7);
   });
 });
 
@@ -59,10 +61,10 @@ describe('similarity', () => {
     expect(Math.log2(1 / zurich.scale)).toBeCloseTo(0.35, 1);
     expect(Math.log2(1 / sf.scale)).toBeCloseTo(0.12, 1);
     expect(Math.log2(1 / anchorage.scale)).toBeCloseTo(0.86, 1);
-    // Rotation ≈ 0 near the central meridian, ~16° at San Francisco, ~30° at Anchorage.
+    // Rotation ≈ 0 near the central meridian, ~16° at San Francisco, ~25° at Anchorage.
     expect(Math.abs((zurich.rotation * 180) / Math.PI)).toBeLessThan(2);
     expect(Math.abs((sf.rotation * 180) / Math.PI)).toBeGreaterThan(12);
-    expect(Math.abs((anchorage.rotation * 180) / Math.PI)).toBeGreaterThan(25);
+    expect(Math.abs((anchorage.rotation * 180) / Math.PI)).toBeCloseTo(25.1, 0);
   });
 });
 

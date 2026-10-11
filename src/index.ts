@@ -33,13 +33,24 @@ export {
 } from './math/backproject.js';
 
 export {
+  relativeJacobian,
+  similarity,
+  similarityOffsets,
+  type CompensationMode,
+  type Matrix2,
+  type SimilarityOffsets,
+} from './math/jacobian.js';
+
+export {
   BandCamera,
   ThresholdCamera,
   type BandCameraOptions,
+  type BandSelector,
   type CameraHost,
   type CameraUpdate,
   type CameraUpdateFn,
   type CameraUpdateResult,
+  type Compensation,
   type GestureEndEvent,
   type LngLatFactory,
   type ThresholdCameraOptions,
@@ -77,7 +88,6 @@ export {
   warpOnly,
   type SubdivideOptions,
 } from './math/subdivide.js';
-export {  relativeJacobian,  similarity,  similarityOffsets,  type CompensationMode,  type Matrix2,  type SimilarityOffsets,} from './math/jacobian.js';
 
 export {
   preimageBBox,
