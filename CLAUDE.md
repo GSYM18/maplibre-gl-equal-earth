@@ -1,12 +1,15 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this
+repository.
 
 ## Commands
 
 ```
-npm run verify     # lint + typecheck + test + build + check:exports — run this before claiming done
+npm run verify     # lint + typecheck + test + build + check:exports: run before claiming done
 npm run dev        # Vite dev server for the demo pages
+npm run build:js   # bundles only, no .d.ts: refreshes dist/worker.mjs, which the demos load
+npm run probe:transition  # headless-Chrome probe of demo/transition.html; not part of verify
 npm test           # vitest run
 npm run test:watch # vitest watch mode
 npm run lint       # eslint (type-aware, .ts only)
@@ -24,6 +27,14 @@ declared in `src/index.ts` (it exists solely to make the 0.2.1 drift bug impossi
 reintroduce). `scripts/check-worker-bundles.mjs` asserts both worker bundles are self-contained
 and actually register `eqearth` when loaded the way MapLibre v5 (`importScripts`) and v6
 (`import()`) load them. `prepublishOnly` runs both.
+
+`npm run probe:transition` (`scripts/probe-transition.mjs`, flags `--city`, `--steps`, `--url`,
+`--chrome`) needs local Chrome, the network, a fresh `npm run build:js` and `npm run dev`
+already running. It drives the transition demo with real wheel events and exits 1 on centre
+drift above 0.001° or any map `error`. Headless Chrome renders through SwiftShader, 5–15 s per
+band: use it for correctness (switches happen, nothing drifts, nothing errors), never for
+timing. **Do not edit anything under `src/` or `demo/` while it runs**: Vite reloads the page
+and the probe dies mid-run.
 
 ESLint's type-aware rules are confined to `**/*.ts`. `no-undef` is off there (tsc covers it),
 which is why `scripts/*.mjs` needs an explicit `globals.node` block.
@@ -75,12 +86,29 @@ affects the absolute metre values from `toEqualEarth`.
   and `proj4.defs` mutates a shared singleton that a host app may also be using. Dropping it
   took the bundle from ~128 kB to 3.4 kB.
 - `src/math/backproject.ts` — the warp, `GRID_FACTOR`, and Web Mercator helpers.
-- `src/math/subdivide.ts` — adaptive densification, and `geographicToMapWorld`'s tolerance helper.
+- `src/math/subdivide.ts` — adaptive densification, and `geographicToMapWorld`'s tolerance
+  helper.
 - `src/math/antimeridian.ts` — restricts source geometry to longitude ±180° before warping.
+- `src/math/jacobian.ts` — the local Jacobian of a band step relative to Mercator and its
+  similarity part (rotation + isotropic scale): the zoom and bearing offsets the camera absorbs
+  (spec §4.2). Only shear is left, and nothing in a tile-warp polyfill can absorb that.
 - `src/map/bands.ts` — zoom bands: the unit the adaptive projection is built from.
 - `src/map/camera.ts` — `BandCamera`, the `transformCameraUpdate` hook (`ThresholdCamera` is its
   two-band form).
 - `src/map/constrain.ts` — camera clamp to the Equal Earth world, via `transformConstrain`.
+- `src/map/style-rewrite.ts` — pure: original style → banded style (one source and one layer
+  copy per band, parse ranges, the gate table) plus `applyGate`. Gating is literal paint values
+  set through `setPaintProperty`, never `global-state`: MapLibre re-evaluates a transition's
+  prior expression against the live state, so a `global-state` flip can never cross-fade.
+- `src/map/switcher.ts` — `BandSwitcher`, the band selector: which band is *shown* is runtime
+  state, moved only when the target band's sources report `isSourceLoaded`. Readiness is
+  judged at the last *rendered* zoom, because `isSourceLoaded` is vacuously true for a source
+  no layer used.
+- `src/map/controller.ts` — one map's lifecycle: rewrite, install switcher + camera +
+  constraint, follow the app's `setStyle`, restore. Its module doc records MapLibre's style
+  event ordering, which decides when it may tear down and re-install (C7).
+- `src/install.ts` — `installEqualEarth`: version gate, worker count, worker bundle loading
+  with the main-thread fallback, and the `setProjection`/`getProjection` polyfill.
 - `src/tiles/tile-cover.ts` — output tile → covering source Mercator tiles.
 - `src/tiles/mvt.ts` — decode → dedupe label points → densify → warp → clip → encode.
 - `src/tiles/clip.ts` — direct clip into the buffered output tile (Sutherland–Hodgman rings,
@@ -95,13 +123,22 @@ affects the absolute metre values from `toEqualEarth`.
   tiles), in-flight request coalescing.
 - `vite.worker.config.ts` — builds the two worker bundles (see `worker-entry.ts`).
 - `demo/` + root `index.html` — Vite demo pages, not part of the published package.
+- `demo/transition.html` + `.ts` — the adaptive transition on OpenFreeMap Liberty, public API
+  only. It passes `workerUrl: /dist/worker.mjs?v=<now>`: under `vite dev` the library's own
+  `new URL('./worker.mjs', import.meta.url)` resolves into `/src/`, where no worker exists, so
+  it would silently warp on the main thread; and without the query Vite keeps serving its
+  cached transform of an older `dist/worker.mjs`. Exposes `window.__eqe` for the probe.
 - `scripts/check-exports.mjs` — build-artifact drift guard.
+- `scripts/check-worker-bundles.mjs` — the two worker bundles load and register `eqearth`.
+- `scripts/probe-transition.mjs` — the headless probe of the transition demo (see Commands).
 - `scripts/probe-openfreemap.ts` — runs the real pipeline against live OpenFreeMap tiles.
   `npx vite-node scripts/probe-openfreemap.ts`. Needs network; not part of `npm run verify`.
 
-Both `map/` modules type their map dependency **structurally** rather than importing
-`maplibre-gl`, so they are unit-testable with a plain fake and no WebGL context. Keep that
-property; it is why `tests/camera.test.ts` can drive a 16-case state machine in milliseconds.
+All `map/` modules and `install.ts` type their MapLibre dependency **structurally** rather
+than importing `maplibre-gl`, so they are unit-testable with a plain fake and no WebGL context,
+and work with whichever major the app loaded (`tests/host-types.test.ts` checks real v5 and v6
+maps against the interfaces). Keep that property; it is why `tests/camera.test.ts` can drive a
+16-case state machine in milliseconds.
 
 `EQUAL_EARTH_X_MAX` is **derived**, not hardcoded. The widely-quoted EPSG:8857 bound
 `17243959.06` was computed with the authalic radius 6371007.1809 while the CRS declares
@@ -148,9 +185,9 @@ mechanism, with line references:
   double conversion (1.74° at Guadalajara). So on each `*end` the camera deletes `R` (on v5
   too) and re-bases, and the inertial ease clones a fresh `R` from `T`. The Camera fires
   `zoomend`, `rotateend`, `pitchend` and `rollend` itself just before its own `moveend`
-  (`_afterEase`, `jumpTo`). After an ease frame,
-  that `*end` is ignored: a gesture interrupting the ease holds that ease's `R`, and re-basing
-  on the `*end` and again on the `moveend` would lose its space. The fakes model all of this.
+  (`_afterEase`, `jumpTo`). After an ease frame, that `*end` is ignored: a gesture
+  interrupting the ease holds that ease's `R`, and re-basing on the `*end` and again on the
+  `moveend` would lose its space. The fakes model all of this.
 - **Construct the camera before adding `moveend` listeners that move the map** (m11). An app
   listener registered earlier runs first, so its `jumpTo` reuses a stale `R` against a stale
   baseline. The gesture-end fix narrows this window but does not close it.
@@ -160,8 +197,9 @@ mechanism, with line references:
   again, a ~217 px jump at Guadalajara at z6. A one-shot `jumpTo` hid this, because its own
   `moveend` deletes `R`.
 - **State initialised in the constructor.** The original's `_zoomstart` was only assigned in an
-  event handler, so it was `undefined` until first interaction. `undefined` fails *both* `<` and
-  `>=`, so an initial `flyTo` across the threshold was silently left unconverted. Measured ~4° off.
+  event handler, so it was `undefined` until first interaction. `undefined` fails *both* `<`
+  and `>=`, so an initial `flyTo` across the threshold was silently left unconverted. Measured
+  ~4° off.
 
 `moveend` listeners are required: one on v5 (the Map), two on v6 (the Camera and the Map).
 The five gesture `*end` listeners go on the Map in both. `destroy()` removes them all. It also
@@ -206,18 +244,29 @@ mind before "optimising" anything here.
 - **Decode dominated, not the clip.** Decoding the 9 sources of 2/1/1 costs ~140–170 ms and
   ~40 MB of heap (decoded GeoJSON is ~4.4× the raw bytes); building the tile from them costs
   ~35–45 ms warmed. So the protocol keeps a per-worker `EntryCache` of decoded source tiles
-  by URL (default 32, `ProtocolOptions.decodedTiles`): one decode serves every band and every
-  overlapping output tile. Warmed, per output tile with the decode cached: 2/1/1 218 → 45 ms,
-  3/4/3 131 → 24 ms against the old decode + geojson-vt path.
-- **The direct clip (`clip.ts`) replaced geojson-vt** and matches it per layer on real tiles
-  (feature counts, line lengths and ring areas); it does not wrap world copies into the
-  buffer, which geojson-vt did at z0–1. Build alone is only ~1.5–2× faster: the profile is
-  dominated by the warp's projection maths (~40%: `toEqualEarth` runs twice per vertex, and
-  map-space lng/lat makes a Mercator round trip), then vt-pbf's property encoding (~17%;
-  OpenFreeMap features carry ~80 `name:*` tags), densify (~10%) and the clip itself (~10%).
+  by URL (default 32): one decode serves every band and every overlapping output tile.
+  `ProtocolOptions.decodedTiles` cannot be set from the shipped worker bundle, which has no
+  configuration channel yet; only a protocol built with `createEqualEarthProtocol` takes it.
+  Warmed, per output tile with the decode cached: 2/1/1 218 → 45 ms, 3/4/3 131 → 24 ms
+  against the old decode + geojson-vt path.
+- **The direct clip (`clip.ts`) replaced geojson-vt.** It matches geojson-vt per layer
+  (feature counts, line lengths, ring areas) in a synthetic comparison in `tests/clip.test.ts`,
+  plus a one-off scratch check on real OpenFreeMap tiles; a committed real-tile fixture is
+  deferred to Plan 3 (Ruling P19). Ring areas differ only by buffer slivers, because vertices
+  are rounded before clipping. It does not wrap world copies into the buffer, which geojson-vt
+  did at z0–1. Build alone measured only 1.4–1.8× faster; the 2.5–5.5× end-to-end gain above
+  is the decode cache. The profile is dominated by the warp's projection maths (~40%:
+  `toEqualEarth` runs twice per vertex, and map-space lng/lat makes a Mercator round trip),
+  then vt-pbf's property encoding (~17%; OpenFreeMap features carry ~80 `name:*` tags),
+  densify (~10%) and the clip itself (~10%).
   A cheap geographic-bbox reject against the tile's pre-image skips the warp for features
-  wholly outside it. Nothing is simplified (the old `simplifyTolerance` is gone), so
-  subdivision vertices survive; `tests/tiles.test.ts` pins that.
+  wholly outside it. It is safe because the warp is pseudocylindrical: the tile's horizontal
+  edges map back to parallels and its vertical edges to longitudes monotone in |lat|, so the
+  pre-image's extremes sit at sampled edge endpoints; the box is taken with twice the tile
+  buffer, far more than the ~1 tile unit a densified chord deviates. `tests/clip.test.ts`
+  ("buildTile pre-warp reject") fails without that margin. Nothing is simplified (the old
+  `simplifyTolerance` is gone), so subdivision vertices survive; `tests/tiles.test.ts` pins
+  that.
 - **Label points were emitted once per source tile.** OpenFreeMap z2 tiles repeat a label in
   up to 9 source tiles' buffers; the old output for 2/1/1 held 1959 place points of which 228
   were distinct, and was 503 kB instead of 225 kB. `mergeLayers` now drops a point whose
@@ -237,10 +286,21 @@ but hairline seams in fills are still possible.
 
 ## Planned work
 
-Plan 1 (worker bundles, blended warp, `BandCamera`, constraint, spike) is done. Plan 2 (smooth
-transition, `docs/superpowers/plans/2026-10-11-plan-2-smooth-transition.md`) is next; Plan 3
-follows it.
+Plan 1 (worker bundles, blended warp, `BandCamera`, constraint, spike) and Plan 2 (smooth
+transition: bands, compensation, style rewrite, gated switcher, controller,
+`installEqualEarth`, throughput, demo + probe;
+`docs/superpowers/plans/2026-10-11-plan-2-smooth-transition.md`) are done. Plan 3 is next and
+not yet written: the cartographic finish (spec §5), `EqualEarthControl` (MapLibre's
+`GlobeControl` reads `equal` as "not Mercator" and turns it off), a geographic API over the
+map-space one with GeoJSON fan-out (§7), a persistent tile cache, a browser test matrix on
+v5.24 and v6, and a SmartMaps demo.
 
-Upstream is moving on this: [maplibre-gl-js#8330](https://github.com/maplibre/maplibre-gl-js/issues/8330)
-tracks a native adaptive Equal Earth. The plugin is intentionally shaped as a polyfill so it can
-be deleted when that lands.
+The stepped transition has a ceiling: after compensation, shear still snaps at each step
+(300 px off-centre, six steps: Zürich ≈ 7 px, San Francisco ≈ 16 px), shrinking only as
+1/steps. Only per-vertex interpolation in the renderer removes it. Whether that is good enough
+is an open product decision for the user, not a plan item; do not try to tune it away.
+
+Upstream is moving on this:
+[maplibre-gl-js#8330](https://github.com/maplibre/maplibre-gl-js/issues/8330) tracks a native
+adaptive Equal Earth. The plugin is intentionally shaped as a polyfill so it can be deleted
+when that lands.

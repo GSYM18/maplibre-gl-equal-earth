@@ -62,6 +62,7 @@
     "test:watch": "vitest",
     "preview": "vite preview",
     "check:exports": "node scripts/check-exports.mjs && node scripts/check-worker-bundles.mjs",
+    "probe:transition": "node scripts/probe-transition.mjs",
     "verify": "npm run lint && npm run typecheck && npm test && npm run build && npm run check:exports",
     "prepublishOnly": "npm run verify"
   },
