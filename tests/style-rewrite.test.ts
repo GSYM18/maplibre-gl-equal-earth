@@ -134,6 +134,26 @@ describe('rewriteStyle', () => {
     expect(JSON.stringify(style)).not.toContain('global-state');
   });
 
+  it("initialBand overrides the initial zoom's band for the state the copies start in", () => {
+    const style = tiny(vec('a', 'fill', { paint: { 'fill-opacity': 0.4 } }), vec('t', 'symbol'));
+    const r = rewriteStyle(style, { bands: SIX.bands, transition: SIX, templates: TEMPLATES, initialZoom: 4.6, initialBand: 3 });
+    const byId = (id: string) => r.style.layers.find((l) => l.id === id)!;
+    expect(byId('a__b3').paint!['fill-opacity']).toBe(0.4);
+    expect(byId('a__b1').paint!['fill-opacity']).toBe(0);
+    expect(byId('t__b3').layout?.['visibility']).toBeUndefined();
+    expect(byId('t__b1').layout!['visibility']).toBe('none');
+  });
+
+  it('warps GeoJSON through options.warp when given', () => {
+    const calls: [number, number][] = [];
+    const r = rewriteStyle(tiny(), {
+      bands: SIX.bands, transition: SIX, templates: TEMPLATES, initialZoom: 4.6,
+      warp: (data, blend, zoom) => { calls.push([blend, zoom]); return data; },
+    });
+    expect(calls.map(([blend]) => blend)).toEqual([0, 1, 2, 3, 4, 5].map((k) => k / 6));
+    expect(r.style.sources['geo__b2']!['data']).toEqual({ type: 'FeatureCollection', features: [] });
+  });
+
   it('absent opacity stays absent in the initial band and is 0 elsewhere', () => {
     const { style } = rewrite(tiny(vec('a', 'line')), SIX, 4.6);
     expect(style.layers.find((l) => l.id === 'a__b1')!.paint!['line-opacity']).toBeUndefined();

@@ -96,6 +96,13 @@ export interface RewriteOptions {
   transition: ResolvedTransition | null;
   templates: Record<string, SourceTemplate>;
   initialZoom: number;
+  /**
+   * The band whose copies start shown (own paint and visibility); every other band's start
+   * hidden. @defaultValue `bandIndexForZoom(bands, initialZoom)`. The controller's live style
+   * edits pass the band the switcher shows, so that MapLibre's diff against the live style
+   * touches only what was added or removed.
+   */
+  initialBand?: number;
   /** @defaultValue 250 */
   fadeMs?: number;
   /** @defaultValue 300 */
@@ -107,6 +114,12 @@ export interface RewriteOptions {
    * them). Such a source is banded only with an entry here.
    */
   geojson?: Record<string, GeoJSON.GeoJSON>;
+  /**
+   * Warps a GeoJSON source's data into a band's map space. @defaultValue {@link warpGeoJSON}. The
+   * controller passes a memoised one, so that a rewrite for a live style edit does not warp
+   * unchanged data again.
+   */
+  warp?: (data: GeoJSON.GeoJSON, blend: number, densifyZoom: number) => GeoJSON.GeoJSON;
 }
 
 export interface LayerGate {
@@ -461,7 +474,8 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
   const fadeMs = options.fadeMs ?? 250;
   const symbolFadeMs = options.symbolFadeMs ?? 300;
   const steps = bands.length - 1;
-  const initial = bandIndexForZoom(bands, options.initialZoom);
+  const initial = options.initialBand ?? bandIndexForZoom(bands, options.initialZoom);
+  const warp = options.warp ?? warpGeoJSON;
   const style = structuredClone(original);
 
   const vectorSources = Object.keys(templates).filter(
@@ -519,7 +533,7 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
       if (bandId in original.sources) {
         throw new TypeError(`rewriteStyle: source id "${bandId}" already exists in the style.`);
       }
-      style.sources[bandId] = { ...structuredClone(fields), data: warpGeoJSON(data, blend, geojsonZoomForBand(transition, k)) };
+      style.sources[bandId] = { ...structuredClone(fields), data: warp(data, blend, geojsonZoomForBand(transition, k)) };
     }
   }
 

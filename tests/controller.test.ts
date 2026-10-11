@@ -1104,4 +1104,399 @@ describe('GeoJSON sources (spec §7)', () => {
     expect(host.errors).toHaveLength(1);
     expect(String(host.errors[0])).toContain('pts');
   });
+
+  it('an amend after a setData keeps the new data in every band copy', async () => {
+    const { host, controller } = geoSetup();
+    await controller.activate('equal');
+    host.geojsonSource('pts').setData(onlyTokyo());
+    host.addLayer({ id: 'dots2', type: 'circle', source: 'pts' });
+    await Promise.resolve();
+    expect(host.style!.layers.some((l) => l.id === 'dots2__b1')).toBe(true);
+    for (const k of BANDS) {
+      expect(host.style!.sources[`pts__b${k}`]!['data']).toEqual(warped(onlyTokyo(), k));
+      // The amend's diff set no data on the copies: nothing stale was pushed back.
+      expect(host.geojsonSource(`pts__b${k}`).argsOf('setData')).toEqual([warped(onlyTokyo(), k)]);
+    }
+  });
+
+  it('re-warps an object the application mutated and set again', async () => {
+    const { host, controller } = geoSetup();
+    await controller.activate('equal');
+    const data = cities();
+    host.geojsonSource('pts').setData(data);
+    data.features.pop();
+    host.geojsonSource('pts').setData(data);
+    expect(host.geojsonSource('pts__b2').argsOf('setData').at(-1)).toEqual(warped(data, 2));
+    host.addLayer({ id: 'dots2', type: 'circle', source: 'pts' });
+    await Promise.resolve();
+    for (const k of BANDS) expect(host.style!.sources[`pts__b${k}`]!['data']).toEqual(warped(data, k));
+  });
+
+  it('bands a GeoJSON source the application adds by URL once fetched, in one amend, and follows its setData', async () => {
+    let arrive!: (data: unknown) => void;
+    const { host, controller, fetchJson } = geoSetup(cities(), { [LATER_URL]: () => new Promise((resolve) => { arrive = resolve; }) });
+    await controller.activate('equal');
+    const styles = host.setStyleCalls.length;
+    host.addSource('more', { type: 'geojson', data: LATER_URL });
+    host.addLayer({ id: 'more-dots', type: 'circle', source: 'more' });
+    await Promise.resolve();
+    expect(fetchJson).toHaveBeenCalledWith(LATER_URL);
+    expect(host.setStyleCalls.length).toBe(styles); // waiting for the data
+    host.addLayer({ id: 'more-dots-2', type: 'circle', source: 'more' }); // joins the waiting amend
+    arrive(onlyTokyo());
+    await vi.waitFor(() => expect(host.setStyleCalls.length).toBe(styles + 1));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(host.setStyleCalls.length).toBe(styles + 1);
+    for (const k of BANDS) expect(host.style!.sources[`more__b${k}`]!['data']).toEqual(warped(onlyTokyo(), k));
+    expect(host.style!.layers.some((l) => l.id === 'more-dots-2__b3')).toBe(true);
+    host.geojsonSource('more').setData(cities());
+    expect(host.geojsonSource('more__b2').argsOf('setData')).toEqual([warped(cities(), 2)]);
+    await controller.deactivate();
+    expect(host.style!.sources['more']).toEqual({ type: 'geojson', data: cities() });
+  });
+
+  it('reports a GeoJSON source added by URL that cannot be loaded, and still amends the rest', async () => {
+    const { host, controller } = geoSetup(cities(), { [LATER_URL]: async () => { throw new Error('offline'); } });
+    await controller.activate('equal');
+    host.on('error', () => undefined);
+    expect(() => host.addSource('more', { type: 'geojson', data: LATER_URL })).not.toThrow();
+    host.addLayer({ id: 'more-dots', type: 'circle', source: 'more' });
+    host.addLayer({ id: 'extra', type: 'line', source: 'openmaptiles', 'source-layer': 'transportation' });
+    await vi.waitFor(() => expect(host.style!.layers.some((l) => l.id === 'extra__b1')).toBe(true));
+    expect(host.errors).toHaveLength(1);
+    expect(String(host.errors[0])).toContain('Equal Earth: could not load GeoJSON for source "more": offline');
+    expect(host.style!.sources['more__b1']).toBeUndefined();
+    expect(controller.active).toBe(true);
+  });
+
+  it('removeLayer and removeSource of a GeoJSON source remove its copies and unwrap it', async () => {
+    const { host, controller } = geoSetup();
+    await controller.activate('equal');
+    host.on('error', () => undefined);
+    host.removeSource('pts'); // `dots` still uses it: refused as MapLibre refuses it
+    expect(String(host.errors[0])).toContain('Source "pts" cannot be removed while layer "dots" is using it.');
+    const source = host.geojsonSource('pts');
+    host.removeLayer('dots');
+    host.removeSource('pts');
+    await Promise.resolve();
+    expect(bandIds(host).filter((id) => id.startsWith('pts') || id.startsWith('dots'))).toEqual([]);
+    expect(Object.hasOwn(source, 'setData')).toBe(false);
+    expect(host.styleErrors).toEqual([]);
+    await controller.deactivate();
+    expect(host.style!.sources['pts']).toBeUndefined();
+  });
+});
+
+describe('live style edits (Task 9)', () => {
+  const layerOf = (host: FakeControllerHost, id: string) => host.style!.layers.find((l) => l.id === id);
+  const indexOf = (host: FakeControllerHost, id: string) => host.style!.layers.findIndex((l) => l.id === id);
+  const copiesOf = (host: FakeControllerHost, id: string) =>
+    host.style!.layers.filter((l) => l.id === id || (l.id.startsWith(`${id}__b`) && /^\d+$/.test(l.id.slice(id.length + 3)))).map((l) => l.id);
+  const extra = (id: string, paint?: Record<string, unknown>) => ({
+    id,
+    type: 'line',
+    source: 'openmaptiles',
+    'source-layer': 'transportation',
+    ...(paint ? { paint } : {}),
+  });
+  const LABEL = 'water_name_point_label';
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it('coalesces ten addLayer calls into one amend that neither re-installs nor moves the camera', async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    const styles = host.setStyleCalls.length;
+    const jumps = host.jumps;
+    const hook = host._camera.transformCameraUpdate;
+    for (let i = 0; i < 10; i++) {
+      host.addLayer({ id: `extra${i}`, type: 'line', source: 'openmaptiles', 'source-layer': 'transportation' });
+    }
+    await Promise.resolve();
+    expect(host.setStyleCalls.length).toBe(styles + 1);
+    expect(host.jumps).toBe(jumps);
+    expect(host._camera.transformCameraUpdate).toBe(hook);
+    for (let i = 0; i < 10; i++) {
+      expect(host.style!.layers.some((l) => l.id === `extra${i}__b1`)).toBe(true);
+    }
+    expect(host.styleErrors).toEqual([]);
+  });
+
+  it("starts added copies in the band that is shown, not the zoom's band", async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    host.applyFrame({ zoomDelta: 0.4 }); // z5.0 is band 2's, but band 2 has not loaded: band 1 is held
+    expect(controller.blend).toBeCloseTo(1 / 6, 12);
+    host.addLayer(extra('extra', { 'line-opacity': 0.7 }));
+    await Promise.resolve();
+    expect(layerOf(host, 'extra__b1')!.paint!['line-opacity']).toBe(0.7);
+    expect(layerOf(host, 'extra__b2')!.paint!['line-opacity']).toBe(0);
+    // MapLibre's diff touched nothing else: the shown band's copies keep their own values.
+    expect(layerOf(host, 'water__b1')!.paint!['fill-opacity']).toBeUndefined();
+    expect(layerOf(host, 'water__b2')!.paint!['fill-opacity']).toBe(0);
+  });
+
+  it('fans a paint change out to every copy and keeps gated values gated', async () => {
+    const { host, controller } = setup(); // z4.6: band 1 shown
+    await controller.activate('equal');
+    host.setPaintProperty('water', 'fill-color', '#123456');
+    for (const id of ['water__b0', 'water__b1', 'water__b5', 'water']) {
+      expect(host.paint[id]?.['fill-color'], id).toBe('#123456');
+    }
+    host.setPaintProperty('water', 'fill-opacity', 0.5);
+    expect(host.paint['water__b1']?.['fill-opacity']).toBe(0.5);
+    expect(host.paint['water__b0']?.['fill-opacity'] ?? 0).toBe(0);
+    // ...and a later band switch shows 0.5, not Liberty's own value:
+    host.loaded.add('openmaptiles__b2');
+    host.applyFrame({ zoomDelta: 0.4 });
+    expect(host.paint['water__b2']?.['fill-opacity']).toBe(0.5);
+    expect(host.styleErrors).toEqual([]);
+    await controller.deactivate();
+    expect(layerOf(host, 'water')!.paint).toEqual({ 'fill-color': '#123456', 'fill-opacity': 0.5 });
+  });
+
+  it('removeLayer removes every copy; edits pass through while inactive', async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    expect(copiesOf(host, 'water')).toHaveLength(7);
+    host.removeLayer('water');
+    expect(layerOf(host, 'water')).toBeUndefined(); // MapLibre's own call ran: the id is gone at once
+    await Promise.resolve();
+    expect(copiesOf(host, 'water')).toEqual([]);
+    expect(host.styleErrors).toEqual([]);
+    await controller.deactivate();
+    expect(layerOf(host, 'water')).toBeUndefined(); // the restore keeps the removal
+    const styles = host.setStyleCalls.length;
+    const writes = host.writes.length;
+    host.setPaintProperty('road_minor', 'line-color', '#ff0000');
+    expect(host.writes.slice(writes)).toEqual([{ kind: 'paint', layerId: 'road_minor', name: 'line-color', value: '#ff0000' }]);
+    host.addLayer(extra('later'));
+    await tick();
+    expect(host.setStyleCalls.length).toBe(styles);
+    expect(copiesOf(host, 'later')).toEqual(['later']);
+  });
+
+  it("the switcher's gate writes on the Mercator band's ids are not application edits (rule 4)", async () => {
+    const { host, controller } = setup(8.2);
+    await controller.activate('equal');
+    expect(controller.blend).toBe(1);
+    const styles = host.setStyleCalls.length;
+    host.loaded.add('openmaptiles__b5');
+    host.applyFrame({ zoomDelta: -0.5 }); // z7.7: band 5 fades in, the Mercator band's `water` out
+    expect(controller.blend).toBeCloseTo(5 / 6, 12);
+    expect(host.writes).toContainEqual({ kind: 'paint', layerId: 'water', name: 'fill-opacity', value: 0 });
+    expect(layerOf(host, 'water__b5')!.paint!['fill-opacity']).toBeUndefined(); // its own: unset
+    for (const k of [0, 1, 2, 3, 4]) expect(layerOf(host, `water__b${k}`)!.paint!['fill-opacity'], `water__b${k}`).toBe(0);
+    expect(layerOf(host, 'water')!.paint!['fill-opacity']).toBe(0);
+    await tick();
+    expect(host.setStyleCalls.length).toBe(styles); // no amend
+    await controller.deactivate();
+    expect(layerOf(host, 'water')!.paint).toEqual(liberty().layers.find((l) => l.id === 'water')!.paint);
+  });
+
+  it("keeps a symbol layer's visibility gated and fans other layout and filter edits out", async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    const filter = ['==', ['get', 'class'], 'lake'];
+    host.setFilter('water', filter);
+    for (const id of copiesOf(host, 'water')) expect(layerOf(host, id)!['filter'], id).toEqual(filter);
+    host.setLayoutProperty(LABEL, 'text-size', 20);
+    for (const id of copiesOf(host, LABEL)) expect(layerOf(host, id)!.layout!['text-size'], id).toBe(20);
+    host.setLayoutProperty(LABEL, 'visibility', 'none');
+    expect(layerOf(host, `${LABEL}__b1`)!.layout!['visibility']).toBe('none');
+    host.setLayoutProperty(LABEL, 'visibility', 'visible');
+    expect(layerOf(host, `${LABEL}__b1`)!.layout!['visibility']).toBe('visible');
+    for (const id of [`${LABEL}__b0`, `${LABEL}__b2`, LABEL]) expect(layerOf(host, id)!.layout!['visibility'], id).toBe('none');
+    expect(host.styleErrors).toEqual([]);
+    await controller.deactivate();
+    expect(layerOf(host, LABEL)!.layout).toMatchObject({ 'text-size': 20, visibility: 'visible' });
+    expect(layerOf(host, 'water')!['filter']).toEqual(filter);
+  });
+
+  it('a value MapLibre refuses reaches neither the other copies nor the original', async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    const colour = liberty().layers.find((l) => l.id === 'water')!.paint!['fill-color'];
+    host.setPaintProperty('water', 'fill-color', 'invalid');
+    expect(host.styleErrors).toHaveLength(1); // one error, as without the plugin
+    for (const id of copiesOf(host, 'water')) expect(layerOf(host, id)!.paint!['fill-color'], id).toBe(colour);
+    host.addLayer(extra('extra'));
+    await Promise.resolve();
+    expect(layerOf(host, 'extra__b1')).toBeDefined(); // the amend is not poisoned
+    await controller.deactivate();
+    expect(layerOf(host, 'water')!.paint!['fill-color']).toBe(colour);
+  });
+
+  it('refuses a duplicate layer id and an unknown source as MapLibre does, without amending', async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    const styles = host.setStyleCalls.length;
+    host.addLayer(extra('water'));
+    host.addLayer({ id: 'nowhere', type: 'line', source: 'missing' });
+    await tick();
+    expect(host.styleErrors).toEqual(['Layer "water" already exists on this map.', 'Source "missing" not found']);
+    expect(host.setStyleCalls.length).toBe(styles);
+    expect(() => host.addSource('openmaptiles', { type: 'vector', tiles: ['x'] })).toThrow(/already exists/);
+  });
+
+  it('under pure Equal Earth, edits address the original ids although only band copies exist', async () => {
+    const { host, controller } = setup(2);
+    await controller.activate('equal-earth');
+    expect(layerOf(host, 'water')).toBeUndefined();
+    host.addLayer(extra('extra'), 'water');
+    host.setPaintProperty('water', 'fill-color', '#123456');
+    await Promise.resolve();
+    expect(host.styleErrors).toEqual([]);
+    expect(layerOf(host, 'extra')).toBeUndefined(); // no Mercator band
+    expect(indexOf(host, 'extra__b0')).toBe(indexOf(host, 'water__b0') - 1);
+    expect(layerOf(host, 'water__b0')!.paint!['fill-color']).toBe('#123456');
+    host.removeLayer('extra');
+    await Promise.resolve();
+    expect(layerOf(host, 'extra__b0')).toBeUndefined();
+    expect(host.styleErrors).toEqual([]);
+    await controller.deactivate();
+    expect(indexOf(host, 'extra')).toBe(-1);
+    expect(layerOf(host, 'water')!.paint!['fill-color']).toBe('#123456');
+  });
+
+  it('inserts before the copies of beforeId, and the restore keeps the order', async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    host.addLayer(extra('extra'), 'water');
+    await Promise.resolve();
+    expect(indexOf(host, 'extra__b0')).toBeLessThan(indexOf(host, 'water__b0'));
+    expect(indexOf(host, 'extra')).toBeLessThan(indexOf(host, 'water__b0'));
+    await controller.deactivate();
+    expect(indexOf(host, 'extra')).toBe(indexOf(host, 'water') - 1);
+  });
+
+  it('keeps edits the application makes while the activation fetches its TileJSON', async () => {
+    const host = new FakeControllerHost(TOKYO, 4.6);
+    host.style = liberty();
+    let release!: (json: unknown) => void;
+    const fetchJson = vi.fn(() => new Promise<unknown>((resolve) => { release = resolve; }));
+    const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson });
+    const pending = controller.activate('equal'); // e.g. setProjection, then addLayer in the same tick
+    host.addLayer(extra('extra'));
+    host.setPaintProperty('water', 'fill-color', '#123456');
+    release(TILEJSON);
+    await pending;
+    expect(layerOf(host, 'extra__b1')).toBeDefined();
+    expect(layerOf(host, 'water__b0')!.paint!['fill-color']).toBe('#123456');
+    await controller.deactivate();
+    expect(layerOf(host, 'extra')).toBeDefined();
+  });
+
+  it('an edit while a re-apply is in flight reaches the re-applied style', async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    const replacement = liberty();
+    replacement.layers = replacement.layers.slice(0, 10);
+    host.setStyle(replacement, {}); // the re-apply starts
+    host.addLayer(extra('extra'));
+    await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+    await tick();
+    expect(layerOf(host, 'extra__b1')).toBeDefined();
+    await controller.deactivate();
+    expect(host.style!.layers.map((l) => l.id)).toEqual([...replacement.layers.map((l) => l.id), 'extra']);
+  });
+
+  it("keeps what the application changed on the map's style outside the seven methods", async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    const light = { anchor: 'map', intensity: 0.7 };
+    host.style!['light'] = light; // as `map.setLight(light)`
+    host.addLayer(extra('extra'));
+    await Promise.resolve();
+    expect(host.style!['light']).toEqual(light);
+    await controller.deactivate();
+    expect(host.style!['light']).toEqual(light);
+  });
+
+  it('an amend leaves a band that is fading out as it is; its pending hide reads the new gates', async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    host.loaded.add('openmaptiles__b2');
+    host.applyFrame({ zoomDelta: 0.4 }); // band 1 → 2: band 1's labels are hidden 300 ms later
+    expect(controller.blend).toBeCloseTo(2 / 6, 12);
+    expect(layerOf(host, `${LABEL}__b1`)!.layout?.['visibility']).toBeUndefined();
+    host.addLayer({ id: 'more_labels', type: 'symbol', source: 'openmaptiles', 'source-layer': 'water_name', layout: { 'text-field': 'x' } });
+    host.removeLayer('water_name_line_label');
+    await Promise.resolve();
+    // The diff neither hid the fading labels early nor dropped the held background.
+    expect(layerOf(host, `${LABEL}__b1`)!.layout?.['visibility']).toBeUndefined();
+    expect(layerOf(host, 'background__b1')!.paint!['background-opacity']).toBeUndefined();
+    expect(layerOf(host, 'more_labels__b1')!.layout!['visibility']).toBe('none');
+    expect(layerOf(host, 'more_labels__b2')!.layout?.['visibility']).toBeUndefined();
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(layerOf(host, `${LABEL}__b1`)!.layout!['visibility']).toBe('none');
+    expect(layerOf(host, 'background__b1')!.paint!['background-opacity']).toBe(0);
+    expect(host.styleErrors).toEqual([]); // the removed layer's copies were not written
+  });
+
+  it('a paint edit on the background goes through the rewrite: the outside keeps its colour', async () => {
+    const host = new FakeControllerHost(TOKYO, 4.6);
+    host.style = liberty();
+    const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson: async () => TILEJSON, outsideColor: '#000000' });
+    await controller.activate('equal');
+    host.setPaintProperty('background', 'background-color', '#eeeeee');
+    await Promise.resolve();
+    expect(layerOf(host, 'background__b1')!.paint!['background-color']).toBe('#000000');
+    expect(layerOf(host, 'equal-earth:world__b1')!.paint!['fill-color']).toBe('#eeeeee');
+    // A gated value is not written to the hidden Mercator background; the rewrite gates it.
+    host.setPaintProperty('background', 'background-opacity', 0.5);
+    expect(host.writes).not.toContainEqual({ kind: 'paint', layerId: 'background', name: 'background-opacity', value: 0.5 });
+    await Promise.resolve();
+    expect(layerOf(host, 'equal-earth:world__b1')!.paint!['fill-opacity']).toBe(0.5);
+    expect(layerOf(host, 'background')!.paint!['background-opacity']).toBe(0);
+    await controller.deactivate();
+    expect(layerOf(host, 'background')!.paint!['background-color']).toBe('#eeeeee');
+  });
+
+  it("follows a style an application style.load listener sets inside an amend's setStyle", async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    const appStyle = liberty();
+    appStyle.layers = appStyle.layers.slice(0, 10);
+    let swapped = false;
+    host.on('style.load', () => {
+      if (swapped) return;
+      swapped = true;
+      host.setStyle(appStyle, {});
+    });
+    host.addLayer(extra('extra'));
+    await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+    await vi.waitFor(() => expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeDefined());
+    expect(swapped).toBe(true);
+    await tick();
+    expect(controller.active).toBe(true);
+    await controller.deactivate();
+    expect(host.style!.layers).toHaveLength(10); // the application's style became the original
+  });
+
+  it('re-applies when MapLibre rebuilds an amended style instead of diffing it', async () => {
+    const { host, controller } = setup();
+    await controller.activate('equal');
+    host.deferStyleData = true; // the amend's setStyle rebuilds
+    host.addLayer(extra('extra'));
+    await Promise.resolve();
+    expect(host._camera.transformCameraUpdate).toBeNull(); // detached before any frame runs on the unloaded style
+    host.deferStyleData = false;
+    host.flushStyleData();
+    await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+    expect(layerOf(host, 'extra__b1')).toBeDefined();
+    expect(controller.toGeographic([host.center.lng, host.center.lat])[1]).toBeCloseTo(TOKYO[1], 9);
+  });
+
+  it('destroy and dispose restore the seven methods', async () => {
+    const own = (host: object, name: string): boolean => Object.prototype.hasOwnProperty.call(host, name);
+    const methods = ['addSource', 'removeSource', 'addLayer', 'removeLayer', 'setPaintProperty', 'setLayoutProperty', 'setFilter'];
+    const a = setup();
+    for (const name of methods) expect(own(a.host, name), name).toBe(true);
+    await a.controller.activate('equal');
+    a.controller.dispose();
+    for (const name of methods) expect(own(a.host, name), name).toBe(false);
+    const b = setup();
+    await b.controller.destroy();
+    for (const name of methods) expect(own(b.host, name), name).toBe(false);
+  });
 });
