@@ -30,15 +30,19 @@
  * supported yet.
  *
  * **GeoJSON** (spec §7). A GeoJSON source is fanned out into one warped copy per band
- * (`style-rewrite.ts`, `geojson.ts`); one given by URL is fetched with `fetchJson` first, once per
- * URL for the controller's life. While installed, the live source object's `setData` and
+ * (`style-rewrite.ts`, `geojson.ts`); one given by URL is fetched with `fetchJson` first, afresh
+ * on each activation and from a per-URL cache for the re-applies within it. Right before each
+ * rewrite the original takes every GeoJSON source's live data (`serialize()`), so a `setData`
+ * made while nothing is wrapped (in the tick of `setProjection` or of the application's own
+ * `setStyle`) is not reverted. While installed, the live source object's `setData` and
  * `updateData` are wrapped (`wrapMethod`) so that the copies follow: `setData` warps the new data
  * into every copy at once (a URL is fetched afresh with `fetchJson` first, and a fetch that a
  * later `setData` overtook is dropped); `updateData` waits until MapLibre has applied the diff,
  * then fans out the source's full `getData()`, a full re-warp of that source per update. The new
  * data also becomes the original's (a URL stays a URL), so a re-apply and the restore keep it.
- * A `setData` in the gap between a teardown and the next install (a re-apply in progress) is not
- * seen.
+ * A teardown makes every fetch or `updateData` the wrappers started stale. An `updateData` made
+ * while nothing is wrapped and still with the worker at the rewrite reaches the copies only with
+ * the source's next wrapped update.
  *
  * Like every `map/` module this has no runtime dependency on `maplibre-gl`; the host is typed
  * structurally ({@link ControllerHost}).
@@ -138,6 +142,8 @@ interface GeoJSONSourceLike {
   /** `false` while a data update is with the worker or pending (`GeoJSONSource.loaded`). */
   loaded?(): boolean;
   once?(type: string, listener: () => void): unknown;
+  /** The source's options with its current `data` (the URL, or the object); both majors. */
+  serialize?(): unknown;
 }
 
 /** What a style's sources resolve to before it is rewritten: vector templates and GeoJSON data. */
@@ -568,7 +574,7 @@ export class EqualEarthController {
         this.#host.on('styledataloading', onChange);
         this.#host.on('style.load', onChange);
         try {
-          resolved = await this.#resolveSources(original);
+          resolved = await this.#resolveSources(original, true);
         } finally {
           this.#host.off('styledataloading', onChange);
           this.#host.off('style.load', onChange);
@@ -734,6 +740,14 @@ export class EqualEarthController {
     const original = this.#original!;
     resolved ??= await this.#resolveSources(original);
     if (generation !== this.#generation) return false;
+    // The application may have set GeoJSON data since the original was captured (its
+    // `setProjection` and `setData` in one tick, a `setData` right after its own `setStyle`): the
+    // wrappers only exist once installed. Take the live data, so the rewrite neither warps nor
+    // diffs back the old one; a new URL is resolved first.
+    while (this.#refreshGeoJSONData(original)) {
+      resolved = { ...resolved, geojson: await this.#geojsonData(original, false) };
+      if (generation !== this.#generation) return false;
+    }
 
     const view = this.#view!;
     const bands = this.#bands;
@@ -909,6 +923,9 @@ export class EqualEarthController {
     camera.destroy();
     installed.uninstallConstrain();
     installed.unwrapGeoJSON();
+    // A fetch or `updateData` the wrappers started is stale once they are gone: whatever comes
+    // next (a re-apply, a deactivation and later activation) starts from the live data.
+    for (const [id, version] of this.#dataVersions) this.#dataVersions.set(id, version + 1);
     this.#installed = undefined;
     return view;
   }
@@ -916,6 +933,8 @@ export class EqualEarthController {
   /** After the style is dealt with: world copies back, the camera back in geographic space. */
   #finishDeactivate(view: View): void {
     this.#view = undefined;
+    this.#geojson.clear(); // the next activation fetches afresh
+
     if (this.#worldCopies !== undefined) {
       this.#host.setRenderWorldCopies(this.#worldCopies);
       this.#worldCopies = undefined;
@@ -1054,23 +1073,55 @@ export class EqualEarthController {
     }
   }
 
-  /** The templates of the vector sources and the data of the GeoJSON sources given by URL. */
-  async #resolveSources(style: StyleLike): Promise<ResolvedSources> {
-    const [templates, geojson] = await Promise.all([this.#templates(style), this.#geojsonData(style)]);
+  /**
+   * The templates of the vector sources and the data of the GeoJSON sources given by URL. An
+   * activation fetches GeoJSON afresh (`freshGeoJSON`: a feed polled while in Mercator has moved
+   * on); a re-apply within one activation is served from the cache.
+   */
+  async #resolveSources(style: StyleLike, freshGeoJSON = false): Promise<ResolvedSources> {
+    const [templates, geojson] = await Promise.all([this.#templates(style), this.#geojsonData(style, freshGeoJSON)]);
     return { templates, geojson };
   }
 
   /** The fetched data of every GeoJSON source of `style` given by URL, by source id. */
-  async #geojsonData(style: StyleLike): Promise<Record<string, GeoJSON.GeoJSON>> {
+  async #geojsonData(style: StyleLike, fresh: boolean): Promise<Record<string, GeoJSON.GeoJSON>> {
     const resolved: Record<string, GeoJSON.GeoJSON> = {};
     await Promise.all(
       Object.entries(style.sources).map(async ([id, source]) => {
         const url = source['data'];
         if (source['type'] !== 'geojson' || typeof url !== 'string') return;
-        resolved[id] = await this.#loadGeoJSON(id, url, false);
+        resolved[id] = await this.#loadGeoJSON(id, url, fresh);
       }),
     );
     return resolved;
+  }
+
+  /**
+   * Copy the live data of each GeoJSON source of `original` into it: the URL or the object that
+   * `serialize()` reports (both majors: `_data.url`, `_data.geojson` or the updateable features).
+   * `getSource(id)` is the application's source here, or the Mercator band's under our own style,
+   * which keeps the original id and geographic data. A source the map lacks is left alone. Returns
+   * whether some source's data became a URL other than the one `original` had, which must be
+   * resolved before rewriting.
+   *
+   * An `updateData` still with the worker is not in `serialize()` yet; it reaches the copies only
+   * through the wrappers' next fan-out.
+   */
+  #refreshGeoJSONData(original: StyleLike): boolean {
+    let newUrl = false;
+    for (const [id, source] of Object.entries(original.sources)) {
+      if (source['type'] !== 'geojson') continue;
+      const live = this.#host.getSource(id) as GeoJSONSourceLike | undefined;
+      const serialized = typeof live?.serialize === 'function' ? live.serialize() : undefined;
+      const data = typeof serialized === 'object' && serialized !== null ? (serialized as { data?: unknown }).data : undefined;
+      if (typeof data === 'string') {
+        if (data !== source['data']) newUrl = true;
+        source['data'] = data;
+      } else if (typeof data === 'object' && data !== null) {
+        source['data'] = data;
+      }
+    }
+    return newUrl;
   }
 
   /** GeoJSON source `id`'s data at `url`: from the cache unless `fresh`; cached either way. */
