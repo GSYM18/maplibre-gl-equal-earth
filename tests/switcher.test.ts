@@ -282,3 +282,69 @@ describe('BandSwitcher', () => {
     expect(host.listenerCount('idle')).toBe(0);
   });
 });
+
+describe('BandSwitcher base layers (R7)', () => {
+  const baseId = (band: number) => `equal-earth:world__b${band}`;
+  const withBase = (band: number): LayerGate[] => [
+    ...gatesFor(band),
+    { layerId: baseId(band), band, paint: { 'fill-opacity': undefined }, hideByVisibility: false, holdWhileFading: true },
+  ];
+  const baseWrites = (host: FakeSwitcherHost, band: number) => host.writes.filter((w) => w.layerId === baseId(band));
+  const start = () => setup(1, 4.4, { gatesForBand: withBase });
+
+  it('keeps the old base fully shown while the new one fades in, and hides it after the fade', () => {
+    const { host, c, zoomTo } = start();
+    host.loaded.add('openmaptiles__b2');
+    expect(zoomTo(4.9)).toBe(2);
+    expect(baseWrites(host, 2)).toEqual([{ kind: 'paint', layerId: baseId(2), name: 'fill-opacity', value: undefined }]);
+    expect(baseWrites(host, 1)).toEqual([]); // not faded
+    expect(host.paint['water__b1']).toEqual({ 'fill-opacity': 0 }); // ordinary gates still cross-fade
+    c.advance(299);
+    expect(baseWrites(host, 1)).toEqual([]);
+    c.advance(1);
+    expect(baseWrites(host, 1)).toEqual([{ kind: 'paint', layerId: baseId(1), name: 'fill-opacity', value: 0 }]);
+  });
+
+  it('cancels the pending hold when the switch returns to the old band before it expires', () => {
+    const { host, c, zoomTo } = start();
+    host.loaded.add('openmaptiles__b1');
+    host.loaded.add('openmaptiles__b2');
+    zoomTo(4.9); // b1 base held until t=300
+    c.advance(350); // past the dwell, but the hold of b1 has already run
+    expect(baseWrites(host, 1)).toHaveLength(1);
+    zoomTo(4.4); // back to b1: shown again
+    expect(baseWrites(host, 1).at(-1)).toMatchObject({ value: undefined });
+    c.advance(1000);
+    expect(host.paint[baseId(1)]).toEqual({ 'fill-opacity': undefined });
+    expect(baseWrites(host, 2).at(-1)).toMatchObject({ value: 0 }); // b2 is hidden after its own hold
+  });
+
+  it('does not hide a held base that was shown again inside its hold', () => {
+    const { host, c, zoomTo } = setup(1, 4.4, { gatesForBand: withBase, dwellMs: 0 });
+    host.loaded.add('openmaptiles__b1');
+    host.loaded.add('openmaptiles__b2');
+    expect(zoomTo(4.9)).toBe(2); // t=0, hold of b1 due at 300
+    c.advance(100);
+    expect(zoomTo(4.4)).toBe(1); // back inside the hold
+    c.advance(1000);
+    expect(baseWrites(host, 1).some((w) => w.value === 0)).toBe(false);
+    expect(baseWrites(host, 2).at(-1)).toMatchObject({ value: 0 });
+  });
+
+  it('holds each superseded base through a rapid second switch', () => {
+    const { host, c, zoomTo } = setup(1, 4.4, { gatesForBand: withBase, dwellMs: 0 });
+    host.loaded.add('openmaptiles__b2');
+    host.loaded.add('openmaptiles__b3');
+    expect(zoomTo(4.9)).toBe(2); // t=0: b1 held until 300
+    c.advance(100);
+    expect(zoomTo(5.7)).toBe(3); // t=100: b2 held until 400
+    expect(baseWrites(host, 1)).toEqual([]);
+    expect(baseWrites(host, 2).some((w) => w.value === 0)).toBe(false);
+    c.advance(200); // t=300
+    expect(baseWrites(host, 1)).toEqual([{ kind: 'paint', layerId: baseId(1), name: 'fill-opacity', value: 0 }]);
+    expect(baseWrites(host, 2).some((w) => w.value === 0)).toBe(false);
+    c.advance(100); // t=400
+    expect(baseWrites(host, 2).at(-1)).toMatchObject({ value: 0 });
+    expect(baseWrites(host, 3).some((w) => w.value === 0)).toBe(false);
+  });
+});

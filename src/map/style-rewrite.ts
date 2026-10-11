@@ -111,6 +111,13 @@ export interface LayerGate {
    * still collide), hillshade (no opacity property; see the module comment) and color-relief.
    */
   hideByVisibility: boolean;
+  /**
+   * A base layer (the background copies and the world polygon, R7): not cross-faded. On a
+   * switch the old band's base stays fully shown while the new one fades in, and is hidden
+   * (`applyGate(…, 'hidden')`) only once the fade is over. Two half-faded bases would let the
+   * container colour through (coverage 1 - 0.5 * 0.5).
+   */
+  holdWhileFading?: boolean;
 }
 
 export type GatePhase = 'shown' | 'fading' | 'hidden';
@@ -159,9 +166,11 @@ const RELIEF = new Set(['raster', 'hillshade', 'color-relief']);
  * Apply one gate through `setPaintProperty` / `setLayoutProperty`. `shown`: own visibility
  * (gates hidden by visibility) and own paint values, verbatim (`undefined` resets to the
  * default); `fading`: gated paint to 0, visibility untouched (the cross-fade); `hidden`: paint
- * to 0 and, for gates hidden by visibility, `visibility: "none"`.
+ * to 0 and, for gates hidden by visibility, `visibility: "none"`. A `holdWhileFading` gate
+ * ignores `fading` and stays as it is.
  */
 export function applyGate(host: GateHost, gate: LayerGate, phase: GatePhase): void {
+  if (phase === 'fading' && gate.holdWhileFading) return;
   if (phase === 'shown') {
     if (gate.hideByVisibility) host.setLayoutProperty(gate.layerId, 'visibility', gate.visibility);
     for (const [name, value] of Object.entries(gate.paint)) {
@@ -184,6 +193,7 @@ function gateCopy(
   initial: number,
   fadeMs: number,
   symbolFadeMs: number,
+  hold = false,
 ): LayerGate | null {
   const props = OPACITY[layer.type] ?? [];
   const symbol = layer.type === 'symbol';
@@ -206,6 +216,7 @@ function gateCopy(
     paint: own,
     ...(byVisibility ? { visibility: structuredClone(layer.layout?.['visibility']) } : {}),
     hideByVisibility: byVisibility,
+    ...(hold ? { holdWhileFading: true } : {}),
   };
 }
 
@@ -320,8 +331,9 @@ interface GeneratedContext {
   bands: readonly Band[];
   layerIds: Set<string>;
   /** Gate `copy` as band `band`'s copy of `layer` (see {@link gateCopy}). */
-  gate: (copy: StyleLayerLike, layer: StyleLayerLike, band: number) => LayerGate | null;
-  emit: (copy: StyleLayerLike, layer: StyleLayerLike, band: number) => void;
+  gate: (copy: StyleLayerLike, layer: StyleLayerLike, band: number, hold?: boolean) => LayerGate | null;
+  /** `hold`: a base layer, see `LayerGate.holdWhileFading`. */
+  emit: (copy: StyleLayerLike, layer: StyleLayerLike, band: number, hold?: boolean) => void;
 }
 
 function claimLayerId(context: GeneratedContext, id: string): string {
@@ -343,7 +355,7 @@ function emitOutsideBackground(context: GeneratedContext, color: string): void {
     if (band.blend >= 1) return;
     const id = claimLayerId(context, `${CARTOGRAPHY_PREFIX}background__b${k}`);
     const layer: StyleLayerLike = { id, type: 'background', paint: { 'background-color': color } };
-    context.emit(structuredClone(layer), layer, k);
+    context.emit(structuredClone(layer), layer, k, true);
   });
 }
 
@@ -357,7 +369,7 @@ function emitBackground(context: GeneratedContext, bg: StyleLayerLike, outsideCo
       copy.paint = { ...copy.paint, 'background-color': outsideColor };
       delete copy.paint['background-pattern'];
     }
-    context.emit(copy, bg, k);
+    context.emit(copy, bg, k, true);
   });
   bands.forEach((band, k) => {
     if (band.blend >= 1) return;
@@ -373,7 +385,7 @@ function emitBackground(context: GeneratedContext, bg: StyleLayerLike, outsideCo
     }
     paint['fill-antialias'] = false;
     const layer: StyleLayerLike = { id: claimLayerId(context, id), type: 'fill', source: id, paint };
-    context.emit(structuredClone(layer), layer, k);
+    context.emit(structuredClone(layer), layer, k, true);
   });
 }
 
@@ -477,10 +489,10 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
   const layers: StyleLayerLike[] = [];
   const gates: LayerGate[] = [];
 
-  const gate = (copy: StyleLayerLike, layer: StyleLayerLike, band: number): LayerGate | null =>
-    gateCopy(copy, layer, band, initial, fadeMs, symbolFadeMs);
-  const emit = (copy: StyleLayerLike, layer: StyleLayerLike, band: number): void => {
-    const g = gate(copy, layer, band);
+  const gate = (copy: StyleLayerLike, layer: StyleLayerLike, band: number, hold = false): LayerGate | null =>
+    gateCopy(copy, layer, band, initial, fadeMs, symbolFadeMs, hold);
+  const emit = (copy: StyleLayerLike, layer: StyleLayerLike, band: number, hold = false): void => {
+    const g = gate(copy, layer, band, hold);
     if (g) gates.push(g);
     layers.push(copy);
   };

@@ -242,7 +242,8 @@ export class BandSwitcher implements BandSelector {
       from,
       this.#schedule(() => {
         this.#pendingHides.delete(from);
-        for (const g of oldGates) if (g.hideByVisibility) applyGate(this.#host, g, 'hidden');
+        // Visibility-hidden gates (symbols) and held bases (R7) are hidden only now.
+        for (const g of oldGates) if (g.hideByVisibility || g.holdWhileFading) applyGate(this.#host, g, 'hidden');
       }, this.#symbolFadeMs),
     );
     this.#shown = to;
