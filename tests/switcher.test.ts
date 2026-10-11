@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { resolveTransition } from '../src/map/bands.js';
 import type { LayerGate } from '../src/map/style-rewrite.js';
-import { BandSwitcher, chooseBand, type SwitchEvent } from '../src/map/switcher.js';
+import { BandSwitcher, chooseBand, type SwitchEvent, type SwitcherOptions } from '../src/map/switcher.js';
 import { FakeSwitcherHost } from './support/fake-maplibre.js';
 
 const SIX = resolveTransition();
@@ -25,16 +25,17 @@ function clock() {
   };
 }
 
-function setup(initialBand = 1, zoom = 4.4) {
+function setup(initialBand = 1, zoom = 4.4, extra: Partial<SwitcherOptions> = {}) {
   const host = new FakeSwitcherHost();
   const c = clock();
   const events: SwitchEvent[] = [];
   let requested = zoom;
   const switcher = new BandSwitcher(host, {
     bands: SIX.bands, transition: SIX, sourceIdsForBand: idsFor, gatesForBand: gatesFor, initialBand,
-    requestedZoom: () => requested, now: c.now, schedule: c.schedule, onSwitch: (e) => events.push(e),
+    requestedZoom: () => requested, now: c.now, schedule: c.schedule, onSwitch: (e) => events.push(e), ...extra,
   });
   switcher.start();
+  switcher.decide(zoom); // the first render: readiness is judged against the last decided zoom
   return { host, c, events, switcher, zoomTo: (z: number) => { requested = z; return switcher.decide(z); } };
 }
 
@@ -42,36 +43,40 @@ describe('chooseBand (spec §4.3 rules)', () => {
   const base = { bands: SIX.bands, transition: SIX, hysteresis: 0.1 };
 
   it("stays when the zoom's band is the shown band", () => {
-    expect(chooseBand({ ...base, shown: 2, requestedZoom: 5.0, isReady: () => true })).toEqual({ band: 2, forced: false });
+    expect(chooseBand({ ...base, shown: 2, requestedZoom: 5.0, isReady: () => true })).toMatchObject({ band: 2, forced: false });
   });
 
   it("moves to the zoom's band when it is ready", () => {
-    expect(chooseBand({ ...base, shown: 2, requestedZoom: 5.7, isReady: (k) => k === 3 })).toEqual({ band: 3, forced: false });
+    expect(chooseBand({ ...base, shown: 2, requestedZoom: 5.7, isReady: (k) => k === 3 })).toMatchObject({ band: 3, forced: false });
   });
 
   it('holds when the next band is not ready and the shown band is still parsed', () => {
-    expect(chooseBand({ ...base, shown: 2, requestedZoom: 5.7, isReady: () => false })).toEqual({ band: 2, forced: false });
+    expect(chooseBand({ ...base, shown: 2, requestedZoom: 5.7, isReady: () => false })).toMatchObject({ band: 2, forced: false });
   });
 
   it('takes the nearest ready band towards the target when several are crossed at once', () => {
-    expect(chooseBand({ ...base, shown: 2, requestedZoom: 7.0, isReady: (k) => k === 4 })).toEqual({ band: 4, forced: true });
+    expect(chooseBand({ ...base, shown: 2, requestedZoom: 7.0, isReady: (k) => k === 4 })).toMatchObject({ band: 4, forced: true });
   });
 
   it('forces the target when nothing is ready and the shown band is no longer parsed', () => {
-    expect(chooseBand({ ...base, shown: 2, requestedZoom: 7.0, isReady: () => false })).toEqual({ band: 4, forced: true });
+    expect(chooseBand({ ...base, shown: 2, requestedZoom: 7.0, isReady: () => false })).toMatchObject({ band: 4, forced: true });
   });
 
   it('never picks a band that is not parsed at the zoom', () => {
-    expect(chooseBand({ ...base, shown: 2, requestedZoom: 7.0, isReady: (k) => k === 1 })).toEqual({ band: 4, forced: true });
+    expect(chooseBand({ ...base, shown: 2, requestedZoom: 7.0, isReady: (k) => k === 1 })).toMatchObject({ band: 4, forced: true });
   });
 
   it('applies hysteresis when zooming back down', () => {
-    expect(chooseBand({ ...base, shown: 3, requestedZoom: 5.55, isReady: () => true })).toEqual({ band: 3, forced: false });
-    expect(chooseBand({ ...base, shown: 3, requestedZoom: 5.45, isReady: () => true })).toEqual({ band: 2, forced: false });
+    expect(chooseBand({ ...base, shown: 3, requestedZoom: 5.55, isReady: () => true })).toMatchObject({ band: 3, forced: false });
+    expect(chooseBand({ ...base, shown: 3, requestedZoom: 5.45, isReady: () => true })).toMatchObject({ band: 2, forced: false });
+  });
+
+  it('picks an intermediate ready band when the target is not ready', () => {
+    expect(chooseBand({ ...base, shown: 2, requestedZoom: 7.3, isReady: (k) => k === 4 })).toEqual({ band: 4, forced: true, target: 5 });
   });
 
   it('pure Equal Earth (no transition) always returns band 0', () => {
-    expect(chooseBand({ bands: [{ minZoom: -Infinity, blend: 0 }], transition: null, hysteresis: 0.1, shown: 0, requestedZoom: 12, isReady: () => false })).toEqual({ band: 0, forced: false });
+    expect(chooseBand({ bands: [{ minZoom: -Infinity, blend: 0 }], transition: null, hysteresis: 0.1, shown: 0, requestedZoom: 12, isReady: () => false })).toMatchObject({ band: 0, forced: false });
   });
 });
 
@@ -127,17 +132,80 @@ describe('BandSwitcher', () => {
     expect(zoomTo(7.4)).toBe(5);
   });
 
-  it('cancels a pending symbol hide when the band is shown again within the fade', () => {
-    const { host, c, zoomTo } = setup(1, 4.4);
-    host.loaded.add('openmaptiles__b2').add('openmaptiles__b1');
-    zoomTo(4.9);
-    c.advance(350);
-    zoomTo(4.5);
-    c.advance(300);
+  it('cancels a pending symbol hide each time the band is shown again within the fade', () => {
+    const { host, c, zoomTo } = setup(1, 4.4, { dwellMs: 0 });
+    host.loaded.add('openmaptiles__b1').add('openmaptiles__b2');
+    expect(zoomTo(4.9)).toBe(2); // t=0: hide of b1 due at 300
+    c.advance(50);
+    expect(zoomTo(4.5)).toBe(1); // t=50: b1 shown again, hide of b2 due at 350
+    c.advance(50);
+    expect(zoomTo(4.9)).toBe(2); // t=100: b2 shown again, hide of b1 due at 400
+    c.advance(50);
+    expect(zoomTo(4.5)).toBe(1); // t=150: b1 shown again, hide of b2 due at 450
+    c.advance(1000);
+    const noneWrites = (id: string) => host.writes.filter((w) => w.kind === 'layout' && w.layerId === id && w.value === 'none');
+    expect(noneWrites('place__b1')).toHaveLength(0);
     expect(host.layout['place__b1']).toEqual({ visibility: undefined });
+    expect(noneWrites('place__b2')).toHaveLength(1);
     expect(host.layout['place__b2']).toEqual({ visibility: 'none' });
     expect(host.paint['water__b1']).toEqual({ 'fill-opacity': 0.8 });
     expect(host.paint['water__b2']).toEqual({ 'fill-opacity': 0 });
+  });
+
+  it('does not take a band for ready merely because MapLibre reports an unused source as loaded', () => {
+    const { host, zoomTo } = setup(2, 4.1);
+    host.loadedWhenUnused = true;
+    expect(zoomTo(6.3)).toBe(2); // band 3 was out of range at z4.1: no tile was ever requested
+    host.loaded.add('openmaptiles__b3');
+    expect(zoomTo(6.3)).toBe(3);
+  });
+
+  it('forgets the wait when the zoom returns to the shown band', () => {
+    const { host, c, zoomTo, events } = setup(1, 4.4);
+    zoomTo(4.9);
+    zoomTo(4.4);
+    c.advance(600000);
+    host.loaded.add('openmaptiles__b2');
+    zoomTo(4.9);
+    expect(events[0]!.waitedMs).toBe(0);
+  });
+
+  it('wakes once at the end of the dwell when the band becomes ready inside it', () => {
+    const { host, c, zoomTo } = setup(1, 4.4);
+    host.loaded.add('openmaptiles__b2');
+    expect(zoomTo(4.9)).toBe(2); // switch at t=0
+    expect(zoomTo(5.7)).toBe(2); // band 3 not ready
+    c.advance(100);
+    host.loaded.add('openmaptiles__b3');
+    host.fire('sourcedata');
+    host.fire('idle');
+    expect(host.jumps).toBe(0);
+    c.advance(199);
+    expect(host.jumps).toBe(0);
+    c.advance(1);
+    expect(host.jumps).toBe(1);
+  });
+
+  it('rejects a hysteresis that reaches the band spacing', () => {
+    const host = new FakeSwitcherHost();
+    expect(() => new BandSwitcher(host, {
+      bands: SIX.bands, transition: SIX, sourceIdsForBand: idsFor, gatesForBand: gatesFor, initialBand: 1,
+      requestedZoom: () => 4.4, hysteresis: SIX.spacing,
+    })).toThrow(TypeError);
+  });
+
+  it('under pure Equal Earth always shows band 0 and writes nothing', () => {
+    const host = new FakeSwitcherHost();
+    const switcher = new BandSwitcher(host, {
+      bands: [{ minZoom: -Infinity, blend: 0 }], transition: null, sourceIdsForBand: () => [], gatesForBand: () => [],
+      initialBand: 0, requestedZoom: () => 12,
+    });
+    switcher.start();
+    for (const z of [0, 5, 12, 20]) expect(switcher.decide(z)).toBe(0);
+    host.fire('sourcedata');
+    expect(host.writes).toHaveLength(0);
+    expect(host.jumps).toBe(0);
+    switcher.destroy();
   });
 
   it('reports the hold time of a switch', () => {
