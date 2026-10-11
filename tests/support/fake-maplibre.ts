@@ -529,6 +529,8 @@ export class FakeSwitcherHost {
     (this.layout[layerId] ??= {})[name] = value;
     this.writes.push({ kind: 'layout', layerId, name, value });
   }
+  zoom = 0;
+  getZoom(): number { return this.zoom; }
   isMoving(): boolean { return this.moving; }
   /** Called by `jumpTo`, as MapLibre runs the camera hook synchronously inside it. */
   onJump?: () => void;
