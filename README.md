@@ -39,7 +39,8 @@ Three consequences you must design around:
 
 - **Coordinates the map reports are not geographic.** While Equal Earth is active,
   `map.getCenter()`, `map.project()`, `getBounds()`, popup anchors and `queryRenderedFeatures()`
-  return map space. Convert with `mapToGeographic` / `geographicToMap`.
+  return map space, and under `{ type: 'equal' }` that space changes with the band shown.
+  Convert through the map's controller: `controllerFor(map).toGeographic` / `toMapSpace`.
 - **Equal Earth and globe cannot be shown at once.** Globe interprets lng/lat as real geodetic
   coordinates, so warped values would render as a distorted sphere.
 - **Labels stay upright.** Because MapLibre still believes it is rendering Mercator, text layout
@@ -78,15 +79,31 @@ warped on the main thread, 100–450 ms per tile; `eqe.workerPath` says which pa
 
 ### Converting coordinates
 
+Anything you place on an Equal Earth map — GeoJSON, marker positions, deck.gl accessors,
+`flyTo` targets — must be converted into map space first, and anything the map reports back
+converted out of it. Use the map's controller, which converts in the space of the band shown
+now:
+
+```js
+const controller = eqe.controllerFor(map);
+
+controller.toMapSpace([8.54, 47.38]);    // → map-space lng/lat to hand to MapLibre
+controller.toGeographic([9.92, 42.09]);  // → back to real lng/lat
+```
+
+Under `{ type: 'equal' }` the shown band changes as the zoom crosses the transition, so a
+position converted earlier belongs to the band that was shown then; re-convert in `onSwitch`.
+While Equal Earth is off, both are the identity.
+
+The bare functions take the blend explicitly and default to 0, pure Equal Earth. Use them for
+`{ type: 'equal-earth' }`, or with a blend you know:
+
 ```js
 import { geographicToMap, mapToGeographic } from '@yellowmap/maplibre-gl-equal-earth';
 
-geographicToMap([8.54, 47.38]);   // → map-space lng/lat to hand to MapLibre
-mapToGeographic([9.92, 42.09]);   // → back to real lng/lat
+geographicToMap([8.54, 47.38]);          // blend 0: pure Equal Earth map space
+mapToGeographic([9.92, 42.09], 0.5);     // from the map space of a band at blend 0.5
 ```
-
-Anything you place on an Equal Earth map — GeoJSON, marker positions, deck.gl accessors,
-`flyTo` targets — must be passed through `geographicToMap` first.
 
 ### Raw projection
 
@@ -98,6 +115,10 @@ fromEqualEarth([0, 8392929.69]);   // → [0, 90]
 ```
 
 ### Camera continuity across a zoom threshold
+
+> **Lower level — only without `installEqualEarth`, which installs this for you.** Adding a
+> camera on top of it chains a second `transformCameraUpdate` hook and converts the centre
+> twice.
 
 An adaptive Equal Earth map shows warped coordinates at low zoom and true geographic coordinates
 once it switches to plain Mercator tiles. `ThresholdCamera` converts the camera centre so the
@@ -120,7 +141,8 @@ camera.destroy();   // restores any transformCameraUpdate the app had installed
 It chains to an existing `transformCameraUpdate` rather than overwriting it, so bbox constraints
 and map synchronisation keep working.
 
-For the adaptive projection's intermediate steps, `BandCamera` takes a list of zoom bands,
+`ThresholdCamera` is the two-band form of `BandCamera`. For the adaptive projection's
+intermediate steps, `BandCamera` takes a list of zoom bands,
 each with a fixed blend between Equal Earth (0) and Mercator (1), and does the same across every
 band boundary:
 
@@ -142,6 +164,8 @@ const camera = new BandCamera(map, {
 Both cameras work on MapLibre v5 and v6: v6 moved the hook behind `setTransformCameraUpdate()`.
 
 ### Keeping the world in view
+
+> **Lower level — only without `installEqualEarth`, which installs this for you.**
 
 On the Mercator grid the Equal Earth world only reaches map-space latitude ±65.54°, but Mercator
 will happily pan on to ±85° and show empty background above and below:
@@ -231,8 +255,10 @@ The readout logs every band switch, how long it was held, and the geographic cen
 
 `npm run probe:transition` is a developer tool, not part of `npm run verify`. It drives the
 demo in headless Chrome with real wheel events, zooming in and out through the transition,
-and fails on a centre drift above 0.001° or any map error. It needs local Chrome
-(`--chrome <path>` or `CHROME_PATH`), the network and the running dev server:
+and fails on a centre drift above 0.001°, any map error or an uncaught page exception. It
+needs Node ≥ 22, local Chrome (`--chrome <path>` or `CHROME_PATH`), the network and the
+running dev server. `--anchor 300,0` wheels at a point 300 px off-centre and reports how far
+the place under the pointer snaps at each step:
 
 ```sh
 node scripts/probe-transition.mjs --city "San Francisco"
@@ -245,7 +271,9 @@ prints say nothing about latency on real hardware.
 ## Limitations
 
 - **Map space.** Everything MapLibre reports while Equal Earth is active is in the shown
-  band's map space; convert with `controllerFor(map).toGeographic` / `toMapSpace`.
+  band's map space; convert with `controllerFor(map).toGeographic` / `toMapSpace`, not with
+  the blend-0 defaults of `mapToGeographic` / `geographicToMap`. Positions you converted
+  belong to the band shown at the time; re-convert on `onSwitch`.
 - **`GlobeControl`** treats `{ type: 'equal' }` as "not Mercator", switches to Mercator and so
   turns Equal Earth off. Use your own control for now.
 - **Style changes while active.** A new style passed to `setStyle` is followed: it becomes the
@@ -269,13 +297,13 @@ prints say nothing about latency on real hardware.
 | --- | --- |
 | `toEqualEarth(lngLat)` | Geographic degrees → Equal Earth metres (EPSG:8857). |
 | `fromEqualEarth(point)` | Equal Earth metres → geographic degrees. Newton inverse. |
-| `geographicToMap(lngLat)` | Geographic degrees → map space. |
-| `mapToGeographic(lngLat)` | Map space → geographic degrees. |
+| `geographicToMap(lngLat, blend = 0)` | Geographic degrees → the map space of a band at `blend` (0 = pure Equal Earth). Prefer `controllerFor(map).toMapSpace`. |
+| `mapToGeographic(lngLat, blend = 0)` | Map space of a band at `blend` → geographic degrees. Prefer `controllerFor(map).toGeographic`. |
 | `installEqualEarth(maplibregl, opts)` | Checks the version, sizes the worker pool, loads the worker bundle, polyfills `setProjection`/`getProjection`. Resolves to `{ version, workerPath, controllerFor(map), uninstall() }`. |
 | `EqualEarthController` | Per map, from `controllerFor(map)`: `active`, `projection`, `blend`, `toMapSpace(lngLat)`, `toGeographic(lngLat)`. |
-| `BandCamera` | The `transformCameraUpdate` hook across zoom bands, with compensation. |
-| `ThresholdCamera` | `transformCameraUpdate` hook for the Equal Earth ↔ Mercator switch. |
-| `installEqualEarthConstrain(map, opts)` | Clamps the camera to the Equal Earth world; returns a teardown function. |
+| `BandCamera` | Lower level: the `transformCameraUpdate` hook across zoom bands, with compensation. `installEqualEarth` installs it. |
+| `ThresholdCamera` | Lower level: the two-band form of `BandCamera` (Equal Earth ↔ Mercator). |
+| `installEqualEarthConstrain(map, opts)` | Lower level, installed by `installEqualEarth`: clamps the camera to the Equal Earth world; returns a teardown function. |
 | `createEqualEarthConstrain(opts)` | The bare `TransformConstrainFunction`, if you want to compose it yourself. |
 | `GRID_FACTOR` | ≈1.162, the Equal Earth → Mercator grid scale. |
 | `EQUAL_EARTH_X_MAX` / `EQUAL_EARTH_Y_MAX` | Half-extents in metres, derived from `EARTH_RADIUS`. |

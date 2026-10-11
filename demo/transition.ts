@@ -45,19 +45,6 @@ const oneOf = <T extends string>(name: string, values: readonly T[]): T | undefi
   return values.find((value) => value === raw);
 };
 
-const transition: Transition = {};
-const steps = numberParam('steps');
-const from = numberParam('from');
-const to = numberParam('to');
-if (steps !== undefined) transition.steps = steps;
-if (from !== undefined) transition.from = from;
-if (to !== undefined) transition.to = to;
-// Validates here, so a bad URL fails loudly before any map exists.
-const resolved = resolveTransition(transition);
-const compensation = oneOf<CompensationMode>('compensate', ['none', 'zoom', 'zoom+bearing']);
-const projection = oneOf<ProjectionType>('projection', ['equal', 'equal-earth', 'mercator']) ?? 'equal';
-const workers = numberParam('workers');
-
 const readout = document.getElementById('readout')!;
 const header: string[] = [];
 const events: string[] = [];
@@ -77,6 +64,32 @@ const log = (line: string): void => {
   render();
 };
 
+/** Show a fatal setup error where the user looks, then stop. */
+const fatal = (what: string, error: unknown): never => {
+  console.error(error);
+  note(`FAILED to ${what}: ${error instanceof Error ? error.message : String(error)}`);
+  throw error;
+};
+
+const transition: Transition = {};
+const steps = numberParam('steps');
+const from = numberParam('from');
+const to = numberParam('to');
+if (steps !== undefined) transition.steps = steps;
+if (from !== undefined) transition.from = from;
+if (to !== undefined) transition.to = to;
+// Validates here, so a bad URL fails loudly before any map exists.
+let resolved: ReturnType<typeof resolveTransition>;
+try {
+  resolved = resolveTransition(transition);
+} catch (error) {
+  resolved = fatal('read ?steps/from/to', error);
+}
+const compensation = oneOf<CompensationMode>('compensate', ['none', 'zoom', 'zoom+bearing']);
+const projection =
+  oneOf<ProjectionType>('projection', ['equal', 'equal-earth', 'mercator']) ?? 'equal';
+const workers = numberParam('workers');
+
 const onSwitch = (event: SwitchEvent): void => {
   log(
     `shown b${event.from}→b${event.to} at z${event.requestedZoom.toFixed(2)} ` +
@@ -89,15 +102,23 @@ const started = performance.now();
 // Under `vite dev` the library's own `new URL('./worker.mjs', import.meta.url)` points into
 // `/src/`, where no worker exists: load the built one. The query string defeats Vite's
 // transform cache, which would otherwise keep serving the worker from before `npm run build:js`.
-const install = await installEqualEarth(maplibregl, {
-  workerUrl: new URL(`/dist/worker.mjs?v=${Date.now()}`, location.href),
-  transition,
-  onSwitch,
-  ...(compensation ? { compensation } : {}),
-  ...(workers !== undefined ? { workers } : {}),
-});
+let install: Awaited<ReturnType<typeof installEqualEarth>>;
+try {
+  install = await installEqualEarth(maplibregl, {
+    workerUrl: new URL(`/dist/worker.mjs?v=${Date.now()}`, location.href),
+    transition,
+    onSwitch,
+    ...(compensation ? { compensation } : {}),
+    ...(workers !== undefined ? { workers } : {}),
+  });
+} catch (error) {
+  install = fatal('install Equal Earth', error);
+}
 
-note(`maplibre-gl ${install.version}; tiles warped on: ${install.workerPath}; workers: ${maplibregl.getWorkerCount()}`);
+note(
+  `maplibre-gl ${install.version}; tiles warped on: ${install.workerPath}; ` +
+    `workers: ${maplibregl.getWorkerCount()}`,
+);
 note(
   `projection ${projection}; steps ${resolved.steps} at z${resolved.bands
     .slice(1)
@@ -140,7 +161,9 @@ map.on('error', (event: { error?: unknown }) => {
 });
 
 // Exposed at once, so a probe sees errors (an unreachable style, say) before `ready`.
-const eqe = { map, controller, install, transition: resolved, shownBand, cities: CITIES, errors, ready: false };
+const eqe = {
+  map, controller, install, transition: resolved, shownBand, cities: CITIES, errors, ready: false,
+};
 Object.assign(window, { __eqe: eqe });
 const exposeReady = (): void => {
   note(`first idle after ${(performance.now() - started).toFixed(0)} ms`);
@@ -185,7 +208,8 @@ toggle.type = 'button';
 const equalType: ProjectionType = projection === 'mercator' ? 'equal' : projection;
 let current: ProjectionType = projection;
 const label = (): void => {
-  toggle.textContent = `projection: ${current} (switch to ${current === 'mercator' ? equalType : 'mercator'})`;
+  const next = current === 'mercator' ? equalType : 'mercator';
+  toggle.textContent = `projection: ${current} (switch to ${next})`;
 };
 toggle.addEventListener('click', () => {
   current = current === 'mercator' ? equalType : 'mercator';
