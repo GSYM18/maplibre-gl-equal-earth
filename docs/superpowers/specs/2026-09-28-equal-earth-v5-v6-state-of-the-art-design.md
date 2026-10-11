@@ -134,7 +134,7 @@ spacing `s` on each side, clamped to the layer's own range; a copy whose clamped
 empty is dropped. Whether a copy is *shown* is a runtime decision (§4) carried by **literal
 paint values** that the switcher sets through `setPaintProperty` / `setLayoutProperty`:
 
-- `fill`, `line`, `fill-extrusion`, `circle`, `heatmap`, `raster`, `hillshade` copies: the
+- `fill`, `line`, `fill-extrusion`, `circle`, `heatmap`, `raster`, `color-relief` copies: the
   layer's opacity-like properties (`OPACITY` per type) hold the **original value** while the
   band is shown and the constant `0` while it is hidden, with a 250 ms `*-transition` unless
   the layer declares its own. A switch is a paint update: main thread, no re-parse. MapLibre
@@ -144,7 +144,10 @@ paint values** that the switcher sets through `setPaintProperty` / `setLayoutPro
   hidden, which re-parses (not re-warps) the two affected sources. Their
   `text-opacity`/`icon-opacity` are gated like paint above with a 300 ms transition, so the
   outgoing band's labels fade before they are hidden.
-- `raster` / `hillshade` layers (relief) exist only in the Mercator band.
+- `hillshade` and `color-relief` copies are hidden by `layout.visibility` like symbols
+  (hillshade has no opacity, and a `basic`/`multidirectional` one still tints at exaggeration
+  0); `color-relief-opacity` still carries the fade.
+- `raster` / `hillshade` / `color-relief` layers (relief) exist only in the Mercator band.
 - The rewrite emits every copy in the state for its initial zoom's band and returns a **gate
   table** (layer id, band, gated paint originals, own visibility) that the switcher applies.
 
@@ -234,7 +237,7 @@ band's `θ`, `σ` jump and the offsets jump by the opposite amount, so the frame
 is continuous. Only shear snaps: measured residual at 300 px, six steps: Zürich ≈ 7 px, San
 Francisco ≈ 16 px, Anchorage 18–65 px, Singapore ≈ 7 px. Offsets are zero outside
 `[from − s/2, to + s/2]`, bounded by half a step inside it (≤ 0.07 zoom, ≤ 3° at Anchorage for
-six steps), and switchable: `compensate: 'none' | 'zoom' | 'zoom+bearing'` (default
+six steps), and switchable: `compensation: 'none' | 'zoom' | 'zoom+bearing'` (default
 `'zoom+bearing'`). The sign convention is pinned by a test, not by prose: with compensation
 the largest of four 300 px probes must move less than 60 % of its uncompensated displacement
 at San Francisco and Zürich.
@@ -260,10 +263,12 @@ conversion and the style flip happen in the same frame. Rules, evaluated on the 
 3. Otherwise walk from `target` towards `shown`; the first band `k` whose layers are parsed at
    `z` (parse range, §3) **and** whose source reports `isSourceLoaded` (every in-view tile has
    data or errored) is shown. The Mercator band's readiness is the original source's.
-4. If none is ready and `shown` is still parsed at `z`: **hold** (the map keeps drawing the old
-   band; the user sees a slightly late step, never a hole).
-5. If `shown` is no longer parsed at `z` (the zoom outran tile production by more than one
-   spacing): **forced** switch to the parsed band nearest `target` that is loaded, else `target`.
+4. If none is ready and `shown` is still parsed at the rendered zoom (`z` plus the camera's
+   compensation offset, which MapLibre hides layers by; P20): **hold** (the map keeps drawing
+   the old band; the user sees a slightly late step, never a hole).
+5. If `shown` is no longer parsed at the rendered zoom (P20; the zoom outran tile production by
+   more than one spacing): **forced** switch to the parsed band nearest `target` that is
+   loaded, else `target`.
 6. A **minimum dwell** of 300 ms between switches, except forced ones, so a fast zoom through
    several bands does not cascade one blink per band.
 
@@ -373,14 +378,17 @@ MapLibre runs **one** tile worker by default (except Safari).
 
 ### Compatibility and build
 
-- `installEqualEarth(maplibregl, { workerUrl?, native?: 'auto' | 'never' })`:
+- `installEqualEarth(maplibregl, { workerUrl?, workerTimeoutMs?, native?: 'auto' | 'never' })`:
   - `getVersion()` ≥ 6 → `importScriptInWorkers(worker.mjs)`;
   - 5.24 ≤ version < 6 → `importScriptInWorkers(worker.iife.js)`;
   - anything older → throws with a clear message.
 - The default worker URL is `new URL('./worker.mjs' | './worker.iife.js', import.meta.url)`, so
   bundlers emit it as an asset. `workerUrl` overrides it (CDN, custom CSP).
 - `native: 'auto'` behaves as `'never'` until #8330 defines a detectable signal; updating it is
-  part of the native-support migration.
+  part of the native-support migration. Not implemented yet (Plan 3): today every install
+  behaves as `'never'`.
+- The worker import is raced against `workerTimeoutMs` (default 10 s) and falls back to the
+  main thread when it times out.
 - CSP: neither worker path needs `blob:` or `unsafe-eval`; only `script-src` for the worker URL.
 - Build: three Vite outputs — the `index.js` ESM library, a self-contained `worker.mjs` (ESM,
   no chunks) and `worker.iife.js`.

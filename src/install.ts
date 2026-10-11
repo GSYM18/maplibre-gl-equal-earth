@@ -47,6 +47,13 @@ export interface InstallOptions {
    * An application that set its own count keeps it. `false` leaves the pool alone.
    */
   workers?: number | false;
+  /**
+   * How long to wait for the worker bundle before warping on the main thread instead (spec §8).
+   * A CDN that accepts the connection and stalls would otherwise hold the install, and with it
+   * the application's first map, forever. `Infinity` waits without a bound.
+   * @defaultValue 10000
+   */
+  workerTimeoutMs?: number;
   transition?: Transition;
   compensation?: CompensationMode;
   fetchJson?: ControllerOptions['fetchJson'];
@@ -73,15 +80,60 @@ export function parseVersion(version: string): { major: number; minor: number } 
 
 const EQUAL_EARTH_TYPES = new Set(['equal', 'equal-earth']);
 
+const DEFAULT_WORKER_TIMEOUT_MS = 10_000;
+
+/** Browsers fire a `setTimeout` beyond 2^31 − 1 ms at once; treat it as no bound. */
+const MAX_TIMEOUT_MS = 2 ** 31 - 1;
+
+/** `promise`, or a rejection once `ms` have passed; the timer is cleared either way. */
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  if (!(ms <= MAX_TIMEOUT_MS)) return promise;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`timed out after ${ms} ms`)), ms);
+  });
+  try {
+    return await Promise.race([promise, timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function defaultWorkerCount(): number {
   const cores = (globalThis as { navigator?: { hardwareConcurrency?: number } }).navigator
     ?.hardwareConcurrency;
   return Math.max(2, Math.min(4, Math.floor((cores ?? 4) / 2)));
 }
 
-export async function installEqualEarth(
+/** Where an install keeps itself on `Map.prototype`, shared by every copy of this module. */
+const INSTALL_KEY = Symbol.for('@yellowmap/maplibre-gl-equal-earth:install');
+
+/**
+ * Install once per MapLibre module. A second call (Vite HMR, a second bundle) returns the first
+ * install, its options included, instead of chaining a second polyfill and a second controller
+ * per map; call `uninstall()` first to install with other options. A failed install leaves
+ * nothing behind.
+ */
+export function installEqualEarth(
   maplibregl: MapLibreModule,
   options: InstallOptions = {},
+): Promise<EqualEarthInstall> {
+  const marked = maplibregl.Map.prototype as unknown as Record<symbol, unknown>;
+  const existing = marked[INSTALL_KEY];
+  if (existing instanceof Promise) return existing as Promise<EqualEarthInstall>;
+  const release = (): void => {
+    if (marked[INSTALL_KEY] === promise) delete marked[INSTALL_KEY];
+  };
+  const promise = install(maplibregl, options, release);
+  marked[INSTALL_KEY] = promise;
+  promise.catch(release);
+  return promise;
+}
+
+async function install(
+  maplibregl: MapLibreModule,
+  options: InstallOptions,
+  release: () => void,
 ): Promise<EqualEarthInstall> {
   const version = maplibregl.getVersion();
   const { major, minor } = parseVersion(version);
@@ -104,11 +156,15 @@ export async function installEqualEarth(
       : new URL(/* @vite-ignore */ './worker.iife.js', import.meta.url));
   let workerPath: EqualEarthInstall['workerPath'] = 'worker';
   try {
-    await maplibregl.importScriptInWorkers(String(workerUrl));
+    await withTimeout(
+      maplibregl.importScriptInWorkers(String(workerUrl)),
+      options.workerTimeoutMs ?? DEFAULT_WORKER_TIMEOUT_MS,
+    );
   } catch (error) {
     // Without the worker bundle the workers find no `eqearth` handler and send each request
     // back to the main thread, where this one serves it: correct, but every warp then runs on
-    // the UI thread.
+    // the UI thread. A bundle that loads after the timeout registers its own handler in the
+    // workers, which then no longer ask.
     const reason = error instanceof Error ? error.message : String(error);
     console.warn(
       `[equal-earth] worker script failed to load (${reason}); warping tiles on the main thread.`,
@@ -190,7 +246,9 @@ export async function installEqualEarth(
   };
 
   const getProjection = function (this: ControllerHost): unknown {
-    const projection = controllers.get(this)?.projection;
+    // The type last set, as MapLibre's own reports it, even while its TileJSON is in flight.
+    const controller = controllers.get(this);
+    const projection = controller?.pendingProjection ?? controller?.projection;
     return projection ? { type: projection } : originalGet.call(this);
   };
 
@@ -202,6 +260,7 @@ export async function installEqualEarth(
     workerPath,
     controllerFor,
     uninstall: () => {
+      release();
       if (proto.setProjection === setProjection) proto.setProjection = originalSet;
       if (proto.getProjection === getProjection) proto.getProjection = originalGet;
       for (const controller of live) {

@@ -38,6 +38,7 @@ import {
   mapSpaceMaxLatitude,
   mapSpaceMaxLongitude,
   mapToGeographic,
+  wrapLongitude,
 } from '../math/backproject.js';
 import type { LngLatTuple } from '../math/equal-earth.js';
 import type { CompensationMode } from '../math/jacobian.js';
@@ -189,8 +190,16 @@ export class EqualEarthController {
   #view: View | undefined;
   /** `renderWorldCopies` before activation; `undefined` until it has been turned off. */
   #worldCopies: boolean | undefined;
-  /** Bumped by every activate, re-apply and deactivate: a stale async apply abandons itself. */
+  /**
+   * Bumped by every activate, re-apply and deactivate ({@link #nextGeneration}): a stale async
+   * apply abandons itself.
+   */
   #generation = 0;
+  /**
+   * Releases the waits for a map event that may never come (a rebuild that `remove()` or another
+   * `setStyle` aborted, M2), so the waiting apply wakes, sees a new generation and gives up.
+   */
+  readonly #eventWaits = new Set<() => void>();
   #pending: { type: EqualEarthProjection; promise: Promise<void> } | undefined;
   /** True while our own `setStyle` runs: its style events are not the application's. */
   #applying = false;
@@ -212,6 +221,11 @@ export class EqualEarthController {
 
   get projection(): EqualEarthProjection | undefined {
     return this.#projection;
+  }
+
+  /** The type an activation still in flight will show; `undefined` when none is. */
+  get pendingProjection(): EqualEarthProjection | undefined {
+    return this.#pending?.type;
   }
 
   /** Blend of the band shown now; 1 (Mercator, i.e. geographic) while inactive. */
@@ -245,7 +259,7 @@ export class EqualEarthController {
     if (this.#destroyed) return Promise.reject(new Error('Equal Earth: this controller was destroyed.'));
     if (this.#pending?.type === type) return this.#pending.promise;
     if (this.#projection === type && !this.#pending) return Promise.resolve();
-    const generation = ++this.#generation;
+    const generation = this.#nextGeneration();
     const promise = this.#activate(type, generation).finally(() => {
       if (this.#pending?.promise === promise) this.#pending = undefined;
     });
@@ -277,7 +291,7 @@ export class EqualEarthController {
    * timers are cancelled; anything still in flight abandons itself.
    */
   dispose(): void {
-    this.#generation++;
+    this.#nextGeneration();
     this.#pending = undefined;
     this.#settle(superseded());
     this.#installed?.switcher.destroy();
@@ -295,7 +309,7 @@ export class EqualEarthController {
   }
 
   #deactivateNow(): void {
-    this.#generation++;
+    this.#nextGeneration();
     this.#pending = undefined;
     this.#settle(superseded());
     if (!this.active) return;
@@ -315,7 +329,7 @@ export class EqualEarthController {
         // 1. A loaded style.
         let style = this.#readStyle();
         while (!style) {
-          await this.#nextEvent('styledata');
+          await this.#nextEvent('styledata').done;
           if (generation !== this.#generation) throw superseded();
           style = this.#readStyle();
         }
@@ -361,9 +375,11 @@ export class EqualEarthController {
     if (this.active) {
       this.#view = this.#detach();
     } else {
+      // With world copies on, the centre may sit on a copy (lng 400); off the outline, the
+      // conversion would extrapolate into the empty corner.
       const center = this.#host.getCenter();
       this.#view = {
-        geographic: [center.lng, center.lat],
+        geographic: [wrapLongitude(center.lng), center.lat],
         zoom: this.#host.getZoom(),
         bearing: this.#host.getBearing(),
         blend: 1,
@@ -390,6 +406,42 @@ export class EqualEarthController {
     if (this.#projection !== type) throw superseded();
   }
 
+  #nextGeneration(): number {
+    this.#generation++;
+    const waits = [...this.#eventWaits];
+    this.#eventWaits.clear();
+    for (const release of waits) release();
+    return this.#generation;
+  }
+
+  /**
+   * The host's next `type` event. `done` resolves on it, or when the generation changes,
+   * whichever comes first (the caller checks which); `fired` says synchronously whether the
+   * event came; `cancel` stops listening without resolving.
+   */
+  #nextEvent(type: string): { done: Promise<void>; fired: () => boolean; cancel: () => void } {
+    let fired = false;
+    let resolve!: () => void;
+    const done = new Promise<void>((r) => {
+      resolve = r;
+    });
+    const cancel = (): void => {
+      this.#host.off(type, onEvent);
+      this.#eventWaits.delete(release);
+    };
+    const release = (): void => {
+      cancel();
+      resolve();
+    };
+    const onEvent = (): void => {
+      fired = true;
+      release();
+    };
+    this.#eventWaits.add(release);
+    this.#host.once(type, onEvent);
+    return { done, fired: () => fired, cancel };
+  }
+
   #whenInstalled(): Promise<void> {
     if (this.#installed) return Promise.resolve();
     return new Promise((resolve, reject) => {
@@ -409,7 +461,7 @@ export class EqualEarthController {
 
   /** Re-apply {@link #original} with the current type; on failure turn off and report. */
   #reapply(): void {
-    const generation = ++this.#generation;
+    const generation = this.#nextGeneration();
     this.#apply(generation).catch((error: unknown) => {
       if (generation !== this.#generation) return;
       this.#abandon(error);
@@ -445,30 +497,22 @@ export class EqualEarthController {
     rewritten.style.projection = { type: 'mercator' };
 
     // C7: install only once the rewritten style has loaded. Listen first: on the diff path
-    // `style.load` fires inside `setStyle`; on a full rebuild a frame or more later.
-    let loaded = false;
-    let resolveLoad!: () => void;
-    const styleLoaded = new Promise<void>((resolve) => {
-      resolveLoad = resolve;
-    });
-    const onLoad = (): void => {
-      loaded = true;
-      resolveLoad();
-    };
-    this.#host.once('style.load', onLoad);
+    // `style.load` fires inside `setStyle`; on a full rebuild a frame or more later, or never
+    // when the rebuild is aborted, in which case the generation has moved on (M2).
+    const styleLoad = this.#nextEvent('style.load');
     this.#setStyle(rewritten.style);
-    if (!loaded) {
+    if (!styleLoad.fired()) {
       const current = this.#readStyle();
       if (current) {
         // Loaded without a `style.load`: either MapLibre found nothing to change (the style is
         // already ours), or it rejected the style (validation errors are `error` events and
         // leave the old style in place).
-        this.#host.off('style.load', onLoad);
+        styleLoad.cancel();
         if (!hasOurMetadata(current)) {
           throw new Error('Equal Earth: the map did not accept the rewritten style.');
         }
       } else {
-        await styleLoaded;
+        await styleLoad.done;
       }
     }
     if (generation !== this.#generation) return false;
@@ -544,7 +588,7 @@ export class EqualEarthController {
   readonly #onStyleLoading = (): void => {
     if (!this.active || this.#applying) return;
     this.#view = this.#detach();
-    if (!this.#switchPending()) this.#generation++;
+    if (!this.#switchPending()) this.#nextGeneration();
   };
 
   /**
@@ -634,7 +678,7 @@ export class EqualEarthController {
    * activations waiting for it (M3) with its error.
    */
   #abandon(error: unknown): void {
-    this.#generation++;
+    this.#nextGeneration();
     this.#settle(error);
     const view = this.#detach();
     this.#projection = undefined;
@@ -707,12 +751,6 @@ export class EqualEarthController {
       return copy as StyleLike;
     }
     return style as StyleLike;
-  }
-
-  #nextEvent(type: string): Promise<void> {
-    return new Promise((resolve) => {
-      this.#host.once(type, () => resolve());
-    });
   }
 }
 

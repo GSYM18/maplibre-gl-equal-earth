@@ -126,6 +126,18 @@ export function mapSpaceMaxLongitude(mapLat: number, blend = 0): number {
 }
 
 /**
+ * Bring a longitude beyond ±180° back into range. ±180° itself is left alone: on Equal
+ * Earth those are opposite edges of the map, not one meridian.
+ */
+export function wrapLongitude(lng: number): number {
+  if (!Number.isFinite(lng)) return lng;
+  // Closed form, not a loop: beyond 2^53 `lng - 360` is `lng`, so a loop never terminates.
+  if (lng > 180) return lng - 360 * Math.ceil((lng - 180) / 360);
+  if (lng < -180) return lng + 360 * Math.ceil((-180 - lng) / 360);
+  return lng;
+}
+
+/**
  * A point in normalised Mercator world space: `[0,1]²`, origin at the top-left
  * (north-west) corner, y increasing southward. This is MapLibre's tile coordinate space —
  * tile `(z, x, y)` covers `[x, x+1] × [y, y+1]` divided by `2^z`.

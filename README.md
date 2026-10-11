@@ -1,6 +1,7 @@
 # @yellowmap/maplibre-gl-equal-earth
 
-Equal Earth projection support for [MapLibre GL JS](https://maplibre.org/maplibre-gl-js/docs/) v6.
+Equal Earth projection support for [MapLibre GL JS](https://maplibre.org/maplibre-gl-js/docs/)
+v6, and v5 from 5.24.
 
 The [Equal Earth projection](https://equal-earth.com/) (Šavrič, Patterson & Jenny, 2018) is an
 equal-area pseudocylindrical projection — countries appear at their true relative size, unlike
@@ -68,14 +69,18 @@ controller.toGeographic(map.getCenter().toArray());             // and back
 `{ type: 'equal' }` is the adaptive projection: Equal Earth at world zoom, plain Mercator from
 `transition.to`, stepped in between. `{ type: 'equal-earth' }` is Equal Earth at every zoom.
 The names follow [style-spec#1623](https://github.com/maplibre/maplibre-style-spec/pull/1623).
-`map.getProjection()` reports them once the activation has committed, i.e. after the vector
-sources' TileJSON was fetched.
+`map.getProjection()` reports them from the `setProjection` call on, while the vector sources'
+TileJSON is still being fetched; the map shows Equal Earth once that activation has committed.
+A second `installEqualEarth` on the same MapLibre module (e.g. a Vite HMR re-run) returns the
+first install, its options included; call `uninstall()` first to change them.
 
 `installEqualEarth` loads its worker bundle from `new URL('./worker.mjs', import.meta.url)`,
 which bundlers (Vite, webpack, Rollup, Parcel) emit as an asset. A plain dev server that serves
 the library from source may have no file there: pass `workerUrl`, pointing at the built
 `dist/worker.mjs` (v6) or `dist/worker.iife.js` (v5). Without the worker bundle the tiles are
 warped on the main thread, 100–450 ms per tile; `eqe.workerPath` says which path is in use.
+A worker bundle that has not loaded after `workerTimeoutMs` (default 10 000; `Infinity` waits
+without a bound) gets the same fallback, so a stalled CDN cannot hold up your first map.
 
 ### Converting coordinates
 
@@ -280,7 +285,10 @@ prints say nothing about latency on real hardware.
   new original and is rewritten. But `getStyle()` → modify → `setStyle()` hands back our
   rewritten style, which still counts as ours: the change is not captured as the original and
   is dropped on deactivation, and layers added against the original source id find no band
-  source. Change the style before activating, or deactivate first.
+  source. Your own `setPaintProperty` on an opacity the transition gates (`fill-opacity`,
+  `text-opacity`, …), or `setLayoutProperty` on a gated layer's `visibility`, is undone at the
+  next band switch, which restores the original style's values, and never reaches the other
+  bands' copies. Change the style before activating, or deactivate first.
 - **Sources.** Band sources inherit `attribution`, `minzoom` and `promoteId` from the original
   source, but not `bounds` (geographic bounds would cut off map-space tiles). TMS sources are
   rejected on activation.
