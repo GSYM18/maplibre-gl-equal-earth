@@ -18,7 +18,7 @@ describe('createEqualEarthConstrain', () => {
     expect(constrain({ lng: 10, lat: -80 }, 3).center.lat).toBeCloseTo(-MAP_SPACE_MAX_LATITUDE, 9);
   });
 
-  it('places the world edge at the map-space image of the pole (~65.46°)', () => {
+  it('places the world edge at the map-space image of the pole (~65.54°)', () => {
     // Sanity-check the constant itself: the geographic pole must land well inside
     // Mercator's own ±85.05° limit, or the warp would be clipped.
     expect(MAP_SPACE_MAX_LATITUDE).toBeGreaterThan(65);
@@ -126,7 +126,7 @@ describe('installEqualEarthConstrain', () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
-  it('rejects a map without setTransformConstrain (maplibre-gl < 6)', () => {
+  it('rejects a map without setTransformConstrain (maplibre-gl < 5.24)', () => {
     expect(() => installEqualEarthConstrain({} as never, { lngLatFactory })).toThrow(TypeError);
   });
 });

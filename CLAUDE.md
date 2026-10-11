@@ -18,11 +18,12 @@ Single test file: `npx vitest run tests/camera.test.ts`.
 Single test by name: `npx vitest run tests/camera.test.ts -t "crossing upward"`.
 
 `npm run build` is two steps because Vite emits the bundle and `tsc -p tsconfig.build.json`
-emits declarations separately. `npm run check:exports` runs two guards over the build. `scripts/check-exports.mjs` diffs the
-built bundle's runtime exports against the value exports declared in `src/index.ts` (it exists
-solely to make the 0.2.1 drift bug impossible to reintroduce). `scripts/check-worker-bundles.mjs`
-asserts both worker bundles are self-contained and actually register `eqearth` when loaded the
-way MapLibre v5 (`importScripts`) and v6 (`import()`) load them. `prepublishOnly` runs both.
+emits declarations separately. `npm run check:exports` runs two guards over the build.
+`scripts/check-exports.mjs` diffs the built bundle's runtime exports against the value exports
+declared in `src/index.ts` (it exists solely to make the 0.2.1 drift bug impossible to
+reintroduce). `scripts/check-worker-bundles.mjs` asserts both worker bundles are self-contained
+and actually register `eqearth` when loaded the way MapLibre v5 (`importScripts`) and v6
+(`import()`) load them. `prepublishOnly` runs both.
 
 ESLint's type-aware rules are confined to `**/*.ts`. `no-undef` is off there (tsc covers it),
 which is why `scripts/*.mjs` needs an explicit `globals.node` block.
@@ -75,7 +76,10 @@ affects the absolute metre values from `toEqualEarth`.
   took the bundle from ~128 kB to 3.4 kB.
 - `src/math/backproject.ts` — the warp, `GRID_FACTOR`, and Web Mercator helpers.
 - `src/math/subdivide.ts` — adaptive densification, and `geographicToMapWorld`'s tolerance helper.
-- `src/map/camera.ts` — `ThresholdCamera`, the `transformCameraUpdate` hook.
+- `src/math/antimeridian.ts` — restricts source geometry to longitude ±180° before warping.
+- `src/map/bands.ts` — zoom bands: the unit the adaptive projection is built from.
+- `src/map/camera.ts` — `BandCamera`, the `transformCameraUpdate` hook (`ThresholdCamera` is its
+  two-band form).
 - `src/map/constrain.ts` — camera clamp to the Equal Earth world, via `transformConstrain`.
 - `src/tiles/tile-cover.ts` — output tile → covering source Mercator tiles.
 - `src/tiles/mvt.ts` — decode → densify → warp → reslice → encode.
@@ -85,6 +89,7 @@ affects the absolute metre values from `toEqualEarth`.
   self-contained: v5 cannot parse `import`, and v6 imports non-`.mjs` scripts via a `blob:` URL
   where relative specifiers cannot resolve.
 - `src/tiles/cache.ts` — byte-bounded LRU + in-flight request coalescing.
+- `vite.worker.config.ts` — builds the two worker bundles (see `worker-entry.ts`).
 - `demo/` + root `index.html` — Vite demo pages, not part of the published package.
 - `scripts/check-exports.mjs` — build-artifact drift guard.
 - `scripts/probe-openfreemap.ts` — runs the real pipeline against live OpenFreeMap tiles.
@@ -184,16 +189,9 @@ but hairline seams in fills are still possible.
 
 ## Planned work
 
-Phases 1 and 2 are done. Remaining, per
-`~/.claude/plans/review-the-implementation-the-smooth-stearns.md`:
-
-- **Phase 3 — projection polyfill.** Intercept `setProjection`/`getProjection` to accept
-  `"equal-earth"` and `"equal"` per the pending [style-spec#1623](https://github.com/maplibre/maplibre-style-spec/pull/1623),
-  setting `{type:'mercator'}` underneath. Track state via `projectiontransition` **and**
-  `styledata` (as `GlobeControl` does). Note `getProjection()` returns `undefined` when the style
-  declares no projection.
-- **Phase 4 — demos and docs** against OpenFreeMap Liberty (`https://tiles.openfreemap.org/styles/liberty`,
-  plain EPSG:3857, no API key, commercial use allowed).
+Plan 1 (worker bundles, blended warp, `BandCamera`, constraint, spike) is done. Plan 2 (smooth
+transition, `docs/superpowers/plans/2026-10-11-plan-2-smooth-transition.md`) is next; Plan 3
+follows it.
 
 Upstream is moving on this: [maplibre-gl-js#8330](https://github.com/maplibre/maplibre-gl-js/issues/8330)
 tracks a native adaptive Equal Earth. The plugin is intentionally shaped as a polyfill so it can

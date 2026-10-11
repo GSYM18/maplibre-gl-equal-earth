@@ -25,7 +25,7 @@
     "url": "https://github.com/GSYM18/maplibre-gl-equal-earth/issues"
   },
   "homepage": "https://github.com/GSYM18/maplibre-gl-equal-earth#readme",
-  "sideEffects": false,
+  "sideEffects": ["./dist/worker.mjs", "./dist/worker.iife.js"],
   "types": "./dist/index.d.ts",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
