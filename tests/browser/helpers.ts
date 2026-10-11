@@ -56,6 +56,8 @@ export interface HarnessOptions {
   outline?: boolean;
   /** `graticule: { step }`, or `true` for the default. */
   graticule?: number | true;
+  /** `?control=1`: the `EqualEarthControl` (and, on v6, `GlobeControl`) on the map. */
+  control?: boolean;
 }
 
 /** `test` with the per-project `mlv` option (`playwright.config.ts` sets it). */
@@ -78,6 +80,7 @@ export async function openHarness(page: Page, options: HarnessOptions): Promise<
   if (options.outside) params.set('outside', options.outside);
   if (options.container) params.set('container', options.container);
   if (options.outline) params.set('outline', '1');
+  if (options.control) params.set('control', '1');
   if (options.graticule !== undefined) params.set('graticule', options.graticule === true ? '1' : String(options.graticule));
   await page.goto(`/tests/browser/harness.html?${params.toString()}`);
   await page.waitForFunction(() => window.__h !== undefined);

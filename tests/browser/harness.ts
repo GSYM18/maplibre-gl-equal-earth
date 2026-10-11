@@ -5,11 +5,11 @@
  * URL parameters: `?mlv=5|6` (default 6), `?plugin=0|1` (default 1), `?dpr=` (the map's
  * `pixelRatio`), `?projection=mercator|globe|equal|equal-earth` (default mercator, set after
  * `load`), `?compensation=`, `?outside=` (colour), `?outline=1` and `?graticule=<step>|1` (all
- * passed to `installEqualEarth` when present).
+ * passed to `installEqualEarth` when present). `?control=1` adds the `EqualEarthControl` (and, on v6, MapLibre's `GlobeControl`) top right.
  */
 import type { StyleSpecification } from 'maplibre-gl';
 
-import { installEqualEarth, type CompensationMode } from '../../src/index.ts';
+import { EqualEarthControl, installEqualEarth, type CompensationMode } from '../../src/index.ts';
 import type { Harness, HarnessProjection } from './helpers.ts';
 
 const params = new URLSearchParams(location.search);
@@ -23,6 +23,7 @@ const compensation = (params.get('compensation') ?? undefined) as CompensationMo
 const outside = params.get('outside') ?? undefined;
 const container = params.get('container');
 if (container) document.getElementById('map')!.style.background = container;
+const control = params.get('control') === '1';
 const outline = params.get('outline') === '1';
 const graticuleParam = params.get('graticule');
 const graticule = graticuleParam === null ? undefined : graticuleParam === '1' ? true : { step: Number(graticuleParam) };
@@ -143,6 +144,10 @@ async function start(): Promise<void> {
     attributionControl: false,
   });
   h.map = map;
+  if (control) {
+    map.addControl(new EqualEarthControl(), 'top-right');
+    if (mlv === 6) map.addControl(new maplibregl.GlobeControl(), 'top-right');
+  }
   if (h.install) h.controller = h.install.controllerFor(map);
   map.on('error', (event: { error?: unknown }) => {
     const { error } = event;

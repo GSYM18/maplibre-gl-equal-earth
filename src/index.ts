@@ -177,3 +177,9 @@ export {
   type SwitcherHost,
   type SwitcherOptions,
 } from './map/switcher.js';
+
+export {
+  EqualEarthControl,
+  type ControlHost,
+  type EqualEarthControlOptions,
+} from './map/control.js';
