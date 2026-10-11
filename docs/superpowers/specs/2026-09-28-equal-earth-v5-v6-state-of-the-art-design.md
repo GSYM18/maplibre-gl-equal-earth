@@ -1,6 +1,6 @@
 # Equal Earth for MapLibre GL JS v5 + v6 — state-of-the-art design
 
-Date: 2026-09-28 · Status: awaiting review · Supersedes Phases 3–4 of
+Date: 2026-09-28 · Amended 2026-10-11 after the transition spike (§3, §4, §6, §9; the spike's findings are in `docs/superpowers/spikes/2026-09-28-band-transition.md`) · Status: approved, Plan 1 done · Supersedes Phases 3–4 of
 `~/.claude/plans/review-the-implementation-the-smooth-stearns.md` (Phases 1–2 are done and
 remain the foundation).
 
@@ -32,9 +32,11 @@ Tiles. It is shaped so it can be deleted when native support
 2. **Cartographic finish.** Curved world outline; ocean/land fill only inside the Equal Earth
    shape; optional graticule; Antarctica and the Arctic Ocean reaching ±90°; no visible fill
    seams at 1× and 2× DPR.
-3. **Smooth adaptive zoom.** `equal` transitions in three steps (z5, z6, z7). The camera centre
-   stays within **1 px** of the same geographic point across every step, under pinch, scroll
-   and `flyTo`. Placeholder tiles are always drawn in the correct step's geometry.
+3. **Smooth adaptive zoom.** `equal` transitions in steps (default six, z4–z8, §3). The camera
+   centre stays within **1 px** of the same geographic point across every step, under pinch,
+   scroll and `flyTo`; the local scale and rotation at the centre change continuously with
+   zoom (§4); a step is shown only once its tiles are drawable, so the map is never blank at a
+   step (§4); the remaining geometry change is cross-faded, not cut.
 4. **Fast first paint.** World view at 1280×800: **≤ 4 s cold at 50 Mbit/s**, **≤ 1.5 s
    warm**, measured with `performance.mark` in the demo. No warping on the main thread
    (except the documented worker-failure fallback).
@@ -99,93 +101,181 @@ world_t(p) = (1 − t) · geographicToMapWorld(p) + t · mercatorWorld(p)
 
 `world_t` is continuous in `p`, so warped geometry never tears.
 
-| Projection | Bands |
-|---|---|
-| `equal-earth` | `[0, ∞)` t = 0 |
-| `equal` | `[0,5)` t = 0 · `[5,6)` t = ⅓ · `[6,7)` t = ⅔ · `[7,∞)` t = 1 |
-| `mercator`, `globe` | none — the plugin is inactive and the style is untouched |
+**Transition** `{ from = 4, to = 8, steps = 6 }` (configurable; `steps ≥ 2`). With spacing
+`s = (to − from) / (steps − 1)` and boundaries `b_k = from + (k − 1)·s` for `k = 1 … steps`:
 
-The `equal` boundaries follow style-spec#1623's
-`["interpolate", ["linear"], ["zoom"], 5, "equal-earth", 7, "mercator"]`. The t = 1 band uses
-the **original source** and never touches the protocol.
+| Band `k` | Zoom range | `t` | Source |
+|---|---|---|---|
+| 0 | `[−∞, b_1)` | 0 | `eqearth://` copy, blend 0 |
+| `1 … steps − 1` | `[b_k, b_{k+1})` | `k / steps` | `eqearth://` copy, blend `k/steps` |
+| `steps` | `[b_steps, ∞)` | 1 | the **original** source, untouched |
+
+Default: boundaries z4.0, 4.8, 5.6, 6.4, 7.2, 8.0; blends ⅙ … ⅚; Mercator from z8. `equal-earth`
+is a single band `[−∞, ∞)` at t = 0. `mercator` and `globe` have no bands: the plugin is inactive
+and the style untouched. The spike settled the trade-off behind the default: the geometry
+change per step shrinks as 1/steps while the number of label re-placements grows with steps,
+and the range z4–z8 spreads the steps out so a zoom gesture rarely crosses two.
+
+The **continuous blend** `t(z) = clamp((z − from)/s + ½, 0, steps) / steps` is what a
+per-vertex renderer would show; it equals band `k`'s blend at the band's midpoint and is the
+reference the camera compensation (§4) steers towards. It is 0 below `from − s/2` and 1 above
+`to + s/2`.
 
 **One source per band.** MapLibre draws placeholder tiles from other zooms of the *same*
-source only. Giving each band its own source guarantees that a placeholder always carries its
-own band's `t`. Each band's vector layers are copies of the original layers, with
-`minzoom`/`maxzoom` clamped to the band. A layer is copied only into the bands its own zoom
-range overlaps, so Liberty's z ≥ 7 layers are never copied. The expected total is ~250–300
-layers; the spike measures the real figure.
+source only, so each band has its own source and a placeholder always carries its own `t`.
+Each band's vector layers are copies of the original layers with the suffix `__b<k>`; a layer
+is copied only into bands its own zoom range overlaps.
 
-**Prefetch.** One hidden layer per non-first band (for example a `fill` with `filter: false`)
-references that band's source from `bandStart − 1`. When the camera enters the band, its tiles
-are already loaded and are drawn overzoomed in the correct geometry.
+**Parse early, show late.** MapLibre's worker parses a layer into a tile only when
+`floor(minzoom) ≤ z < maxzoom`, so a copy whose range begins at its band boundary has nothing
+drawable in tiles loaded before the crossing (spike finding 3: a ~2 s blank at every step).
+Therefore a copy's **zoom range is only the parse range**: the band's range widened by one
+spacing `s` on each side, clamped to the layer's own range. Whether a copy is *shown* is a
+runtime decision (§4) carried by **global state**:
+
+- `fill`, `line`, `fill-extrusion` copies: the opacity property becomes
+  `["case", ["global-state", "eqe-show-<k>"], <original value>, 0]` (zoom curves keep `zoom`
+  at the top level by wrapping each stop output), with a 250 ms paint transition unless the
+  layer declares its own. Flipping the state is a paint update: main thread, no re-parse.
+- `symbol` copies: `layout.visibility` becomes
+  `["case", ["global-state", "eqe-sym-<k>"], "visible", "none"]`. Transparent labels would
+  still take part in collision, so symbols must really be hidden, which re-parses (not
+  re-warps) the two affected sources. Their `text-opacity`/`icon-opacity` are gated like paint
+  above, so the outgoing band's labels fade before they are hidden.
+- `raster` layers (relief) exist only in the Mercator band, gated by `eqe-show-<steps>`.
+- The rewritten style declares `state` defaults so a fresh style renders the band of its
+  initial zoom; the Mercator band's original layers are gated the same way as copies.
+
+The spec's earlier hidden *prefetch layers* are dropped: they load tiles but cannot make them
+drawable.
 
 ### Components
 
 | Module | Status | Responsibility |
 |---|---|---|
-| `math/backproject.ts` | extend | `geographicToMapWorld(p, t = 0)`; inverse `mapWorldToGeographic(w, t = 0)`, closed form at t ∈ {0, 1}, 1-D bisection on latitude otherwise (northing depends on latitude alone); `worldYRange(t)`, `mapSpaceMaxLatitude(t)` |
-| `math/subdivide.ts` | extend | densify/warp take `t` |
-| `tiles/protocol.ts` | extend | `t` encoded in the source config; pole snapping (§5) during decode |
-| `tiles/tile-cover.ts` | extend | pre-image under `world_t`; relative `sourceZoomOffset` |
-| `tiles/cache.ts` | extend | persistent tier (§6) |
-| `map/camera.ts` | generalise | `ThresholdCamera` → `BandCamera` (§4); `cameraHookAccess` bridges v5's property and v6's setter |
-| `map/constrain.ts` | extend | world bounds per band |
-| `map/bands.ts` | new | pure: projection spec → band list |
-| `map/style-rewrite.ts` | new | pure: (style, bands, options) → rewritten style (sources, layer copies, prefetch layers, raster suppression, world polygon, outline, graticule) |
-| `map/controller.ts` | new | per-map state machine: intercepts `setProjection`/`getProjection`, listens to `projectiontransition` and `styledata`, applies and restores the rewrite, toggles `renderWorldCopies` |
-| `map/geo-api.ts` | new | per-instance wrappers and GeoJSON fan-out (§7) |
-| `map/graticule.ts` | moved | from `demo/graticule.ts` |
-| `control.ts` | new | `EqualEarthControl`, modelled on `GlobeControl` |
-| `install.ts` | new | `installEqualEarth(maplibregl, options)`: version gate, native detection, worker loading (§8) |
+| `math/backproject.ts` | done | `geographicToMap(p, t)`, `mapToGeographic(w, t)`, `worldYRange(t)`, `mapSpaceMaxLatitude(t)` |
+| `math/jacobian.ts` | new | local 2×2 Jacobian of `world_t` against Mercator at a point; its rotation and isotropic scale; `similarityOffsets` (§4) |
+| `math/antimeridian.ts` | done | clip to lng [−180, 180] before warping |
+| `tiles/protocol.ts` | extend | `blend` in the source config (done); decoded-tile sharing across bands (§6) |
+| `tiles/clip.ts` | new | direct polygon/line/point clipping to the buffered output tile, replacing geojson-vt (§6) |
+| `map/bands.ts` | extend | `Band`, `validateBands`, `bandIndexForZoom` (done); `transitionBands`, `continuousBlend`, `parseRange`, `bandSourceId` |
+| `map/camera.ts` | extend | `BandCamera`: baseline model (done) + similarity compensation + a band *selector* hook (§4) |
+| `map/switcher.ts` | new | ready-gated band selection, hysteresis, dwell, global-state flips, symbol fade sequence |
+| `map/constrain.ts` | done | world bounds per band |
+| `map/style-rewrite.ts` | new | pure: (style, bands, options) → rewritten style (sources, copies, parse ranges, global-state gating, transitions, raster gating, `state` defaults) |
+| `map/controller.ts` | new | per-map: intercepts `setProjection`/`getProjection`, listens to `projectiontransition` and `styledata`, applies and restores the rewrite, owns camera + switcher + constrain, toggles `renderWorldCopies` |
+| `map/geo-api.ts` | new (Plan 3) | per-instance wrappers and GeoJSON fan-out (§7) |
+| `map/graticule.ts` | moved (Plan 3) | from `demo/graticule.ts` |
+| `control.ts` | new (Plan 3) | `EqualEarthControl`, modelled on `GlobeControl` |
+| `install.ts` | new | `installEqualEarth(maplibregl, options)`: version gate, worker loading, worker count (§8, §6) |
 
-Every new `map/` module keeps the existing rule: types are structural and there is no import
-of `maplibre-gl`, so it can be tested with plain fakes. `bands` and `style-rewrite` are pure
-functions.
+Every `map/` module keeps the rule: types are structural and there is no runtime import of
+`maplibre-gl`, so it can be tested with plain fakes. `bands`, `style-rewrite` and `jacobian`
+are pure.
 
 ### Data flow
 
 ```
-setProjection({type})  → controller → bands(type) → styleRewrite(originalStyle, bands)
-                       → map.setStyle(rewritten, {diff: true})
+setProjection({type})  → controller → bands(type, transition) → styleRewrite(originalStyle, bands)
+                       → map.setStyle(rewritten, {diff: true}); switcher.start(initialBand)
+camera frame           → BandCamera hook: requested zoom/bearing (minus baseline offsets)
+                       → switcher.decide(zoom) → shown band (may flip global state)
+                       → centre converted baseline band → shown band; + similarity offsets
 tile request           → eqearth://<config incl. t>/{z}/{x}/{y} → worker
-                       → cover → fetch (memory LRU → persistent cache → network)
-                       → decode + pole snap → densify + warp_t → reslice → MVT
+                       → cover → fetch (memory LRU → network) → decode once per source tile
+                       → densify + warp_t → clip → MVT
 ```
 
 ## 4. Transition and camera
 
-**`BandCamera`** replaces `ThresholdCamera`. It converts relative to a *baseline* band: the
-band of the rendered zoom when MapLibre's requested camera state was created. That baseline
-is reset on the `moveend` that deletes the state. This is needed because every frame of a
-gesture or animation hands the hook the unconverted requested state, not its own previous
-output. On v6, only the Camera's own `moveend` deletes that state, so the baseline follows
-that event and not the Map's. It keeps the state seeded in the constructor, the chaining to
-the host's previous hook and the careful `destroy()`, and accepts a list of band boundaries
-instead of one `switchZoom`. On any update whose zoom falls in a different band from the
-baseline:
+### 4.1 Centre continuity (done in Plan 1)
+
+`BandCamera` converts the camera centre relative to a *baseline* band: the band of the rendered
+transform when MapLibre's requested camera state `R` was created. Every frame of a gesture or
+animation hands the hook the unconverted `R`, never the hook's previous output, so the hook is
+a pure function of `R` and the baseline; the baseline is reset on the `moveend` that deletes
+`R` (on v6 the Camera's own; the plugin closes v6's Map-`moveend` gap itself). A gesture that
+interrupts an ease renders a detached `R`, recognised by the absent `_requestedCameraState`
+and converted from the previous baseline. CLAUDE.md "ThresholdCamera: why it looks the way it
+does" is the authoritative description; `tests/band-camera.test.ts` and `tests/camera.test.ts`
+pin it with fakes that model the real mechanism.
+
+Conversion: `geographic = mapToGeographic(centre, t_baseline)`;
+`centre' = geographicToMap(geographic, t_shown)`; one conversion however many bands apart.
+
+### 4.2 What a step does to the picture, and what the camera can absorb
+
+With the centre pinned, a step from `t_a` to `t_b` moves a feature at screen offset `d` from
+the centre by `(M_b − M_a)·d` to first order, where `M_t = J_t·J_1⁻¹` is the local Jacobian
+of the blended warp relative to Mercator at the centre. It does not depend on zoom. Measured
+(spike), 300 px from the centre, six steps: Zürich ≈ 20 px, San Francisco ≈ 30 px, Anchorage
+40–125 px per step. Reducing it by step count alone would need 100+ steps.
+
+Because the blend is linear in world space, `M_t = (1 − t)·M_0 + t·I`. Polar-decompose `M`
+into a rotation `θ(M)` and an isotropic scale `σ(M) = √|det M|`; the rest is shear. The
+camera can absorb the rotation and the scale, **continuously**:
 
 ```
-geographic = mapToGeographic(centre, tOld)     // leave the old band's map space
-centre'    = geographicToMap(geographic, tNew) // enter the new band's map space
+θ*(z, c) = θ(M_{t(z)}(c))      σ*(z, c) = σ(M_{t(z)}(c))      // what a continuous blend would show
+Δbearing = θ* − θ(M_{t_shown}(c))      Δzoom = log2(σ* / σ(M_{t_shown}(c)))
 ```
 
-Both functions generalise the existing exports with a `t` parameter (default 0, today's
-behaviour); at t = 1 they are the identity. When several bands
-are crossed in one update (`flyTo` z3 → z10), it converts once, directly from `tOld` to `tNew`.
+`t(z)` is the continuous blend (§3). Within a band the offsets vary smoothly with zoom (the
+picture rotates and scales as it would under a per-vertex renderer); at a crossing the shown
+band's `θ`, `σ` jump and the offsets jump by the opposite amount, so the frame at the centre
+is continuous. Only shear snaps: measured residual at 300 px, six steps: Zürich ≈ 7 px, San
+Francisco ≈ 16 px, Anchorage 18–65 px, Singapore ≈ 7 px. Offsets are zero outside
+`[from − s/2, to + s/2]`, bounded by half a step inside it (≤ 0.07 zoom, ≤ 3° at Anchorage for
+six steps), and switchable: `compensate: 'none' | 'zoom' | 'zoom+bearing'` (default
+`'zoom+bearing'`). The sign convention is pinned by a test, not by prose: with compensation
+the largest of four 300 px probes must move less than 60 % of its uncompensated displacement
+at San Francisco and Zürich.
 
-- **Zoom is not compensated.** The per-step scale jump is roughly a third of the table's
-  "zoom jump" column. Changing it would break zoom-driven style expressions.
-- **Known residual.** With scroll-zoom the anchor is the pointer, which `transformCameraUpdate`
-  cannot see, so the point under the pointer drifts by about (step difference × distance from
-  centre). The 1 px criterion applies to the centre; the spike measures pointer drift.
-- **Inverse accuracy.** Measured and tested: < 1e-9° for |lat| ≤ 82.5°, < 1e-5° (≈1 m) at the poles, where the northing's derivative vanishes and precision is limited by the projection itself. Out-of-band points return NaN; the camera clamps before converting.
+The rendered zoom and bearing therefore differ from the requested ones mid-transition. `R` is
+cloned from the rendered transform, so the hook must not compensate twice: alongside the
+baseline band it keeps the **baseline offsets** (the offsets in effect when `R` was created,
+i.e. the last ones it returned before the `moveend`), subtracts them from `R` to recover the
+requested zoom and bearing, decides the band on the requested zoom, and adds the new offsets.
+An application's `jumpTo({ zoom })` or `setBearing(0)` mid-transition is read as requested
+values and lands within half a step's offset of what it asked for; `getZoom()`/`getBearing()`
+return rendered values. Both are documented; Plan 3's geo API may expose requested values.
 
-**Visual spike (the first task of the plan, throwaway code).** Hard-code the three `equal`
-steps on the Liberty demo; fly to Tokyo, San Francisco, Anchorage and Zürich; record a screen
-capture of each step, pointer drift, and the rewritten layer count.
-**Fail condition:** if a single step is still clearly jarring at Tokyo, stop and revisit this
-section before building production code; the first fallback is six finer steps across z4–z8.
+### 4.3 Switch only when the next step is ready
+
+The shown band is runtime state owned by `map/switcher.ts`, decided in the camera hook
+(`BandCamera` takes a *band selector* instead of deriving the band from zoom) so the camera
+conversion and the style flip happen in the same frame. Rules, evaluated on the requested zoom:
+
+1. `target = bandIndexForZoom(z)`, with **hysteresis** `h = 0.1`: within `h` below a boundary
+   the previous band is kept, so a zoom hovering at a boundary does not flip back and forth.
+2. If `target === shown`: nothing.
+3. Otherwise walk from `target` towards `shown`; the first band `k` whose layers are parsed at
+   `z` (parse range, §3) **and** whose source reports `isSourceLoaded` (every in-view tile has
+   data or errored) is shown. The Mercator band's readiness is the original source's.
+4. If none is ready and `shown` is still parsed at `z`: **hold** (the map keeps drawing the old
+   band; the user sees a slightly late step, never a hole).
+5. If `shown` is no longer parsed at `z` (the zoom outran tile production by more than one
+   spacing): **forced** switch to the parsed band nearest `target` that is loaded, else `target`.
+6. A **minimum dwell** of 300 ms between switches, except forced ones, so a fast zoom through
+   several bands does not cascade one blink per band.
+
+A switch flips `eqe-show-<old>` off and `eqe-show-<new>` on (paint cross-fade), sets
+`eqe-sym-<new>` on (re-parse begins; labels fade in as placed) and `eqe-sym-<old>` off after
+one fade (300 ms), so labels cross-fade rather than blink. While the map is idle no camera
+frame runs the hook, so when a waited-for band becomes loaded (`sourcedata`) the switcher asks
+the camera to run one update (`host.jumpTo({})`, which fires `movestart`/`moveend` as any
+camera change does — documented). Readiness and band parse ranges come from public API
+(`isSourceLoaded`, the rewritten style); nothing reads MapLibre's private tile caches.
+
+**Known residuals.** (a) The pointer, not the centre, is the anchor of a scroll zoom; the hook
+cannot see it, so the point under the pointer moves by about the compensated residual × its
+distance from the centre at each step. (b) Labels of the outgoing band may win collision
+against the incoming band's for one fade when zooming out. (c) Zooming out reveals new edge
+area that is empty until its tiles arrive, as in plain MapLibre, slower here.
+
+**What this cannot reach.** A transition that is imperceptible everywhere on screen needs
+per-vertex interpolation in the renderer, as MapLibre's globe transition does
+(maplibre-gl-js#8330). The polyfill is shaped to be deleted when that lands.
 
 ## 5. Cartographic finish
 
@@ -212,8 +302,25 @@ section before building production code; the first fallback is six finer steps a
 - **Labels** need nothing: the renderer believes it is Mercator, so text stays upright and
   collision works normally.
 
-## 6. Fast first paint
+## 6. Fast first paint and tile throughput
 
+Throughput is a transition requirement, not an optimisation: a step is shown only when its
+tiles are drawable (§4.3), so slow tiles mean late steps. Measured (spike): 100–750 ms warp per
+band tile in Node, 12–20 tiles per screen, up to three band sources live per tile position, and
+MapLibre runs **one** tile worker by default (except Safari).
+
+- **Workers.** `installEqualEarth` sets `setWorkerCount(max(2, min(4, ⌊hardwareConcurrency/2⌋)))`
+  when the count is still MapLibre's default of 1, before any `Map` exists; option
+  `workers: number | false`.
+- **Decode once per source tile.** The geographic decode does not depend on the blend; a
+  worker-local bounded cache of decoded source tiles (by URL) serves every band and every
+  overlapping output tile. The byte LRU of raw tiles remains for the fetch tier.
+- **Direct clip.** geojson-vt builds a tile index per output tile and layer; it is replaced by
+  `tiles/clip.ts`: Sutherland–Hodgman per ring against the buffered tile rectangle (holes stay
+  separate rings, orientation is preserved), Liang–Barsky per line segment with run merging,
+  a bounds test for points, then the existing vt-pbf encoder fed the same tile structure.
+  Measured before merging on fixture tiles: identical feature counts per layer and ring areas
+  within 0.1 % of the geojson-vt output, and a timing table in the probe.
 - **Existing:** worker-side warping, the byte-bounded LRU, and request coalescing.
 - **Persistent output-tile cache.** Cache Storage inside the worker. Key:
   `pluginVersion / hash(source config) / t / z / x / y`, where the hash covers the upstream
@@ -311,20 +418,32 @@ first-paint marks in the demo against OpenFreeMap and SmartMaps.
 
 ## 9. Delivery order
 
-1. Worker bundle fix (`worker.mjs` + `worker.iife.js` + guard). Independent of everything else
-   and fixes a real bug.
-2. **Visual spike** (§4). Go/no-go for the band design.
-3. `world_t`, Newton inverse, `BandCamera`, per-band constrain.
-4. `bands`, `style-rewrite`, `controller`, `installEqualEarth`, `EqualEarthControl`.
-5. Cartographic finish (§5), including the seam measurement.
-6. Geo API audit, then `geo-api` and GeoJSON fan-out.
-7. Persistent cache, `sourceZoomOffset`, probe budget mode.
-8. Browser test matrix, then demos (OpenFreeMap Liberty + SmartMaps) and the README.
+Plan 1 (done): 1. worker bundles; 2. visual spike (GO, amended); 3. `world_t`, inverse,
+`BandCamera` centre continuity, per-band constrain, antimeridian clip.
+
+Plan 2 (smooth transition, end to end on the Liberty demo):
+4. `bands` transition model; `jacobian` and similarity compensation in `BandCamera`.
+5. `style-rewrite` with parse ranges, global-state gating and transitions; `switcher`.
+6. `controller` (`setProjection` polyfill, `styledata`, restore), `installEqualEarth`
+   (version gate, worker loading, worker count).
+7. Throughput: decoded-tile sharing, direct clip replacing geojson-vt.
+8. Demo `demo/transition.html` on OpenFreeMap Liberty replacing the spike, with a committed
+   headless probe (`scripts/probe-transition.mjs`, needs local Chrome, not part of `verify`)
+   that measures centre drift, holes and switch latency per step.
+
+Plan 3: cartographic finish (§5); `EqualEarthControl`; geo API audit, `geo-api`, GeoJSON
+fan-out (§7); persistent cache and `sourceZoomOffset` (§6); browser test matrix on v5.24 and
+v6.6; SmartMaps demo; README.
 
 ## 10. Risks
 
-- **Stepped blend still looks jarring** → the spike's fail condition is the gate; the fallback
-  is finer steps.
+- **Steps still look jarring after compensation and cross-fade** → the demo lets the human
+  compare `steps`, `from`, `to`; the residual is shear, which only in-renderer interpolation
+  removes (#8330). Recorded as a product decision, not a plan item.
+- **Tile throughput too low for the gate on slow devices** → steps arrive late (held), never
+  blank; §6's three measures; `steps` can be lowered per deployment.
+- **Global state in `visibility` re-parses on every switch** → bounded to the two affected
+  sources; measured in the demo probe as switch latency.
 - **Layer count from band duplication** hurts style parse or render time → measured in the
   spike; copying only into overlapping bands keeps it bounded.
 - **Wrapper double conversion** → the audit comes before implementation; browser tests pin it.
