@@ -401,6 +401,26 @@ describe('mergeLayers', () => {
     expect(merged.get('place')).toEqual([withCopy]);
   });
 
+  it('drops only the already-seen positions of a MultiPoint, leaving its input untouched', () => {
+    const multi: GeoJSON.Feature<GeoJSON.MultiPoint> = {
+      type: 'Feature',
+      id: 7,
+      properties: { name: 'label' },
+      geometry: { type: 'MultiPoint', coordinates: [[10, 20], [30, 40], [-350, 20]] },
+    };
+    const merged = mergeLayers([
+      new Map([['place', [point(7, [10, 20])]]]),
+      new Map([['place', [multi]]]),
+    ]).get('place')!;
+
+    expect(merged).toHaveLength(2);
+    expect(merged[1]!.id).toBe(7);
+    expect(merged[1]!.properties).toEqual({ name: 'label' });
+    // The seen position goes, and so does the world copy, which the warp would drop anyway.
+    expect(merged[1]!.geometry).toEqual({ type: 'MultiPoint', coordinates: [[30, 40]] });
+    expect(multi.geometry.coordinates).toHaveLength(3);
+  });
+
   it('dedupes per layer, not across layers', () => {
     const merged = mergeLayers([
       new Map([['a', [point(7, [10, 20])]]]),
