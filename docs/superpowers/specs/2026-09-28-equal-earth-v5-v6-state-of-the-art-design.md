@@ -275,6 +275,10 @@ frame runs the hook, so when a waited-for band becomes loaded (`sourcedata`) the
 the camera to run one update (`host.jumpTo({})`, which fires `movestart`/`moveend` as any
 camera change does — documented). Readiness and band parse ranges come from public API
 (`isSourceLoaded`, the rewritten style); nothing reads MapLibre's private tile caches.
+`isSourceLoaded` is vacuously `true` for a source that no layer used at the last render (a
+band whose copies were all outside their zoom range), so a band counts as ready only if it was
+also parsed at the previous frame's zoom — otherwise an app's `jumpTo` across several bands
+would switch onto a band whose tiles were never requested.
 
 **Known residuals.** (a) The pointer, not the centre, is the anchor of a scroll zoom; the hook
 cannot see it, so the point under the pointer moves by about the compensated residual × its
