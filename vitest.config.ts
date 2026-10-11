@@ -4,5 +4,7 @@ export default defineConfig({
   test: {
     environment: 'node',
     include: ['tests/**/*.test.ts'],
+    // Playwright's: `npm run test:browser`.
+    exclude: ['tests/browser/**', 'node_modules/**'],
   },
 });

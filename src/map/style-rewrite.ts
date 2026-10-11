@@ -190,6 +190,43 @@ function gateCopy(
   };
 }
 
+/**
+ * `original`, ready to be restored over `live` with a diffed `setStyle`.
+ *
+ * MapLibre's diff turns a changed zoom range into `setLayerZoomRange(id, minzoom, maxzoom)`,
+ * which skips an absent bound (`style/style.ts`: `if (minzoom != null)`), so it cannot take a
+ * bound away. A layer the rewrite bounded under its own id (the Mercator band keeps the original
+ * id, from its parse range up) would keep the band's `minzoom` after the restore, and draw
+ * nothing below it. Such a layer gets MapLibre's default bound explicitly, `minzoom: 0` or
+ * `maxzoom: 24`, which draws the same as none. Returns `original` itself when no layer needs it.
+ */
+export function restorableStyle(original: StyleLike, live: StyleLike | undefined): StyleLike {
+  if (!live) return original;
+  const bounded = new Map(live.layers.map((layer) => [layer.id, layer]));
+  const needs = (layer: StyleLayerLike): { min: boolean; max: boolean } => {
+    const now = bounded.get(layer.id);
+    // A changed type, source or source layer is removed and re-added, not diffed.
+    const diffed =
+      now !== undefined &&
+      now.type === layer.type &&
+      now.source === layer.source &&
+      now['source-layer'] === layer['source-layer'];
+    return {
+      min: diffed && layer.minzoom === undefined && now.minzoom !== undefined,
+      max: diffed && layer.maxzoom === undefined && now.maxzoom !== undefined,
+    };
+  };
+  if (!original.layers.some((layer) => Object.values(needs(layer)).some(Boolean))) return original;
+  return {
+    ...original,
+    layers: original.layers.map((layer) => {
+      const { min, max } = needs(layer);
+      if (!min && !max) return layer;
+      return { ...layer, ...(min ? { minzoom: 0 } : {}), ...(max ? { maxzoom: 24 } : {}) };
+    }),
+  };
+}
+
 export function rewriteStyle(original: StyleLike, options: RewriteOptions): RewrittenStyle {
   const { bands, transition, templates } = options;
   if (original.metadata?.[REWRITTEN_METADATA_KEY]) {

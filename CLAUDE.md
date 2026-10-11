@@ -6,11 +6,12 @@ repository.
 ## Commands
 
 ```
-npm run verify     # lint + typecheck + test + build + check:exports: run before claiming done
+npm run verify     # lint + typecheck + test + build + check:exports + test:browser: run before claiming done
 npm run dev        # Vite dev server for the demo pages
 npm run build:js   # bundles only, no .d.ts: refreshes dist/worker.mjs, which the demos load
 npm run probe:transition  # headless-Chrome probe of demo/transition.html; not part of verify
 npm test           # vitest run
+npm run test:browser  # Playwright on MapLibre 6.6 and 5.24, SwiftShader; ~1–3 min; needs a fresh build
 npm run test:watch # vitest watch mode
 npm run lint       # eslint (type-aware, .ts only)
 npm run typecheck  # tsc --noEmit over src, tests, demo
@@ -19,6 +20,16 @@ npm run build      # vite build (ESM bundle) + tsc (.d.ts emit) → dist/
 
 Single test file: `npx vitest run tests/camera.test.ts`.
 Single test by name: `npx vitest run tests/camera.test.ts -t "crossing upward"`.
+Single browser spec: `npx playwright test --config tests/browser/playwright.config.ts baseline.spec.ts --project v6`.
+
+`npm run test:browser` (`tests/browser/`) runs every `*.spec.ts` against both majors (projects
+`v6` and `v5`) in headless Chromium through SwiftShader. Its config starts its own Vite server on
+port 5179 (`tests/browser/vite.config.ts`, not the demo's 5173) serving the harness page, `src/`
+through Vite, the worker bundles from `/dist/` (hence the build first; `verify` orders it) and
+offline fixture tiles generated in memory (`fixture-tiles.ts`, `Cache-Control: no-store`). Specs
+convert geographic positions only through the helpers in `tests/browser/helpers.ts`. The
+Chromium revision must match the pinned `@playwright/test` (1.62.1 → `chromium_headless_shell-1234`
+in `%LOCALAPPDATA%\ms-playwright`); `npx playwright install chromium` needs the network.
 
 `npm run build` is two steps because Vite emits the bundle and `tsc -p tsconfig.build.json`
 emits declarations separately. `npm run check:exports` runs two guards over the build.
@@ -110,7 +121,9 @@ affects the absolute metre values from `toEqualEarth`.
   prior expression against the live state, so a `global-state` flip can never cross-fade.
   Symbol, hillshade and color-relief copies are also hidden by `visibility: "none"`
   (`LayerGate.hideByVisibility`): transparent labels still collide, and a `basic` hillshade still tints
-  at exaggeration 0.
+  at exaggeration 0. `restorableStyle` prepares the original for the diffed restore: MapLibre's
+  `setLayerZoomRange` skips an absent bound, so a layer the Mercator band bounded under its own
+  id is restored with an explicit `minzoom: 0` (it would otherwise keep the band's minzoom).
 - `src/map/switcher.ts` — `BandSwitcher`, the band selector: which band is *shown* is runtime
   state, moved only when the target band's sources report `isSourceLoaded`. Readiness is
   judged at the last *rendered* zoom, because `isSourceLoaded` is vacuously true for a source

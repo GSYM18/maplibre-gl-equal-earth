@@ -2,10 +2,11 @@ import { readFileSync } from 'node:fs';
 import { validateStyleMin } from '@maplibre/maplibre-gl-style-spec';
 import { describe, expect, it } from 'vitest';
 
-import { resolveTransition } from '../src/map/bands.js';
+import { EQUAL_EARTH_BANDS, resolveTransition } from '../src/map/bands.js';
 import {
   REWRITTEN_METADATA_KEY,
   applyGate,
+  restorableStyle,
   rewriteStyle,
   type GateHost,
   type LayerGate,
@@ -399,5 +400,33 @@ describe('applyGate', () => {
     applyGate(a, fill, 'hidden');
     applyGate(b, fill, 'fading');
     expect(a.calls).toEqual(b.calls);
+  });
+});
+
+describe('restorableStyle', () => {
+  it('bounds a layer explicitly where the rewrite bounded it in place and the original did not', () => {
+    const original = tiny(vec('water', 'fill'), vec('road', 'line', { minzoom: 3 }), vec('river', 'line', { maxzoom: 9 }));
+    const live = rewrite(original).style;
+    // The Mercator band keeps the original ids, ranged from its parse range up.
+    expect(live.layers.find((l) => l.id === 'water')!.minzoom).toBeGreaterThan(0);
+    const restorable = restorableStyle(original, live);
+    // A diffed setStyle cannot remove a bound (`setLayerZoomRange` skips an absent one): 0 can.
+    expect(restorable.layers.find((l) => l.id === 'water')).toMatchObject({ minzoom: 0 });
+    expect(restorable.layers.find((l) => l.id === 'water')!.maxzoom).toBeUndefined();
+    expect(restorable.layers.find((l) => l.id === 'road')!.minzoom).toBe(3);
+    expect(restorable.layers.find((l) => l.id === 'river')).toMatchObject({ minzoom: 0, maxzoom: 9 });
+    // Nothing else changes, and the original is not mutated.
+    const normalised = (style: StyleLike) => style.layers.map((l) => ({ ...l, minzoom: l.minzoom ?? 0 }));
+    expect(normalised(restorable)).toEqual(normalised(original));
+    expect(original.layers[0]!.minzoom).toBeUndefined();
+  });
+
+  it('returns the original itself when nothing needs a bound', () => {
+    const original = tiny(vec('water', 'fill'));
+    expect(restorableStyle(original, original)).toBe(original);
+    expect(restorableStyle(original, undefined)).toBe(original);
+    // Pure Equal Earth renames every copy: the originals are re-added, not diffed.
+    const pure = rewriteStyle(original, { bands: EQUAL_EARTH_BANDS, transition: null, templates: TEMPLATES, initialZoom: 2 }).style;
+    expect(restorableStyle(original, pure)).toBe(original);
   });
 });

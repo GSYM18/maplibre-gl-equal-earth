@@ -618,7 +618,18 @@ export class FakeControllerHost extends FakeV6Map {
     }
     // A diff with no operations changes nothing and fires nothing.
     if (JSON.stringify(this.style) === JSON.stringify(style)) return this;
+    const before = new Map(this.style.layers.map((layer) => [layer.id, layer]));
     this.style = structuredClone(style);
+    // A changed zoom range diffs to `setLayerZoomRange(id, minzoom, maxzoom)`, which skips an
+    // absent bound (`style/style.ts` `setLayerZoomRange`: `if (minzoom != null)`): a layer kept
+    // under its id keeps the bound the new style leaves out.
+    for (const layer of this.style.layers) {
+      const old = before.get(layer.id);
+      const replaced = !old || old.type !== layer.type || old.source !== layer.source || old['source-layer'] !== layer['source-layer'];
+      if (replaced) continue; // removed and re-added, not diffed
+      if (layer.minzoom === undefined && old.minzoom !== undefined) layer.minzoom = old.minzoom;
+      if (layer.maxzoom === undefined && old.maxzoom !== undefined) layer.maxzoom = old.maxzoom;
+    }
     this.#styleChanged = true;
     this.fireMapEvent('style.load');
     return this;
