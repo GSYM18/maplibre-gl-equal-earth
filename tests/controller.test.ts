@@ -711,4 +711,44 @@ describe('EqualEarthController', () => {
       await expect(controller.activate('equal')).rejects.toThrow(/destroyed/);
     });
   });
+
+  describe('unwarped layers notice', () => {
+    async function fresh() {
+      vi.resetModules();
+      const mod = await import('../src/map/controller.js');
+      const make = (style: StyleLike) => {
+        const host = new FakeControllerHost(TOKYO, 4.6);
+        host.style = style;
+        return new mod.EqualEarthController(host, { lngLatFactory, fetchJson: async () => TILEJSON });
+      };
+      return make;
+    }
+
+    it('logs once per page when the style has raster layers', async () => {
+      const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+      try {
+        const make = await fresh();
+        await make(liberty()).activate('equal');
+        const raster = info.mock.calls.filter((c) => String(c[0]).includes('raster'));
+        expect(raster).toHaveLength(1);
+        await make(liberty()).activate('equal');
+        expect(info.mock.calls.filter((c) => String(c[0]).includes('raster'))).toHaveLength(1);
+      } finally {
+        info.mockRestore();
+      }
+    });
+
+    it('logs nothing for a style without raster, hillshade or color-relief', async () => {
+      const info = vi.spyOn(console, 'info').mockImplementation(() => undefined);
+      try {
+        const make = await fresh();
+        const style = liberty();
+        style.layers = style.layers.filter((l) => !['raster', 'hillshade', 'color-relief'].includes(l.type));
+        await make(style).activate('equal');
+        expect(info).not.toHaveBeenCalled();
+      } finally {
+        info.mockRestore();
+      }
+    });
+  });
 });

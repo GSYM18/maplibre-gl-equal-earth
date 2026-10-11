@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest';
+import geojsonvt from 'geojson-vt';
 
 import {
   geographicToMap,
   geographicToMapWorld,
   mapToGeographic,
+  MERCATOR_MAX_LATITUDE,
   WORLD_Y_MAX,
   WORLD_Y_MIN,
+  worldYRange,
 } from '../src/math/backproject.js';
 import { densify, toleranceForZoom } from '../src/math/subdivide.js';
 import {
@@ -27,6 +30,18 @@ import { PbfReader } from 'pbf';
 import { fromGeojsonVt } from 'vt-pbf';
 
 /* ------------------------------------------------------------------ helpers */
+
+/** Encode geographic GeoJSON geometries, per layer, into the MVT of `tile` (extent 4096, buffer 64). */
+function encodeTile(layers: Record<string, GeoJSON.Geometry[]>, tile: TileId): Uint8Array {
+  const encoded: Record<string, unknown> = {};
+  for (const [name, geometries] of Object.entries(layers)) {
+    const fc: GeoJSON.FeatureCollection = { type: 'FeatureCollection', features: geometries.map((geometry) => ({ type: 'Feature', properties: {}, geometry })) };
+    const index = geojsonvt(fc, { maxZoom: Math.max(tile.z, 1), indexMaxZoom: 0, tolerance: 0, extent: 4096, buffer: 64, debug: 0 });
+    const t = index.getTile(tile.z, tile.x, tile.y);
+    if (t && t.features.length > 0) encoded[name] = t;
+  }
+  return fromGeojsonVt(encoded as Parameters<typeof fromGeojsonVt>[0], { version: 2, extent: 4096 });
+}
 
 function countVertices(encoded: Uint8Array): number {
   if (encoded.byteLength === 0) return 0;
@@ -586,5 +601,36 @@ describe('geometry beyond the antimeridian', () => {
     // western half. (geojson-vt also copied it into the undrawn western buffer at x <= 0; the
     // direct clip does not wrap at all.)
     expect(xs.filter((x) => x > 0 && x < 2048)).toEqual([]);
+  });
+});
+
+describe('pole snapping', () => {
+  const top = MERCATOR_MAX_LATITUDE;
+  const polar = (): Uint8Array =>
+    encodeTile({
+      water: [{ type: 'Polygon', coordinates: [[[-180, 80], [180, 80], [180, top], [-180, top], [-180, 80]]] }],
+      boundary: [{ type: 'LineString', coordinates: [[-10, top], [10, top]] }],
+    }, { z: 0, x: 0, y: 0 });
+
+  it('snaps polygon vertices on the Mercator edge of a z0 tile to the pole, and leaves lines alone', () => {
+    const layers = decodeToGeographic(polar(), { z: 0, x: 0, y: 0 });
+    const ring = (layers.get('water')![0]!.geometry as GeoJSON.Polygon).coordinates[0]!;
+    expect(Math.max(...ring.map((p) => p[1]!))).toBe(90);
+    expect(ring.filter((p) => p[1] === 90)).toHaveLength(2);
+    const line = (layers.get('boundary')![0]!.geometry as GeoJSON.LineString).coordinates;
+    expect(line.every((p) => p[1]! < 90)).toBe(true);
+  });
+
+  it('warps a snapped polygon to the top of the Equal Earth world', () => {
+    const layers = decodeToGeographic(polar(), { z: 0, x: 0, y: 0 });
+    const out = buildTile(layers, { z: 0, x: 0, y: 0 }, { blend: 0 });
+    const layer = new VectorTile(new PbfReader(out)).layers['water']!;
+    const ys: number[] = [];
+    for (let i = 0; i < layer.length; i++) {
+      for (const ring of layer.feature(i).loadGeometry()) for (const p of ring) ys.push(p.y);
+    }
+    expect(ys.length).toBeGreaterThan(0);
+    const poleY = worldYRange(0)[0] * 4096;
+    expect(Math.abs(Math.min(...ys) - poleY)).toBeLessThanOrEqual(2);
   });
 });
