@@ -22,6 +22,7 @@ import {
   mapSpaceMaxLatitude,
   mapSpaceMaxLongitude,
   mapToGeographic,
+  wrapLongitude,
 } from '../math/backproject.js';
 import type { LngLatTuple } from '../math/equal-earth.js';
 import {
@@ -647,18 +648,6 @@ function thresholdBands(options: ThresholdCameraOptions): BandCameraOptions {
       { minZoom: switchZoom, blend: 1 },
     ],
   };
-}
-
-/**
- * Bring a longitude beyond ±180° back into range. ±180° itself is left alone: on Equal
- * Earth those are opposite edges of the map, not one meridian.
- */
-function wrapLongitude(lng: number): number {
-  if (!Number.isFinite(lng)) return lng;
-  // Closed form, not a loop: beyond 2^53 `lng - 360` is `lng`, so a loop never terminates.
-  if (lng > 180) return lng - 360 * Math.ceil((lng - 180) / 360);
-  if (lng < -180) return lng + 360 * Math.ceil((-180 - lng) / 360);
-  return lng;
 }
 
 /** Clamp to ±limit. NaN passes through, so a genuinely broken centre is still reported. */

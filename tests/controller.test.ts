@@ -165,6 +165,24 @@ describe('EqualEarthController', () => {
     expect(Math.abs(host.zoom - 4.95)).toBeLessThan(0.07);
   });
 
+  it('wraps a world-copy centre into [-180, 180] before converting it (M6)', async () => {
+    const at = (center: [number, number]) => {
+      const host = new FakeControllerHost(center, 4.6); // a world copy, with renderWorldCopies on
+      host.style = liberty();
+      return { host, controller: new EqualEarthController(host, { lngLatFactory, fetchJson: async () => TILEJSON }) };
+    };
+    const { host, controller } = at([TOKYO[0] + 360, TOKYO[1]]);
+    await controller.activate('equal');
+    const expected = geographicToMap(TOKYO, 1 / 6);
+    expect(host.center.lng).toBeCloseTo(expected[0], 9);
+    expect(host.center.lat).toBeCloseTo(expected[1], 9);
+    const west = at([190, 10]);
+    await west.controller.activate('equal');
+    const geographic = west.controller.toGeographic([west.host.center.lng, west.host.center.lat]);
+    expect(geographic[0]).toBeCloseTo(-170, 9);
+    expect(geographic[1]).toBeCloseTo(10, 9);
+  });
+
   it('does nothing when activated twice with the same type, and switches type in place', async () => {
     const { host, controller } = setup();
     await controller.activate('equal');
@@ -606,6 +624,30 @@ describe('EqualEarthController', () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
       expect(host.setStyleCalls).toHaveLength(setStyles);
       expect(controller.active).toBe(false);
+    });
+
+    it('settles an activation whose rebuild never loads because the map was removed (M2)', async () => {
+      const { host, controller } = setup();
+      host.deferStyleData = true; // our setStyle rebuilds; this rebuild will never load
+      const pending = controller.activate('equal');
+      await vi.waitFor(() => expect(host.setStyleCalls).toHaveLength(1));
+      controller.dispose();
+      await expect(pending).rejects.toMatchObject({ name: 'EqualEarthSupersededError' });
+      expect(host.listenerCount('style.load')).toBe(0);
+    });
+
+    it('settles an activation whose rebuild a deactivate abandoned, and activates afresh (M2)', async () => {
+      const { host, controller } = setup();
+      host.deferStyleData = true;
+      const pending = controller.activate('equal');
+      await vi.waitFor(() => expect(host.setStyleCalls).toHaveLength(1));
+      await controller.deactivate(); // the original's rebuild is pending too: no style.load yet
+      await expect(pending).rejects.toMatchObject({ name: 'EqualEarthSupersededError' });
+      host.deferStyleData = false;
+      host.flushStyleData();
+      await controller.activate('equal');
+      expect(controller.active).toBe(true);
+      expect(host._camera.transformCameraUpdate).not.toBeNull();
     });
 
     it('dispose during the pending re-apply touches nothing and rejects the waiter', async () => {

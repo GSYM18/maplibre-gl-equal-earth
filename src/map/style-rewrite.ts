@@ -12,7 +12,9 @@
  * to the layer's own value or to 0 through `setPaintProperty`, which does cross-fade through
  * the `*-transition` we add. A `global-state` expression would not: the transition's prior
  * value re-evaluates against the same live state, so the switch would be instant. Symbols
- * must really hide (`visibility: "none"`), because transparent labels still collide.
+ * must really hide (`visibility: "none"`), because transparent labels still collide, and so
+ * must hillshade and color-relief: a `basic` or `multidirectional` hillshade at exaggeration 0
+ * still draws a flat highlight tint (MapLibre 6.6's hillshade shader at zero derivative).
  *
  * Rules, in short:
  * 1. Every vector source with a template gets one source per band with blend < 1.
@@ -20,7 +22,8 @@
  *    intersected with the layer's own; the Mercator band keeps the original id and source.
  *    Copies with an empty range are dropped.
  * 3. In the initial band a copy keeps the layer's own paint; elsewhere gated opacity is 0 and
- *    symbols are `visibility: "none"`. `gates` records the own values for the switcher.
+ *    symbol, hillshade and color-relief copies are `visibility: "none"`. `gates` records the
+ *    own values for the switcher.
  * 4. Raster, hillshade and color-relief layers are kept once, in the Mercator band, or removed
  *    under pure Equal Earth. Background and layers of other sources are untouched.
  */
@@ -83,8 +86,12 @@ export interface LayerGate {
   band: number;
   /** The layer's own value of every gated paint property (`undefined` = unset). */
   paint: Readonly<Record<string, unknown>>;
-  /** Symbol layers only: the layer's own `layout.visibility` (`undefined` = unset). */
+  /** With `symbol`: the layer's own `layout.visibility` (`undefined` = unset). */
   visibility?: unknown;
+  /**
+   * Hidden by `visibility: "none"`, not only by its paint: symbol layers (transparent labels
+   * still collide), hillshade (no opacity property; see the module comment) and color-relief.
+   */
   symbol: boolean;
 }
 
@@ -103,7 +110,7 @@ export interface RewrittenStyle {
    * their own zoom range never reaches it) and vector layers whose range reaches no band.
    */
   removedLayers: string[];
-  /** One per rewritten copy with a gated property or a symbol, in output layer order. */
+  /** One per rewritten copy with a gated property or a visibility gate, in output layer order. */
   gates: readonly LayerGate[];
   sourceIdsForBand(band: number): string[];
   gatesForBand(band: number): LayerGate[];
@@ -111,7 +118,7 @@ export interface RewrittenStyle {
 
 export const REWRITTEN_METADATA_KEY = 'equal-earth:rewritten';
 
-/** Paint properties that hide a layer at 0, per layer type. */
+/** Paint properties that fade a layer out at 0, per layer type. */
 const OPACITY: Record<string, readonly string[]> = {
   fill: ['fill-opacity'],
   line: ['line-opacity'],
@@ -120,17 +127,20 @@ const OPACITY: Record<string, readonly string[]> = {
   heatmap: ['heatmap-opacity'],
   symbol: ['text-opacity', 'icon-opacity'],
   raster: ['raster-opacity'],
-  hillshade: ['hillshade-exaggeration'],
+  hillshade: [],
   'color-relief': ['color-relief-opacity'],
 };
+
+/** Layer types hidden by `visibility: "none"` once faded (see the module comment). */
+const HIDE_BY_VISIBILITY = new Set(['symbol', 'hillshade', 'color-relief']);
 
 const RELIEF = new Set(['raster', 'hillshade', 'color-relief']);
 
 /**
  * Apply one gate through `setPaintProperty` / `setLayoutProperty`. `shown`: own visibility
- * (symbols) and own paint values, verbatim (`undefined` resets to the default); `fading`:
- * gated paint to 0, visibility untouched (the cross-fade); `hidden`: paint to 0 and, for
- * symbols, `visibility: "none"`.
+ * (gates hidden by visibility) and own paint values, verbatim (`undefined` resets to the
+ * default); `fading`: gated paint to 0, visibility untouched (the cross-fade); `hidden`: paint
+ * to 0 and, for gates hidden by visibility, `visibility: "none"`.
  */
 export function applyGate(host: GateHost, gate: LayerGate, phase: GatePhase): void {
   if (phase === 'shown') {
@@ -158,6 +168,7 @@ function gateCopy(
 ): LayerGate | null {
   const props = OPACITY[layer.type] ?? [];
   const symbol = layer.type === 'symbol';
+  const byVisibility = HIDE_BY_VISIBILITY.has(layer.type);
   const own: Record<string, unknown> = {};
   const paint = (copy.paint ??= {});
   for (const prop of props) {
@@ -168,14 +179,14 @@ function gateCopy(
       paint[transition] = { duration: symbol ? symbolFadeMs : fadeMs, delay: 0 };
     }
   }
-  if (symbol && band !== initial) copy.layout = { ...copy.layout, visibility: 'none' };
-  if (props.length === 0 && !symbol) return null;
+  if (byVisibility && band !== initial) copy.layout = { ...copy.layout, visibility: 'none' };
+  if (props.length === 0 && !byVisibility) return null;
   return {
     layerId: copy.id,
     band,
     paint: own,
-    ...(symbol ? { visibility: structuredClone(layer.layout?.['visibility']) } : {}),
-    symbol,
+    ...(byVisibility ? { visibility: structuredClone(layer.layout?.['visibility']) } : {}),
+    symbol: byVisibility,
   };
 }
 

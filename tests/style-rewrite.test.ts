@@ -190,16 +190,29 @@ describe('rewriteStyle', () => {
       vec('a', 'fill'),
     );
     const { style: out, gates, removedLayers } = rewrite(style, SIX, 4.6);
-    for (const [id, prop] of [['r', 'raster-opacity'], ['hs', 'hillshade-exaggeration']] as const) {
+    for (const id of ['r', 'hs']) {
       const layer = out.layers.filter((l) => l.id === id);
       expect(layer).toHaveLength(1);
       expect(layer[0]!.minzoom).toBeCloseTo(7.2, 12);
-      expect(layer[0]!.paint![prop]).toBe(0);
-      expect(gates.find((g) => g.layerId === id)).toMatchObject({ band: 6, paint: { [prop]: undefined } });
     }
+    expect(out.layers.find((l) => l.id === 'r')!.paint!['raster-opacity']).toBe(0);
+    expect(gates.find((g) => g.layerId === 'r')).toMatchObject({ band: 6, paint: { 'raster-opacity': undefined }, symbol: false });
     expect(removedLayers).toEqual([]);
     const atMercator = rewrite(tiny({ id: 'r', type: 'raster', source: 'geo', paint: { 'raster-opacity': 0.5 } }), SIX, 9).style;
     expect(atMercator.layers[0]!.paint!['raster-opacity']).toBe(0.5);
+  });
+
+  it('hides a hillshade by visibility, not by a zero exaggeration (a basic hillshade still tints at 0)', () => {
+    const basic = { 'hillshade-method': 'basic', 'hillshade-exaggeration': 0.6 };
+    const { style, gates } = rewrite(tiny({ id: 'hs', type: 'hillshade', source: 'geo', paint: basic }), SIX, 4.6);
+    const layer = style.layers.find((l) => l.id === 'hs')!;
+    expect(layer.layout!['visibility']).toBe('none');
+    expect(layer.paint!['hillshade-exaggeration']).toBe(0.6);
+    expect(gates.find((g) => g.layerId === 'hs')).toEqual({ layerId: 'hs', band: 6, paint: {}, visibility: undefined, symbol: true });
+    // In the initial band it keeps its own visibility.
+    const shown = rewrite(tiny({ id: 'hs', type: 'hillshade', source: 'geo', paint: basic, layout: { visibility: 'visible' } }), SIX, 9);
+    expect(shown.style.layers[0]!.layout!['visibility']).toBe('visible');
+    expect(shown.gates[0]!.visibility).toBe('visible');
   });
 
   it('clamps copy zoom bounds to [0, 24] when the parse range reaches below 0', () => {
@@ -213,13 +226,14 @@ describe('rewriteStyle', () => {
     expect(validateStyleMin(rewrite(liberty(), wide, 1.5).style as never)).toEqual([]);
   });
 
-  it('keeps color-relief once in the Mercator band, gated', () => {
+  it('keeps color-relief once in the Mercator band, faded by opacity and hidden by visibility', () => {
     const { style, gates } = rewrite(tiny({ id: 'cr', type: 'color-relief', source: 'geo' }), SIX, 4.6);
     const layer = style.layers.filter((l) => l.id === 'cr');
     expect(layer).toHaveLength(1);
     expect(layer[0]!.minzoom).toBeCloseTo(7.2, 12);
     expect(layer[0]!.paint!['color-relief-opacity']).toBe(0);
-    expect(gates.find((g) => g.layerId === 'cr')).toMatchObject({ band: 6 });
+    expect(layer[0]!.layout!['visibility']).toBe('none');
+    expect(gates.find((g) => g.layerId === 'cr')).toMatchObject({ band: 6, paint: { 'color-relief-opacity': undefined }, symbol: true });
   });
 
   it('rejects bands whose blends differ from the transition at equal length', () => {
@@ -338,6 +352,18 @@ describe('applyGate', () => {
       ['paint', 's__b2', 'text-opacity', 0],
       ['paint', 's__b2', 'icon-opacity', 0],
       ['paint', 'f__b2', 'fill-opacity', 0],
+    ]);
+  });
+
+  it('shows and hides a hillshade gate by visibility alone', () => {
+    const hillshade: LayerGate = { layerId: 'hs', band: 6, paint: {}, visibility: undefined, symbol: true };
+    const host = new FakeGateHost();
+    applyGate(host, hillshade, 'shown');
+    applyGate(host, hillshade, 'fading');
+    applyGate(host, hillshade, 'hidden');
+    expect(host.calls).toEqual([
+      ['layout', 'hs', 'visibility', undefined],
+      ['layout', 'hs', 'visibility', 'none'],
     ]);
   });
 

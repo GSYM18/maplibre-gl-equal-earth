@@ -52,8 +52,9 @@ Equal Earth projection support for MapLibre GL JS v6, published as
 proj4, and the `0.2.x` line are gone). ESM only — maplibre-gl v6 dropped CJS.
 
 **Registry note:** this environment's npm proxy refuses packages published after 2026-08-31.
-maplibre-gl is pinned to 6.6.0 (not 6.7.0) and vitest to 4.x (not 5.x) for that reason, and
-`@deck.gl/maplibre` cannot be installed at all — it debuted in deck.gl 9.4.0 (2026-09-05).
+maplibre-gl stays at 6.6.0, not 6.7.0 (`package.json` declares `^6.6.0`; the lockfile pins
+6.6.0), and vitest at 4.x, not 5.x, for that reason, and `@deck.gl/maplibre` cannot be
+installed at all — it debuted in deck.gl 9.4.0 (2026-09-05).
 
 ## The central constraint
 
@@ -107,6 +108,9 @@ affects the absolute metre values from `toEqualEarth`.
   copy per band, parse ranges, the gate table) plus `applyGate`. Gating is literal paint values
   set through `setPaintProperty`, never `global-state`: MapLibre re-evaluates a transition's
   prior expression against the live state, so a `global-state` flip can never cross-fade.
+  Symbol, hillshade and color-relief copies are also hidden by `visibility: "none"`
+  (`LayerGate.symbol`): transparent labels still collide, and a `basic` hillshade still tints
+  at exaggeration 0.
 - `src/map/switcher.ts` — `BandSwitcher`, the band selector: which band is *shown* is runtime
   state, moved only when the target band's sources report `isSourceLoaded`. Readiness is
   judged at the last *rendered* zoom, because `isSourceLoaded` is vacuously true for a source
@@ -115,7 +119,9 @@ affects the absolute metre values from `toEqualEarth`.
   constraint, follow the app's `setStyle`, restore. Its module doc records MapLibre's style
   event ordering, which decides when it may tear down and re-install (C7).
 - `src/install.ts` — `installEqualEarth`: version gate, worker count, worker bundle loading
-  with the main-thread fallback, and the `setProjection`/`getProjection` polyfill.
+  with the main-thread fallback (also on a `workerTimeoutMs` timeout), and the
+  `setProjection`/`getProjection` polyfill. A second install on the same `Map.prototype`
+  (HMR) returns the first, through a `Symbol.for` marker.
 - `src/tiles/tile-cover.ts` — output tile → covering source Mercator tiles.
 - `src/tiles/mvt.ts` — decode → dedupe label points → densify → warp → clip → encode.
 - `src/tiles/clip.ts` — direct clip into the buffered output tile (Sutherland–Hodgman rings,
@@ -144,8 +150,8 @@ affects the absolute metre values from `toEqualEarth`.
 All `map/` modules and `install.ts` type their MapLibre dependency **structurally** rather
 than importing `maplibre-gl`, so they are unit-testable with a plain fake and no WebGL context,
 and work with whichever major the app loaded (`tests/host-types.test.ts` checks real v5 and v6
-maps against the interfaces). Keep that property; it is why `tests/camera.test.ts` can drive a
-16-case state machine in milliseconds.
+maps against the interfaces). Keep that property; it is why `tests/camera.test.ts` can drive
+21 state-machine cases in milliseconds.
 
 `EQUAL_EARTH_X_MAX` is **derived**, not hardcoded. The widely-quoted EPSG:8857 bound
 `17243959.06` was computed with the authalic radius 6371007.1809 while the CRS declares
