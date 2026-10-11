@@ -210,7 +210,10 @@ the Mercator band uses the original source untouched. Four things make the steps
   switch. The camera also absorbs the local rotation and scale of each step, so the rendered
   zoom and bearing follow what a continuous blend would show. What is left is shear.
 - **Cross-fade.** Fills and lines fade between bands over 250 ms; labels fade out over 300 ms
-  before the outgoing band's symbols are hidden.
+  before the outgoing band's symbols are hidden. Hillshade does not cross-fade: a hillshade at
+  zero exaggeration still draws a flat highlight, so it is hidden by visibility like a symbol and
+  simply disappears when the hide fires. Because hidden relief is also not parsed, relief pops in
+  once its DEM tiles load when you zoom into the Mercator band.
 
 ```js
 await installEqualEarth(maplibregl, {

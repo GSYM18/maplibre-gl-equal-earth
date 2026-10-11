@@ -283,7 +283,7 @@ camera change does — documented). Readiness and band parse ranges come from pu
 `isSourceLoaded` is vacuously `true` for a source that no layer used at the last render (a
 band whose copies were all outside their zoom range), so a band counts as ready only if it was
 also parsed at the previous frame's zoom — otherwise an app's `jumpTo` across several bands
-would switch onto a band whose tiles were never requested.
+would switch onto a band whose tiles were never requested. Hillshade and color-relief are hidden by visibility like symbols (a hillshade at zero exaggeration still draws a highlight wash), so hillshade does not cross-fade and, being unparsed while hidden, relief pops in once its DEM tiles load.
 
 **Known residuals.** (a) The pointer, not the centre, is the anchor of a scroll zoom; the hook
 cannot see it, so the point under the pointer moves by about the compensated residual × its
