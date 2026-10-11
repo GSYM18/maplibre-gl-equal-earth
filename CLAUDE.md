@@ -130,7 +130,21 @@ mechanism, with line references:
   a detached `R`, still in the space of the baseline the reset replaced. The hook spots this
   because `_requestedCameraState` is absent at hook time. It converts that frame from the
   previous baseline. The same applies to an ease whose `R` a mid-ease `moveend` deletes: on v6
-  through `setVerticalFieldOfView`, on v5 through any Map `moveend`.
+  through `setVerticalFieldOfView`, on v5 through any Map `moveend`. A second such `moveend`
+  during the same ease must not overwrite `#previousBaseline` (m13), and the stale frame's band
+  is adopted as the baseline only once its conversion proved finite (m14).
+- **Gesture end before inertia.** A gesture released with inertia ends without any `moveend`:
+  the HandlerManager fires its `*end` events (`dragend`, `zoomend`, `rotateend`, `pitchend`,
+  `rollend`) on the Map, then calls `easeTo` with a centre and anchor computed from the
+  **rendered** `T`. That ease ran on the surviving `R`, still in the baseline band's space: a
+  double conversion (1.74° at Guadalajara). So on each `*end` the camera deletes `R` (on v5
+  too) and re-bases, and the inertial ease clones a fresh `R` from `T`. The Camera fires
+  `zoomend` itself just before its own `moveend` (`_afterEase`, `jumpTo`). After an ease frame,
+  that `*end` is ignored: a gesture interrupting the ease holds that ease's `R`, and re-basing
+  on the `*end` and again on the `moveend` would lose its space. The fakes model all of this.
+- **Construct the camera before adding `moveend` listeners that move the map** (m11). An app
+  listener registered earlier runs first, so its `jumpTo` reuses a stale `R` against a stale
+  baseline. The gesture-end fix narrows this window but does not close it.
 - **History.** The original compared against a zoom frozen at `movestart` and re-converted every
   frame (a Zürich pinch landed 24° off). The first rewrite compared against the previous frame's
   band, and so converted only on the crossing frame: the next frame rendered the unconverted `R`
@@ -141,13 +155,19 @@ mechanism, with line references:
   `>=`, so an initial `flyTo` across the threshold was silently left unconverted. Measured ~4° off.
 
 `moveend` listeners are required: one on v5 (the Map), two on v6 (the Camera and the Map).
-`destroy()` removes them. It also restores the host's prior `transformCameraUpdate` rather than nulling it,
-unless the application replaced ours after we installed.
+The five gesture `*end` listeners go on the Map in both. `destroy()` removes them all. It also
+restores the host's prior `transformCameraUpdate` rather than nulling it, unless the
+application replaced ours after we installed.
 
 For clamping the camera to the Equal Earth world, prefer **`transformConstrain`** over
 `transformCameraUpdate`: it is threaded into `createProjectionFromName` and survives projection
 switches, whereas `migrateProjection` swaps `this.transform` wholesale and leaves
-`transformCameraUpdate`'s `_requestedCameraState` stale.
+`transformCameraUpdate`'s `_requestedCameraState` stale. The override is called **instead of**
+`defaultConstrain` (min/max zoom, `maxBounds`, Mercator's world fill), so ours composes with it:
+`installEqualEarthConstrain` reads it lazily from `map.transform` (v5) or `map._camera.transform`
+(v6 `Map` has no `transform`). MapLibre also constrains `R` on every `setZoom`/`setCenter`, in
+the requested zoom's band while `R`'s centre is in the baseline band's space, so the clamp is
+never tighter than `baselineBand`'s edge (I3: Svalbard used to land at 70.65°).
 
 ## Publishing
 

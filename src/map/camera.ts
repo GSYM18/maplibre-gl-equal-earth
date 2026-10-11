@@ -13,7 +13,12 @@
  * the move started in — see {@link BandCamera}.
  */
 
-import { geographicToMap, mapSpaceMaxLatitude, mapToGeographic } from '../math/backproject.js';
+import {
+  geographicToMap,
+  mapSpaceMaxLatitude,
+  mapSpaceMaxLongitude,
+  mapToGeographic,
+} from '../math/backproject.js';
 import type { LngLatTuple } from '../math/equal-earth.js';
 import { bandIndexForZoom, validateBands, type Band } from './bands.js';
 
@@ -61,7 +66,11 @@ export interface MoveEndEmitter {
  * `setTransformCameraUpdate()`. Both shapes are accepted — see {@link cameraHookAccess}.
  */
 export interface CameraHost extends MoveEndEmitter {
+  on(type: 'moveend' | GestureEndEvent, listener: () => void): unknown;
+  off(type: 'moveend' | GestureEndEvent, listener: () => void): unknown;
   getZoom(): number;
+  /** MapLibre v5's `Map` inherits it from `Camera`; a v6 `Map` has none (its `_camera` does). */
+  isEasing?(): boolean;
   /** MapLibre v5, and test doubles: the hook is a plain property. */
   transformCameraUpdate?: CameraUpdateFn | null;
   /** MapLibre v6: the hook can only be set through this method. */
@@ -90,10 +99,12 @@ export interface CameraHookAccess {
   hasRequestedState(): boolean | undefined;
   /**
    * Delete the requested state if there is one and no ease is running, as v5 does on every
-   * `moveend`; returns whether it did. Only v6 needs this (see {@link cameraHookAccess}). It
-   * does nothing, and returns `false`, on v5 or when the internals cannot be read.
+   * `moveend`; returns whether it did (see {@link cameraHookAccess}). It does nothing, and
+   * returns `false`, when the internals cannot be read.
    */
   discardRequestedState(): boolean;
+  /** Whether an ease is running; `undefined` when this MapLibre version offers no way to tell. */
+  isEasing(): boolean | undefined;
 }
 
 /** The private members this module reads, wherever they live. */
@@ -131,6 +142,10 @@ function hasHookSetter(host: CameraHost): host is V6Host {
  * passes to `jumpTo`/`easeTo` (in the rendered band's space) would be read in the wrong one.
  * A running ease is left alone: its `R` is still in use. A v6 `Map` has no `isEasing()`; its
  * Camera does.
+ *
+ * It is needed on v5 as well, for the gesture `*end` events: v5 deletes the state on `moveend`
+ * itself, but a gesture released with inertia fires its `*end` events and then starts the
+ * inertial ease *without* a `moveend` in between, and that ease must not inherit the old `R`.
  */
 export function cameraHookAccess(host: CameraHost): CameraHookAccess {
   if (hasHookSetter(host)) {
@@ -151,6 +166,7 @@ export function cameraHookAccess(host: CameraHost): CameraHookAccess {
         delete owner._requestedCameraState;
         return true;
       },
+      isEasing: () => (typeof owner?.isEasing === 'function' ? owner.isEasing() : undefined),
     };
   }
   const internals = host as unknown as CameraInternals;
@@ -161,10 +177,26 @@ export function cameraHookAccess(host: CameraHost): CameraHookAccess {
     },
     requestOwner: host,
     hasRequestedState: () => internals._requestedCameraState !== undefined,
-    // MapLibre v5 already deletes it on every `moveend`.
-    discardRequestedState: () => false,
+    // v5 deletes it on every `moveend` itself, but the gesture `*end` events fire *before* the
+    // inertial ease (v5 68689-68712), when `R` must already be gone.
+    discardRequestedState: () => {
+      if (internals._requestedCameraState === undefined) return false;
+      if (typeof host.isEasing !== 'function' || host.isEasing()) return false;
+      delete internals._requestedCameraState;
+      return true;
+    },
+    isEasing: () => (typeof host.isEasing === 'function' ? host.isEasing() : undefined),
   };
 }
+
+/**
+ * The `*end` events the HandlerManager fires on the Map when a gesture finishes, before it
+ * either fires `moveend` or starts the inertial ease (v6 21992-22018, v5 68680-68712).
+ */
+const GESTURE_END_EVENTS = ['dragend', 'zoomend', 'rotateend', 'pitchend', 'rollend'] as const;
+
+/** One of {@link GESTURE_END_EVENTS}. */
+export type GestureEndEvent = (typeof GESTURE_END_EVENTS)[number];
 
 export interface BandCameraOptions {
   /** Zoom bands, validated with `validateBands`. */
@@ -198,7 +230,8 @@ export interface ThresholdCameraOptions {
  *   every frame, and a move that crosses up and back down returns to the identity. The
  *   baseline is reset from the rendered zoom on the `moveend` that deletes the requested
  *   state, because the next one is cloned from what is rendered. On v6 that is the Camera's
- *   own `moveend`, not the Map's — see {@link cameraHookAccess}.
+ *   own `moveend`, not the Map's — see {@link cameraHookAccess}. A gesture's `*end` events
+ *   delete the state and re-base too, because an inertial ease follows them with no `moveend`.
  * - **State initialised in the constructor**, from the live camera, so an initial `flyTo`
  *   across a boundary is converted even before any interaction.
  *
@@ -225,6 +258,19 @@ export class BandCamera {
    * while still in use — see {@link handleCameraUpdate}.
    */
   #previousBaseline: number;
+
+  /**
+   * Whether the last hook frame rendered a detached requested state (one a `moveend` deleted
+   * while still in use). Guards {@link #previousBaseline} against a second mid-ease reset (m13).
+   */
+  #lastFrameStale = false;
+
+  /**
+   * Whether an ease was running during the last hook frame. A `*end` event that follows such a
+   * frame is the Camera's own (`_afterEase`, v6 22491-22495), which a `moveend` follows at once
+   * — see {@link #onGestureEnd}.
+   */
+  #lastFrameEasing = false;
 
   /** The host's own hook, chained rather than clobbered. */
   #previousHook: CameraUpdateFn | null;
@@ -283,6 +329,8 @@ export class BandCamera {
     // that gap, so a centre the application supplies is always read in the rendered band.
     this.#mapMoveEndSource = owner !== undefined && owner !== host ? host : undefined;
     this.#mapMoveEndSource?.on('moveend', this.#onMapMoveEnd);
+    // A gesture released with inertia ends without any `moveend`: see `#onGestureEnd`.
+    for (const type of GESTURE_END_EVENTS) host.on(type, this.#onGestureEnd);
     this.#access.set(this.handleCameraUpdate);
     this.#installed = true;
   }
@@ -294,6 +342,16 @@ export class BandCamera {
   /** Blend of the band the rendered camera is in. */
   get blend(): number {
     return this.#bands[bandIndexForZoom(this.#bands, this.#host.getZoom())]!.blend;
+  }
+
+  /**
+   * Index of the band whose map space the requested camera state's centre is in. This can lag
+   * the rendered band for the whole of a move, and the constraint, which MapLibre also applies
+   * to the requested state, must not clamp it tighter than this band's edge (see
+   * `createEqualEarthConstrain`'s `baselineBand`).
+   */
+  get baselineBand(): number {
+    return this.#baseline;
   }
 
   /**
@@ -319,12 +377,13 @@ export class BandCamera {
     // also happens to an ease whose state a mid-ease `moveend` deleted: on v6 from
     // `setVerticalFieldOfView` (22131), on v5 from any Map `moveend`. Either way the state is
     // in the space of the baseline that reset replaced, and the next one will be cloned from
-    // what this frame renders, so this frame's band becomes the baseline.
-    let baseline = this.#baseline;
-    if (this.#access.hasRequestedState() === false) {
-      baseline = this.#previousBaseline;
-      this.#baseline = current;
-    }
+    // what this frame renders, so this frame's band becomes the baseline — once the frame has
+    // converted (m14): a frame that fails renders the requested state unconverted.
+    const stale = this.#access.hasRequestedState() === false;
+    const baseline = stale ? this.#previousBaseline : this.#baseline;
+    // Recorded for the event handlers: m13's guard in `#onMoveEnd`, and `#onGestureEnd`.
+    this.#lastFrameStale = stale;
+    this.#lastFrameEasing = this.#access.isEasing() === true;
 
     // Otherwise no state change here: the baseline moves only on `moveend`, so every frame of
     // a move converts its requested state the same way.
@@ -333,14 +392,20 @@ export class BandCamera {
 
     // Still in the baseline band (or one sharing its blend), including after a move crossed
     // out and back: the requested centre is already in the right space.
-    if (fromBlend === toBlend) return upstream;
+    if (fromBlend === toBlend) {
+      if (stale) this.#baseline = current;
+      return upstream;
+    }
 
     const source: LngLatTuple = [center.lng, center.lat];
     // Bring the centre into the old band's world first: a centre panned into the empty
-    // space beyond the world edge has no geographic meaning, and would convert to NaN.
+    // space beyond the world edge has no geographic meaning. Above or below the world it would
+    // convert to NaN; in a corner beside the rounded outline (row 9) to a finite point beyond
+    // ±180°, so the longitude is clamped to the outline at the clamped latitude.
+    const clampedLat = clampLatitude(center.lat, mapSpaceMaxLatitude(fromBlend));
     const inWorld: LngLatTuple = [
-      wrapLongitude(center.lng),
-      clampLatitude(center.lat, mapSpaceMaxLatitude(fromBlend)),
+      clampLongitude(wrapLongitude(center.lng), mapSpaceMaxLongitude(clampedLat, fromBlend)),
+      clampedLat,
     ];
     // One conversion straight from the baseline band to the current one, however many bands
     // lie between — chaining through each would accumulate error.
@@ -351,12 +416,21 @@ export class BandCamera {
       return upstream;
     }
 
+    if (stale) this.#baseline = current;
     return { ...upstream, center: this.#lngLatFactory(converted[0], converted[1]) };
   };
 
-  /** The requested state is gone; the next one is cloned from what is rendered. */
+  /**
+   * The requested state is gone; the next one is cloned from what is rendered.
+   *
+   * m13: while an ease keeps rendering a detached requested state (the last frame was stale),
+   * a further `moveend` (v5: any Map `moveend`, e.g. a resize mid-`flyTo`) deletes nothing new.
+   * `#previousBaseline` still names the space of that detached state, so keep it.
+   */
   readonly #onMoveEnd = (): void => {
-    this.#previousBaseline = this.#baseline;
+    if (!(this.#lastFrameStale && this.#access.isEasing() === true)) {
+      this.#previousBaseline = this.#baseline;
+    }
     this.#baseline = bandIndexForZoom(this.#bands, this.#host.getZoom());
   };
 
@@ -365,6 +439,27 @@ export class BandCamera {
    * state and re-based through {@link #onMoveEnd}; for the Map's own, do what v5 would.
    */
   readonly #onMapMoveEnd = (): void => {
+    if (this.#access.discardRequestedState()) this.#onMoveEnd();
+  };
+
+  /**
+   * A `*end` event reached the Map (I1). When a gesture is released with inertia, the
+   * HandlerManager fires its `*end` events and then calls `easeTo` with a centre and anchor
+   * computed from the *rendered* transform (v6 21999-22018, v5 68689-68712), with no `moveend`
+   * in between. That ease would run on the surviving requested state, still in the baseline
+   * band's space, and the hook would convert its already-rendered-space centre a second time
+   * (1.74° at Guadalajara). Deleting the state here makes the ease clone a fresh one from what
+   * is rendered, and re-basing puts the baseline in that same space.
+   *
+   * The Camera fires `zoomend` (and `rotateend`, ...) itself too, just before its `moveend`,
+   * at the end of an ease (`_afterEase`) and of a `jumpTo`. After an ease, that includes a
+   * gesture interrupting it: the HandlerManager already holds the ease's state, about to render
+   * it detached in the space of {@link #previousBaseline}. Re-basing here *and* on the
+   * `moveend` would overwrite that, so a `*end` that follows an ease frame is left to the
+   * `moveend`. After a `jumpTo` the double re-base is harmless: nothing holds its state.
+   */
+  readonly #onGestureEnd = (): void => {
+    if (this.#lastFrameEasing) return;
     if (this.#access.discardRequestedState()) this.#onMoveEnd();
   };
 
@@ -379,6 +474,7 @@ export class BandCamera {
     this.#installed = false;
     this.#moveEndSource.off('moveend', this.#onMoveEnd);
     this.#mapMoveEndSource?.off('moveend', this.#onMapMoveEnd);
+    for (const type of GESTURE_END_EVENTS) this.#host.off(type, this.#onGestureEnd);
     // Only hand the hook back if it is still ours; if the application replaced it after we
     // installed, stomping on that would be worse than leaving it alone. When the host gives
     // no way to read the hook, restoring is the better guess.
@@ -441,3 +537,6 @@ function wrapLongitude(lng: number): number {
 function clampLatitude(lat: number, limit: number): number {
   return lat < -limit ? -limit : lat > limit ? limit : lat;
 }
+
+/** The same for longitude: clamp to ±limit, NaN passing through. */
+const clampLongitude = clampLatitude;

@@ -10,6 +10,14 @@ import type { Band } from '../src/map/bands.js';
 
 const lngLatFactory = (lng: number, lat: number) => ({ lng, lat });
 
+/** The `equal` projection's bands (spec §3). */
+const EQUAL: Band[] = [
+  { minZoom: 0, blend: 0 },
+  { minZoom: 5, blend: 1 / 3 },
+  { minZoom: 6, blend: 2 / 3 },
+  { minZoom: 7, blend: 1 },
+];
+
 describe('createEqualEarthConstrain', () => {
   it('clamps latitude to the Equal Earth world edge', () => {
     const constrain = createEqualEarthConstrain({ lngLatFactory });
@@ -51,16 +59,82 @@ describe('createEqualEarthConstrain', () => {
     );
   });
 
-  it('is inert while inactive, so Mercator and globe are untouched', () => {
+  it("hands Mercator and globe to MapLibre's own constraint while inactive", () => {
+    // Our override replaces MapLibre's `defaultConstrain` (v6 9051-9054), so "inactive" must
+    // mean "delegate", not "pass through": min/max zoom and `maxBounds` live in the default.
+    const clamped = { lng: 0, lat: 80 };
+    const fallback = vi.fn(() => ({ center: clamped, zoom: 3 }));
     const constrain = createEqualEarthConstrain({
       lngLatFactory,
       isActive: () => false,
+      fallback,
     });
     const input = { lng: 0, lat: 84 };
     const result = constrain(input, 2);
 
-    expect(result.center).toBe(input);
-    expect(result.center.lat).toBe(84);
+    expect(fallback).toHaveBeenCalledWith(input, 2);
+    expect(result).toEqual({ center: clamped, zoom: 3 });
+    expect(result.center).toBe(clamped);
+  });
+
+  it('passes the camera through while inactive when there is nothing to delegate to', () => {
+    const constrain = createEqualEarthConstrain({ lngLatFactory, isActive: () => false });
+    const input = { lng: 0, lat: 84 };
+    expect(constrain(input, 2).center).toBe(input);
+  });
+
+  it('composes with the default constraint instead of replacing it (I2)', () => {
+    const fallback = vi.fn((ll: { lng: number; lat: number }, zoom: number) => ({
+      center: { lng: ll.lng, lat: Math.min(ll.lat, 80) },
+      zoom: Math.min(zoom, 7),
+    }));
+    const constrain = createEqualEarthConstrain({ lngLatFactory, bands: EQUAL, fallback });
+    // Mercator band: pure delegation (zoom clamped by the fallback's maxZoom).
+    expect(constrain({ lng: 10, lat: 84 }, 9)).toEqual({ center: { lng: 10, lat: 80 }, zoom: 7 });
+    // Equal Earth band: fallback first, then our tighter latitude clamp; the fallback's zoom survives.
+    const result = constrain({ lng: 10, lat: 84 }, 3);
+    expect(result.center.lat).toBeCloseTo(mapSpaceMaxLatitude(0), 9);
+    expect(fallback).toHaveBeenCalledTimes(2);
+  });
+
+  it('delegates to the fallback while inactive', () => {
+    const fallback = vi.fn((ll: { lng: number; lat: number }) => ({ center: ll, zoom: 5 }));
+    const constrain = createEqualEarthConstrain({ lngLatFactory, fallback, isActive: () => false });
+    expect(constrain({ lng: 0, lat: 89 }, 2)).toEqual({ center: { lng: 0, lat: 89 }, zoom: 5 });
+  });
+
+  it("picks the band from the fallback's zoom, which is what will be rendered", () => {
+    // maxZoom 6.5 pulls a z9 request back into the ⅔ band, whose edge then applies.
+    const fallback = (ll: { lng: number; lat: number }, zoom: number) => ({ center: ll, zoom: Math.min(zoom, 6.5) });
+    const constrain = createEqualEarthConstrain({ lngLatFactory, bands: EQUAL, fallback });
+    expect(constrain({ lng: 0, lat: 84 }, 9).center.lat).toBeCloseTo(mapSpaceMaxLatitude(2 / 3), 9);
+  });
+
+  it("never clamps tighter than the baseline band's edge (I3)", () => {
+    const constrain = createEqualEarthConstrain({ lngLatFactory, bands: EQUAL, baselineBand: () => 1 });
+    const limit1 = mapSpaceMaxLatitude(1 / 3);
+    expect(constrain({ lng: 0, lat: limit1 - 0.01 }, 4.9).center.lat).toBeCloseTo(limit1 - 0.01, 9);
+    expect(constrain({ lng: 0, lat: limit1 + 1 }, 4.9).center.lat).toBeCloseTo(limit1, 9);
+  });
+
+  it('does not clamp at all while the baseline band is Mercator', () => {
+    // The requested state is then in geographic space: any Equal Earth edge would distort it.
+    const constrain = createEqualEarthConstrain({ lngLatFactory, bands: EQUAL, baselineBand: () => 3 });
+    const input = { lng: 0, lat: 84 };
+    expect(constrain(input, 6.5).center).toBe(input);
+  });
+
+  it('adds the margin per band, and clamps at negative zoom and a non-zero first-band minZoom (row 16)', () => {
+    const bands = [
+      { minZoom: 2, blend: 0 },
+      { minZoom: 5, blend: 1 },
+    ];
+    const constrain = createEqualEarthConstrain({ lngLatFactory, bands, latitudeMargin: 1 });
+    expect(constrain({ lng: 0, lat: 89 }, -1).center.lat).toBeCloseTo(mapSpaceMaxLatitude(0) + 1, 9);
+    expect(constrain({ lng: 0, lat: 89 }, 1).center.lat).toBeCloseTo(mapSpaceMaxLatitude(0) + 1, 9);
+    expect(constrain({ lng: 0, lat: 89 }, 5).center.lat).toBe(89);
+    const margined = createEqualEarthConstrain({ lngLatFactory, bands: EQUAL, latitudeMargin: 1 });
+    expect(margined({ lng: 0, lat: 89 }, 5.5).center.lat).toBeCloseTo(mapSpaceMaxLatitude(1 / 3) + 1, 9);
   });
 
   it('re-evaluates isActive on every call rather than latching', () => {
@@ -126,19 +200,71 @@ describe('installEqualEarthConstrain', () => {
     expect(spy).toHaveBeenCalledTimes(1);
   });
 
+  it('installs a fallback that reads host.transform lazily', () => {
+    let calls = 0;
+    const host = {
+      transform: {
+        defaultConstrain: (ll: { lng: number; lat: number }, zoom: number) => {
+          calls++;
+          return { center: ll, zoom };
+        },
+      },
+      constrain: null as TransformConstrainFn | null,
+      setTransformConstrain(fn: TransformConstrainFn | null) {
+        this.constrain = fn;
+      },
+    };
+    installEqualEarthConstrain(host, { lngLatFactory });
+    host.constrain!({ lng: 0, lat: 0 }, 3);
+    // `migrateProjection` swaps the transform wholesale.
+    host.transform = {
+      defaultConstrain: (ll, zoom) => {
+        calls += 10;
+        return { center: ll, zoom };
+      },
+    };
+    host.constrain!({ lng: 0, lat: 0 }, 3);
+    expect(calls).toBe(11);
+  });
+
+  it("reads a v6 map's default constraint off its camera, lazily", () => {
+    // A v6 `Map` has no `transform`; `setTransformConstrain` writes to `_camera.transform`
+    // (v6 24448), and `migrateProjection` replaces that object (v6 22077-22079).
+    const seen: string[] = [];
+    const transform = (name: string) => ({
+      defaultConstrain: (ll: { lng: number; lat: number }, zoom: number) => {
+        seen.push(name);
+        return { center: ll, zoom: Math.min(zoom, 2) };
+      },
+    });
+    const host = {
+      _camera: { transform: transform('mercator') },
+      constrain: null as TransformConstrainFn | null,
+      setTransformConstrain(fn: TransformConstrainFn | null) {
+        this.constrain = fn;
+      },
+    };
+    installEqualEarthConstrain(host, { lngLatFactory });
+    expect(host.constrain!({ lng: 0, lat: 0 }, 9).zoom).toBe(2);
+    host._camera.transform = transform('globe');
+    host.constrain!({ lng: 0, lat: 0 }, 9);
+    expect(seen).toEqual(['mercator', 'globe']);
+  });
+
+  it('prefers an explicit fallback over the map default', () => {
+    const map = new FakeMap();
+    const fallback = vi.fn((ll: { lng: number; lat: number }, zoom: number) => ({ center: ll, zoom }));
+    installEqualEarthConstrain(map, { lngLatFactory, fallback });
+    map.constrain!({ lng: 0, lat: 0 }, 3);
+    expect(fallback).toHaveBeenCalledOnce();
+  });
+
   it('rejects a map without setTransformConstrain (maplibre-gl < 5.24)', () => {
     expect(() => installEqualEarthConstrain({} as never, { lngLatFactory })).toThrow(TypeError);
   });
 });
 
 describe('createEqualEarthConstrain with bands', () => {
-  const EQUAL: Band[] = [
-    { minZoom: 0, blend: 0 },
-    { minZoom: 5, blend: 1 / 3 },
-    { minZoom: 6, blend: 2 / 3 },
-    { minZoom: 7, blend: 1 },
-  ];
-
   it('uses the world edge of the band the requested zoom falls in', () => {
     const constrain = createEqualEarthConstrain({ lngLatFactory, bands: EQUAL });
 

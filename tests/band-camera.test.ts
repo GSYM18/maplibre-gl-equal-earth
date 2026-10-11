@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { Band } from '../src/map/bands.js';
 import { BandCamera, type CameraUpdateResult } from '../src/map/camera.js';
+import { createEqualEarthConstrain } from '../src/map/constrain.js';
 import { geographicToMap, mapSpaceMaxLatitude, mapToGeographic } from '../src/math/backproject.js';
 import {
   FakeV5Map,
@@ -111,9 +112,9 @@ describe.each(SHAPES)('BandCamera on a MapLibre $shape-shaped host', ({ shape, c
     new BandCamera(map, { bands: EQUAL });
 
     expectHeldThrough(map, zoomFrames(4.6, 5.4, 0.2), GUADALAJARA);
-    map.endGesture({ inertia });
+    map.endGesture({ inertia })?.finish();
     expectHeldThrough(map, zoomFrames(5.4, 6.4, 0.2), GUADALAJARA);
-    map.endGesture({ inertia });
+    map.endGesture({ inertia })?.finish();
     expectHeldThrough(map, zoomFrames(6.4, 7.4, 0.2), GUADALAJARA);
   });
 
@@ -370,6 +371,115 @@ describe.each(SHAPES)('BandCamera on a MapLibre $shape-shaped host', ({ shape, c
 
     expect(map.requestedCenter).toBeUndefined();
   });
+
+  it('holds the centre through a pinch that crosses z5 and is released with inertia (I1)', () => {
+    const map = mapAt(create, GUADALAJARA, 4.8);
+    new BandCamera(map, { bands: EQUAL });
+    for (const frame of zoomFrames(4.8, 5.2, 0.1)) map.applyFrame(frame);
+    const ease = map.endGesture({ inertia: true })!;
+    // The HandlerManager builds the inertial ease from the rendered transform.
+    ease.frame({ center: [map.center.lng, map.center.lat], zoomDelta: 0.05 });
+    expectGeographic(map, GUADALAJARA, 1e-9);
+    ease.frame({ zoomDelta: 0.05 });
+    ease.finish();
+    expectGeographic(map, GUADALAJARA, 1e-9);
+  });
+
+  it.each([
+    ['zooming', true],
+    ['pan-only', false],
+  ] as const)(
+    'holds the centre when a gesture interrupts a %s inertial ease before its first frame',
+    (_, inertialZoom) => {
+      // The inertial ease's `R` was cloned from the rendered transform, in the new band. A touch
+      // that stops it before any frame renders that `R` detached; it must not be read in the
+      // band of the `R` the gesture end discarded.
+      const map = mapAt(create, GUADALAJARA, 4.8);
+      new BandCamera(map, { bands: EQUAL });
+      expectHeldThrough(map, zoomFrames(4.8, 5.2, 0.1), GUADALAJARA);
+      map.endGesture({ inertia: true, inertialZoom });
+
+      expectHeldThrough(map, zoomFrames(5.2, 5.4, 0.1), GUADALAJARA);
+      // And the state the next frames accumulate into is in the rendered band: a drag there
+      // and back lands on Guadalajara again.
+      map.applyFrame({ panDelta: [0.2, 0.1] });
+      map.applyFrame({ panDelta: [-0.2, -0.1] });
+      expectGeographic(map, GUADALAJARA);
+    },
+  );
+
+  it("does not let the constraint clamp the requested state against a lower band's edge (I3)", () => {
+    const SVALBARD: [number, number] = [15.6, 78.2];
+    const map = mapAt(create, SVALBARD, 5.3);
+    const camera = new BandCamera(map, { bands: EQUAL });
+    map.setTransformConstrain(
+      createEqualEarthConstrain({
+        lngLatFactory: (lng, lat) => ({ lng, lat }),
+        bands: EQUAL,
+        baselineBand: () => camera.baselineBand,
+      }),
+    );
+    expectHeldThrough(map, zoomFrames(5.3, 4.7, 0.1), SVALBARD);
+  });
+
+  it('brings a centre in the empty corner back onto the outline before converting (row 9)', () => {
+    const map = create([179, 60], 4.9);
+    new BandCamera(map, { bands: EQUAL });
+    map.applyFrame({ zoomDelta: 0.2 });
+    const [lng, lat] = renderedGeographic(map);
+    // On the outline, not 246° beyond it. The slack is this check's own round trip: even an
+    // exact ±180° comes back from blend ⅓ map space as 180 ± 4e-12.
+    expect(Math.abs(lng)).toBeLessThanOrEqual(180 + 1e-9);
+    expect(Math.abs(lat)).toBeLessThanOrEqual(90);
+  });
+
+  it('holds the centre through two Map-level moveends during one band-crossing ease (m13)', () => {
+    // v5: each one deletes the ease's `R`, which the ease keeps rendering detached. The second
+    // must not forget the band that detached `R` is in. (v6 keeps `R` mid-ease throughout.)
+    const map = mapAt(create, GUADALAJARA, 4.6);
+    new BandCamera(map, { bands: EQUAL });
+    const ease = map.easeTo();
+    for (const zoom of [4.8, 5.1]) ease.frame({ zoom });
+
+    map.fireMapMoveEnd();
+    ease.frame({ zoom: 5.4 });
+    expectGeographic(map, GUADALAJARA);
+    map.fireMapMoveEnd();
+    for (const zoom of [5.8, 6.2, 6.6, 7.2]) {
+      ease.frame({ zoom });
+      expectGeographic(map, GUADALAJARA);
+    }
+    ease.finish();
+    expectHeldThrough(map, zoomFrames(map.zoom, 6.2, 0.2), GUADALAJARA);
+  });
+
+  it("keeps the baseline when a stale frame's conversion fails (m14)", () => {
+    const onConversionFailure = vi.fn();
+    const map = create([Number.NaN, Number.NaN], 4.6);
+    const camera = new BandCamera(map, { bands: EQUAL, onConversionFailure });
+    const ease = map.easeTo();
+    ease.frame({ zoom: 4.8 });
+
+    // A scroll interrupts the ease and crosses z5 on its first, detached, frame.
+    map.applyFrame({ zoomDelta: 0.4 });
+
+    expect(onConversionFailure).toHaveBeenCalledOnce();
+    // Rendered unconverted, so still in band 0's space, and the baseline says so.
+    expect(camera.baselineBand).toBe(0);
+  });
+
+  it('listens for every gesture end, and stops on destroy', () => {
+    const map = mapAt(create, GUADALAJARA, 4.8);
+    const types = ['dragend', 'zoomend', 'rotateend', 'pitchend', 'rollend'];
+    const counts = () => types.map((type) => map.listenerCount(type));
+    const before = counts();
+    const camera = new BandCamera(map, { bands: EQUAL });
+    expect(counts()).toEqual(before.map((count) => count + 1));
+
+    camera.destroy();
+
+    expect(counts()).toEqual(before);
+  });
 });
 
 describe('BandCamera', () => {
@@ -451,6 +561,15 @@ describe('BandCamera', () => {
       expect(map._camera.transformCameraUpdate).toBe(upstream);
     });
 
+    it('leaves an app-replaced hook alone on destroy (row 10)', () => {
+      const map = new FakeV6Map([0, 0], 3);
+      const camera = new BandCamera(map, { bands: EQUAL });
+      const replacement = () => ({});
+      map.setTransformCameraUpdate(replacement);
+      camera.destroy();
+      expect(map._camera.transformCameraUpdate).toBe(replacement);
+    });
+
     it('still holds ordinary gestures when the requested state cannot be read', () => {
       // As if MapLibre had renamed the field: it reads as absent on every frame, and the
       // Map's moveend cannot delete it. Ordinary gestures must still hold.
@@ -469,7 +588,8 @@ describe('BandCamera', () => {
       new BandCamera(map, { bands: EQUAL });
 
       expectHeldThrough(map, zoomFrames(4.6, 5.4, 0.2), GUADALAJARA);
-      map.endGesture({ inertia: true });
+      // The inertial ease runs to its end, whose Camera `moveend` re-bases.
+      map.endGesture({ inertia: true })!.finish();
       expectHeldThrough(map, zoomFrames(5.4, 6.4, 0.2), GUADALAJARA);
     });
 

@@ -27,6 +27,7 @@ export {
   WEB_MERCATOR_RADIUS,
   geographicToMap,
   mapSpaceMaxLatitude,
+  mapSpaceMaxLongitude,
   mapToGeographic,
   worldYRange,
 } from './math/backproject.js';
@@ -39,6 +40,7 @@ export {
   type CameraUpdate,
   type CameraUpdateFn,
   type CameraUpdateResult,
+  type GestureEndEvent,
   type LngLatFactory,
   type ThresholdCameraOptions,
 } from './map/camera.js';
@@ -61,6 +63,7 @@ export {
   createEqualEarthConstrain,
   installEqualEarthConstrain,
   type ConstrainHost,
+  type DefaultConstrainOwner,
   type EqualEarthConstrainOptions,
   type LngLatLike,
   type TransformConstrainFn,

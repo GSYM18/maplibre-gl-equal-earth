@@ -26,6 +26,21 @@
  * The HandlerManager takes `R` *before* calling `stop(true)` (v6 21867/21873, v5 67195/67202).
  * When a gesture interrupts a running ease, `stop` fires the Camera's `moveend` and deletes
  * `R`, yet that first frame still renders the detached `R` it took.
+ *
+ * Three more mechanisms are modelled because bugs hid in their absence:
+ *
+ * - **Gesture end and the inertia handover** (v6 21992-22025, v5 68680-68718). The
+ *   HandlerManager fires each finished gesture's `*end` event (`zoomend`, `dragend`, ...) on the
+ *   Map, and only then either fires the Map's `moveend` (no inertia) or calls `easeTo` with
+ *   options computed from the *rendered* transform (`handlePanInertia(..., camera.transform)`,
+ *   v6 19637).
+ * - **The Camera's own `*end` events.** `_afterEase` (v6 22478-22495, v5 69668) fires `zoomend`
+ *   before `moveend` when the ease was zooming, and `jumpTo` (v6 22283-22288) fires `zoomend`
+ *   before `moveend` when the zoom changed. Both bubble up to the Map.
+ * - **The constraint on `R`.** `R` is a `transform.clone()` and carries the constrain override;
+ *   every `setZoom`/`setCenter` on it runs `constrainInternal()` (v6 9286, 9298, 9441), so a
+ *   frame's delta is constrained before the hook ever sees it. The hook's result is applied
+ *   with `setCenter`/`setZoom` on a clone too (v6 22459-22462), and constrained again.
  */
 import type { CameraUpdate, CameraUpdateFn, CameraUpdateResult } from '../../src/map/camera.js';
 
@@ -82,8 +97,12 @@ export class FakeCamera extends Emitter {
   /** `R`: the requested state, absent between moves. Named as in MapLibre. */
   _requestedCameraState?: CameraState;
   transformCameraUpdate: CameraUpdateFn | null = null;
+  /** The `transformConstrain` override, applied wherever MapLibre's setters would apply it. */
+  constrain: ((center: LngLat, zoom: number) => { center: LngLat; zoom: number }) | null = null;
   /** Stands in for `_easeFrameId`: set while an ease is running. */
   #ease: object | undefined;
+  /** Stands in for `_zooming` during an ease: `_afterEase` fires `zoomend` when it is set. */
+  #easeZooming = false;
 
   constructor(center: readonly [number, number], zoom: number) {
     super();
@@ -106,7 +125,33 @@ export class FakeCamera extends Emitter {
     // Store the returned object by reference, as `setCenter(center)` does.
     if (result.center) final.center = result.center;
     if (typeof result['zoom'] === 'number') final.zoom = result['zoom'];
+    // v6 22459-22462: the result goes through `setCenter`/`setZoom`, which constrain.
+    if (result.center || typeof result['zoom'] === 'number') this.#constrainState(final);
     this.transform = final;
+  }
+
+  /**
+   * Apply one frame's delta to a state, then constrain it as MapLibre's `setZoom`/`setCenter`
+   * do (`constrainInternal`, v6 9441-9449).
+   */
+  applyTo(state: CameraState, frame: Frame): void {
+    if (frame.center) state.center = { lng: frame.center[0], lat: frame.center[1] };
+    if (frame.zoom !== undefined) state.zoom = frame.zoom;
+    if (frame.zoomDelta !== undefined) state.zoom += frame.zoomDelta;
+    if (frame.panDelta) {
+      state.center = {
+        lng: state.center.lng + frame.panDelta[0],
+        lat: state.center.lat + frame.panDelta[1],
+      };
+    }
+    this.#constrainState(state);
+  }
+
+  #constrainState(state: CameraState): void {
+    if (!this.constrain) return;
+    const { center, zoom } = this.constrain(state.center, state.zoom);
+    state.center = center;
+    state.zoom = zoom;
   }
 
   /** v6 22611: `!!this._easeFrameId`. */
@@ -114,10 +159,16 @@ export class FakeCamera extends Emitter {
     return this.#ease !== undefined;
   }
 
-  /** Mark an ease as running; returns its token. */
-  startEase(): object {
+  /** Mark an ease as running; returns its token. `zooming` as `easeTo` sets `_zooming`. */
+  startEase(zooming = false): object {
     this.#ease = {};
+    this.#easeZooming = zooming;
     return this.#ease;
+  }
+
+  /** An ease frame changed the zoom, so `_afterEase` will fire `zoomend`. */
+  markEaseZooming(): void {
+    this.#easeZooming = true;
   }
 
   isCurrentEase(token: object): boolean {
@@ -125,12 +176,16 @@ export class FakeCamera extends Emitter {
   }
 
   /**
-   * `stop()` (v6 22617): ending a running ease runs `_afterEase`, which fires the Camera's
+   * `stop()` (v6 22617-22627): `_easeFrameId` is deleted first, so `isEasing()` is already
+   * false when `_afterEase` fires `zoomend` (if the ease was zooming) and then the Camera's
    * `moveend` (v6 22478-22495). With no ease running it does nothing.
    */
   stop(): void {
     if (this.#ease === undefined) return;
     this.#ease = undefined;
+    const zooming = this.#easeZooming;
+    this.#easeZooming = false;
+    if (zooming) this.fire('zoomend');
     this.fire('moveend');
   }
 }
@@ -149,18 +204,6 @@ export interface Frame {
   panDelta?: readonly [number, number];
 }
 
-function applyTo(state: CameraState, frame: Frame): void {
-  if (frame.center) state.center = { lng: frame.center[0], lat: frame.center[1] };
-  if (frame.zoom !== undefined) state.zoom = frame.zoom;
-  if (frame.zoomDelta !== undefined) state.zoom += frame.zoomDelta;
-  if (frame.panDelta) {
-    state.center = {
-      lng: state.center.lng + frame.panDelta[0],
-      lat: state.center.lat + frame.panDelta[1],
-    };
-  }
-}
-
 /** A running `easeTo`/`flyTo`, including a double-click zoom. */
 export interface FakeEase {
   /** One animation frame, applied to the `R` captured when the ease started (v6 22368). */
@@ -173,8 +216,22 @@ export interface FakeEase {
 export abstract class FakeMapBase {
   protected readonly camera: FakeCamera;
 
+  /**
+   * Whether the current gesture zoomed / panned: which `*end` events `endGesture` fires.
+   * TS-private rather than `#`, because `FakeV5Map` is wrapped in a Proxy.
+   */
+  private gestureZoomed = false;
+  private gesturePanned = false;
+
   constructor(center: readonly [number, number], zoom: number) {
     this.camera = new FakeCamera(center, zoom);
+  }
+
+  /** `map.setTransformConstrain(fn)` (v6 24448): the override on the camera's transform. */
+  setTransformConstrain(
+    constrain: ((center: LngLat, zoom: number) => { center: LngLat; zoom: number }) | null,
+  ): void {
+    this.camera.constrain = constrain;
   }
 
   /** `T.center`: the rendered centre. */
@@ -205,18 +262,41 @@ export abstract class FakeMapBase {
   applyFrame(frame: Frame): void {
     const requested = this.camera.getTransformForUpdate();
     this.camera.stop();
-    applyTo(requested, frame);
+    if (frame.zoom !== undefined || frame.zoomDelta !== undefined) this.gestureZoomed = true;
+    if (frame.center || frame.panDelta) this.gesturePanned = true;
+    this.camera.applyTo(requested, frame);
     this.camera.applyUpdatedTransform(requested);
   }
 
   /**
-   * End a gesture. With inertia the HandlerManager hands over to `easeTo`, whose `moveend` the
-   * Camera fires (v6 22495). Without it, the HandlerManager fires `moveend` on the Map
-   * (v6 22022); scroll zoom always ends that way.
+   * End a gesture (v6 21992-22025, v5 68680-68718). The HandlerManager first fires the finished
+   * gesture's `*end` events on the Map: `zoomend` if it zoomed, `dragend` if it panned.
+   *
+   * - Without inertia it then fires `moveend` on the Map (v6 22022); scroll zoom always ends
+   *   that way. Returns `undefined`.
+   * - With inertia it calls `easeTo` (v6 22018) and returns that ease. Like any `easeTo` it
+   *   works on whatever `getTransformForUpdate()` returns at that moment: the surviving `R`, or
+   *   a fresh clone of `T` if something deleted it. Its options are computed from the rendered
+   *   transform, so the caller passes `center: [T.center.lng, T.center.lat]` in the first
+   *   frame, as `handlePanInertia(finalPan, camera.transform)` does (v6 19637). The ease is
+   *   zooming (its end fires `zoomend`) if the gesture zoomed, unless `inertialZoom` says
+   *   otherwise: inertia measures only the last ~160 ms of deltas, which may hold no zoom.
    */
-  endGesture({ inertia = false }: { inertia?: boolean } = {}): void {
-    if (inertia) this.camera.fire('moveend');
-    else this.fireMapMoveEnd();
+  endGesture({
+    inertia = false,
+    inertialZoom,
+  }: { inertia?: boolean; inertialZoom?: boolean } = {}): FakeEase | undefined {
+    const zoomed = this.gestureZoomed;
+    const panned = this.gesturePanned;
+    this.gestureZoomed = false;
+    this.gesturePanned = false;
+    if (zoomed) this.fireOnMap('zoomend');
+    if (panned) this.fireOnMap('dragend');
+    if (!inertia) {
+      this.fireMapMoveEnd();
+      return undefined;
+    }
+    return this.easeTo({ zooming: inertialZoom ?? zoomed });
   }
 
   /**
@@ -228,27 +308,39 @@ export abstract class FakeMapBase {
     this.fireOnMap('moveend');
   }
 
-  /** `jumpTo` (v6 22257): `stop()` first, then one frame, then the Camera's own `moveend`. */
+  /**
+   * `jumpTo` (v6 22257-22288): `stop()` first, then one frame, then the Camera's own `zoomend`
+   * (when the zoom changed) and `moveend`.
+   */
   jumpTo(frame: Frame): void {
     this.camera.stop();
     const requested = this.camera.getTransformForUpdate();
-    applyTo(requested, frame);
+    const oldZoom = requested.zoom;
+    this.camera.applyTo(requested, frame);
     this.camera.applyUpdatedTransform(requested);
+    if (requested.zoom !== oldZoom) this.camera.fire('zoomend');
     this.camera.fire('moveend');
   }
 
-  /** `easeTo`/`flyTo` (v6 22321-22330): `stop()` first, then capture `R` for every frame. */
-  easeTo(): FakeEase {
+  /**
+   * `easeTo`/`flyTo` (v6 22321-22330): `stop()` first, then capture `R` for every frame.
+   * `zooming` sets `_zooming` up front, as `easeTo` does for a zoom target and `flyTo` always
+   * does (v6 22583); a frame that changes the zoom sets it too.
+   */
+  easeTo({ zooming = false }: { zooming?: boolean } = {}): FakeEase {
     this.camera.stop();
     const requested = this.camera.getTransformForUpdate();
-    const ease = this.camera.startEase();
+    const ease = this.camera.startEase(zooming);
     const assertRunning = () => {
       if (!this.camera.isCurrentEase(ease)) throw new Error('This ease was stopped.');
     };
     return {
       frame: (frame) => {
         assertRunning();
-        applyTo(requested, frame);
+        if (frame.zoom !== undefined || frame.zoomDelta !== undefined) {
+          this.camera.markEaseZooming();
+        }
+        this.camera.applyTo(requested, frame);
         this.camera.applyUpdatedTransform(requested);
       },
       finish: () => {
@@ -264,6 +356,22 @@ export abstract class FakeMapBase {
 
 /** MapLibre v5: `Map extends Camera`, so the Map and the Camera are one emitter. */
 export class FakeV5Map extends FakeMapBase {
+  constructor(center: readonly [number, number], zoom: number) {
+    super(center, zoom);
+    // On v5 `_requestedCameraState` is an own property of the Map (dev.js 69587), and
+    // `delete map._requestedCameraState` removes it (68763). A getter alone would make that
+    // `delete` a silent no-op, so forward it to the camera.
+    return new Proxy(this, {
+      deleteProperty: (target, key) => {
+        if (key === '_requestedCameraState') {
+          delete target.camera._requestedCameraState;
+          return true;
+        }
+        return Reflect.deleteProperty(target, key);
+      },
+    });
+  }
+
   get transformCameraUpdate(): CameraUpdateFn | null {
     return this.camera.transformCameraUpdate;
   }

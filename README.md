@@ -122,10 +122,15 @@ import { installEqualEarthConstrain } from '@yellowmap/maplibre-gl-equal-earth';
 
 const uninstall = installEqualEarthConstrain(map, {
   lngLatFactory: (lng, lat) => new LngLat(lng, lat),
-  isActive: () => equalEarthEnabled,   // inert under Mercator and globe
+  isActive: () => equalEarthEnabled,   // only MapLibre's own constraint under Mercator and globe
   latitudeMargin: 2,
 });
 ```
+
+The plugin composes with MapLibre's own constraint (min/max zoom, `maxBounds`), tightening the
+latitude only in Equal Earth bands. With an adaptive `BandCamera`, pass `bands` and
+`baselineBand: () => camera.baselineBand` as well, so that zooming out across a band boundary
+does not clamp a high-latitude centre against the lower band's edge.
 
 This uses `transformConstrain` rather than `transformCameraUpdate`, because it survives a
 projection switch — `migrateProjection` replaces the transform wholesale.
