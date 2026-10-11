@@ -2,7 +2,9 @@
  * Minimal ambient declarations for the two tile libraries that ship no types.
  *
  * `@types/geojson-vt` exists but describes the v3 namespace-style export, which does not
- * match v4's ESM default export, so it is declared here instead.
+ * match v4's ESM default export, so it is declared here instead. geojson-vt is a dev
+ * dependency only: `tests/clip.test.ts` keeps it as the reference the direct clip is
+ * compared against.
  */
 
 declare module 'geojson-vt' {
@@ -26,8 +28,11 @@ declare module 'geojson-vt' {
     generateId?: boolean;
   }
 
-  /** A geometry as geojson-vt emits it: flat `[x, y, x, y, …]` rings, or a point pair. */
-  export type GeoJSONVTGeometry = number[] | number[][];
+  /**
+   * A geometry in a tile returned by `getTile` (already transformed to tile units): points
+   * `[[x, y], …]`, lines and polygons `[[[x, y], …], …]`.
+   */
+  export type GeoJSONVTGeometry = number[][] | number[][][];
 
   export interface GeoJSONVTFeature {
     /** 1 = point, 2 = linestring, 3 = polygon. */
@@ -67,17 +72,19 @@ declare module 'geojson-vt' {
 }
 
 declare module 'vt-pbf' {
-  import type { GeoJSONVTTile } from 'geojson-vt';
-
   export interface FromGeojsonVtOptions {
     /** Vector tile spec version. MapLibre expects 2. */
     version?: number;
     extent?: number;
   }
 
-  /** Serialise geojson-vt tiles, keyed by layer name, to an uncompressed MVT buffer. */
+  /**
+   * Serialise tiles, keyed by layer name, to an uncompressed MVT buffer. Each layer needs only
+   * `features`, each `{ type, geometry, tags, id? }` in tile units: `TileFeature` from
+   * `src/tiles/clip.ts`, or a tile from geojson-vt's `getTile`. Typed loosely so both fit.
+   */
   export function fromGeojsonVt(
-    layers: Record<string, GeoJSONVTTile>,
+    layers: Record<string, { readonly features: readonly unknown[] }>,
     options?: FromGeojsonVtOptions,
   ): Uint8Array;
 

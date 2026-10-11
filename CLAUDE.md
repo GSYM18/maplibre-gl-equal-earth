@@ -82,13 +82,17 @@ affects the absolute metre values from `toEqualEarth`.
   two-band form).
 - `src/map/constrain.ts` — camera clamp to the Equal Earth world, via `transformConstrain`.
 - `src/tiles/tile-cover.ts` — output tile → covering source Mercator tiles.
-- `src/tiles/mvt.ts` — decode → densify → warp → reslice → encode.
+- `src/tiles/mvt.ts` — decode → dedupe label points → densify → warp → clip → encode.
+- `src/tiles/clip.ts` — direct clip into the buffered output tile (Sutherland–Hodgman rings,
+  Liang–Barsky segments). Replaced geojson-vt, which is now a devDependency kept only as the
+  reference in `tests/clip.test.ts`.
 - `src/tiles/protocol.ts` — the `eqearth://` handler and its URL codec.
 - `src/tiles/worker-entry.ts` — built twice by `vite.worker.config.ts`, as `dist/worker.mjs`
   (v6, dynamic `import()`) and `dist/worker.iife.js` (v5, classic `importScripts`). Both must be
   self-contained: v5 cannot parse `import`, and v6 imports non-`.mjs` scripts via a `blob:` URL
   where relative specifiers cannot resolve.
-- `src/tiles/cache.ts` — byte-bounded LRU + in-flight request coalescing.
+- `src/tiles/cache.ts` — byte-bounded LRU (raw tiles), count-bounded `EntryCache` (decoded
+  tiles), in-flight request coalescing.
 - `vite.worker.config.ts` — builds the two worker bundles (see `worker-entry.ts`).
 - `demo/` + root `index.html` — Vite demo pages, not part of the published package.
 - `scripts/check-exports.mjs` — build-artifact drift guard.
@@ -187,10 +191,11 @@ missing two that do. Never reintroduce `git add -f dist/`.
 Numbers from `scripts/probe-openfreemap.ts` against live OpenFreeMap Liberty. Keep these in
 mind before "optimising" anything here.
 
-- **Warp cost is 100–450 ms per output tile** (z0–z3, Node). That is why the protocol is
+- **Warp cost was 100–450 ms per output tile** (z0–z3, Node, before the direct clip and the
+  decode cache; ~20–70 ms now, single-shot in the probe). That is why the protocol is
   registered in the worker pool, not on the main thread.
 - **Source volume dominates, not CPU.** Output tile 2/1/1 needs 9 source tiles totalling
-  9.4 MB to produce 516 kB. The byte-bounded LRU plus request coalescing in `cache.ts` is
+  9.4 MB to produce 225 kB. The byte-bounded LRU plus request coalescing in `cache.ts` is
   what makes this viable: neighbouring output tiles share nearly all of their source cover.
 - **Subdivision adds only 1–3% vertices on real data.** This surprised us and is worth not
   re-litigating: OpenMapTiles/Planetiler geometry is already vertex-dense at low zoom, so
@@ -198,8 +203,26 @@ mind before "optimising" anything here.
   scales with the *square* of segment length. Subdivision is not broken — `tests/tiles.test.ts`
   proves a long meridian gains >5× vertices end to end — it simply finds little to do. The
   visual risk from straight chords is therefore much smaller than anticipated.
-- **`simplifyTolerance` defaults to 0, not geojson-vt's 3.** At 3 it deletes exactly the
-  vertices subdivision adds. There is a regression test for this.
+- **Decode dominated, not the clip.** Decoding the 9 sources of 2/1/1 costs ~140–170 ms and
+  ~40 MB of heap (decoded GeoJSON is ~4.4× the raw bytes); building the tile from them costs
+  ~35–45 ms warmed. So the protocol keeps a per-worker `EntryCache` of decoded source tiles
+  by URL (default 32, `ProtocolOptions.decodedTiles`): one decode serves every band and every
+  overlapping output tile. Warmed, per output tile with the decode cached: 2/1/1 218 → 45 ms,
+  3/4/3 131 → 24 ms against the old decode + geojson-vt path.
+- **The direct clip (`clip.ts`) replaced geojson-vt** and matches it per layer on real tiles
+  (feature counts, line lengths and ring areas); it does not wrap world copies into the
+  buffer, which geojson-vt did at z0–1. Build alone is only ~1.5–2× faster: the profile is
+  dominated by the warp's projection maths (~40%: `toEqualEarth` runs twice per vertex, and
+  map-space lng/lat makes a Mercator round trip), then vt-pbf's property encoding (~17%;
+  OpenFreeMap features carry ~80 `name:*` tags), densify (~10%) and the clip itself (~10%).
+  A cheap geographic-bbox reject against the tile's pre-image skips the warp for features
+  wholly outside it. Nothing is simplified (the old `simplifyTolerance` is gone), so
+  subdivision vertices survive; `tests/tiles.test.ts` pins that.
+- **Label points were emitted once per source tile.** OpenFreeMap z2 tiles repeat a label in
+  up to 9 source tiles' buffers; the old output for 2/1/1 held 1959 place points of which 228
+  were distinct, and was 503 kB instead of 225 kB. `mergeLayers` now drops a point whose
+  in-world positions (world copies beyond ±180° ignored) were already seen with the same `id`
+  in that layer.
 - **Equal Earth fills only ~49% of the Mercator grid vertically**, so whole rows of tiles
   (e.g. z2/0/0) are outside the world. `sourceTilesFor` returns `[]` for those and the
   protocol short-circuits without fetching.

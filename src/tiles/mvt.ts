@@ -1,15 +1,13 @@
 /**
- * The tile warp: decode → densify → warp → reslice → encode.
+ * The tile warp: decode → densify → warp → clip → encode.
  *
- * Clipping and reslicing are delegated to `geojson-vt` rather than hand-written. That is a
- * deliberate call: correct polygon clipping with winding preservation, buffers and
- * simplification is a large amount of subtle geometry code, and `geojson-vt` is the very
- * library MapLibre uses for its own GeoJSON sources — so its output is exactly what the
- * renderer already expects.
+ * Clipping to the output tile is `clip.ts` (Sutherland–Hodgman / Liang–Barsky straight into
+ * integer tile units). It replaced `geojson-vt`, which built a tile index per output tile and
+ * per layer; the encoder is still vt-pbf, fed the same tile structure. Decoding is the largest
+ * cost, which is why the protocol caches decoded source tiles (`protocol.ts`).
  */
 
 import { VectorTile } from '@mapbox/vector-tile';
-import geojsonvt, { type GeoJSONVTTile } from 'geojson-vt';
 // pbf 5 split the old default-exported `Pbf` class into PbfReader/PbfWriter.
 import { PbfReader } from 'pbf';
 import { fromGeojsonVt } from 'vt-pbf';
@@ -23,7 +21,8 @@ import {
 import { geographicToMap } from '../math/backproject.js';
 import type { LngLatTuple } from '../math/equal-earth.js';
 import { densify, TILE_EXTENT, toleranceForZoom } from '../math/subdivide.js';
-import type { TileId } from './tile-cover.js';
+import { clipFeatureToTile, type TileFeature } from './clip.js';
+import { preimageBBox, type BBox, type TileId } from './tile-cover.js';
 
 export interface WarpTileOptions {
   /** Output tile extent. @defaultValue 4096 */
@@ -39,22 +38,6 @@ export interface WarpTileOptions {
   toleranceTileUnits?: number;
   /** Hard recursion cap for subdivision. @defaultValue 8 */
   maxDepth?: number;
-  /**
-   * `geojson-vt` simplification tolerance, in tile units.
-   *
-   * **Defaults to 0 (disabled), unlike geojson-vt's own default of 3.** Douglas–Peucker
-   * drops any vertex lying within the tolerance of its neighbours' chord — which is
-   * precisely the set of vertices adaptive subdivision just added. With geojson-vt's
-   * default of 3 against a subdivision target of 1, simplification removed essentially all
-   * of them and the warp degenerated to plain vertex displacement (measured: 1.00–1.04×
-   * vertex count, i.e. no curvature recovered at all).
-   *
-   * Densification is already adaptive and emits a near-minimal vertex set, so there is
-   * little left to simplify. If you do enable it, keep it below `toleranceTileUnits`.
-   *
-   * @defaultValue 0
-   */
-  simplifyTolerance?: number;
   /** Restrict to these source layers. Omit to keep all. */
   layers?: readonly string[];
   /** Blend of the zoom band this tile is built for: 0 Equal Earth … 1 Mercator. @defaultValue 0 */
@@ -95,14 +78,53 @@ export function decodeToGeographic(
   return result;
 }
 
-/** Merge decoded source tiles into one set of layers. */
+/**
+ * Merge decoded source tiles into one set of layers.
+ *
+ * A label point near a source tile edge is repeated in the neighbouring tile's buffer, at the
+ * same integer global position, so it decodes to identical coordinates from both; low-zoom
+ * OpenFreeMap tiles carry a label in up to nine source tiles. A `Point` that repeats an
+ * earlier one in the same layer with the same `id` and coordinates is that duplicate and is
+ * dropped; otherwise the output tile would place the label once per source tile.
+ *
+ * Some tiles carry the same label as a `MultiPoint` with a world copy (Algeria at 3° and
+ * −357°), others as a plain `Point`. The copy beyond ±180° is removed before warping anyway, so
+ * only positions inside the world are compared: a `Point` or `MultiPoint` none of whose
+ * in-world positions is new for its `id` is dropped. Features without an `id` are kept:
+ * nothing says they are the same feature.
+ */
 export function mergeLayers(tiles: readonly GeographicLayers[]): GeographicLayers {
   const merged: GeographicLayers = new Map();
+  const seenPoints = new Map<string, Set<string>>();
   for (const tile of tiles) {
     for (const [name, features] of tile) {
-      const existing = merged.get(name);
-      if (existing) existing.push(...features);
-      else merged.set(name, [...features]);
+      let target = merged.get(name);
+      if (!target) {
+        target = [];
+        merged.set(name, target);
+      }
+      for (const feature of features) {
+        const geometry = feature.geometry;
+        if (feature.id !== undefined && (geometry.type === 'Point' || geometry.type === 'MultiPoint')) {
+          let seen = seenPoints.get(name);
+          if (!seen) {
+            seen = new Set();
+            seenPoints.set(name, seen);
+          }
+          const positions = geometry.type === 'Point' ? [geometry.coordinates] : geometry.coordinates;
+          let fresh = false;
+          for (const [lng, lat] of positions) {
+            if (Math.abs(lng!) > 180) continue;
+            const key = `${feature.id}|${lng}|${lat}`;
+            if (!seen.has(key)) {
+              seen.add(key);
+              fresh = true;
+            }
+          }
+          if (!fresh) continue;
+        }
+        target.push(feature);
+      }
     }
   }
   return merged;
@@ -112,9 +134,8 @@ export function mergeLayers(tiles: readonly GeographicLayers[]): GeographicLayer
  * Clip, densify and warp a feature's geometry from geographic into map space.
  *
  * Geometry is first clipped to longitude [-180, 180]. Equal Earth is not periodic in
- * longitude, so world copies cannot be warped faithfully, and `geojson-vt` would fold them
- * back into the map at the wrong place (see `antimeridian.ts`). Returns `null` when nothing
- * is left.
+ * longitude, so world copies cannot be warped faithfully: they would land in the map at the
+ * wrong place (see `antimeridian.ts`). Returns `null` when nothing is left.
  *
  * Points are warped without densification — there is nothing between a point and itself.
  */
@@ -205,37 +226,65 @@ export function buildTile(
   const tolerance = toleranceForZoom(output.z, options.toleranceTileUnits ?? 1);
   const blend = options.blend ?? 0;
 
-  const encoded: Record<string, GeoJSONVTTile> = {};
+  // Most features handed in lie wholly outside this output tile: the source cover overlaps
+  // several output tiles, and low-zoom source tiles carry wide buffers. Rejecting them on
+  // their geographic bounding box skips the warp, which dominates the cost. The pre-image is
+  // taken with twice the tile buffer, so a feature whose densified chords could still reach
+  // the buffered tile is never rejected.
+  const reach = preimageBBox(output, { blend, buffer: (2 * buffer * TILE_EXTENT) / extent });
+  if (!reach) return new Uint8Array(0);
+
+  const encoded: Record<string, { features: TileFeature[] }> = {};
 
   for (const [name, features] of sourceLayers) {
-    const warped: GeoJSON.Feature[] = [];
+    const clipped: TileFeature[] = [];
     for (const feature of features) {
-      const result = warpFeature(feature, tolerance, maxDepth, blend);
-      if (result) warped.push(result);
+      if (!mayReach(feature.geometry, reach)) continue;
+      const warped = warpFeature(feature, tolerance, maxDepth, blend);
+      if (!warped) continue;
+      const result = clipFeatureToTile(warped, output, extent, buffer);
+      if (result) clipped.push(result);
     }
-    if (warped.length === 0) continue;
-
-    // `indexMaxZoom: 0` keeps indexing lazy, so only the requested tile is clipped
-    // rather than a whole pyramid being materialised for a single request.
-    const index = geojsonvt(
-      { type: 'FeatureCollection', features: warped },
-      {
-        maxZoom: Math.max(output.z, 1),
-        indexMaxZoom: 0,
-        tolerance: options.simplifyTolerance ?? 0,
-        extent,
-        buffer,
-        debug: 0,
-      },
-    );
-
-    const tile = index.getTile(output.z, output.x, output.y);
-    if (tile && tile.features.length > 0) encoded[name] = tile;
+    if (clipped.length > 0) encoded[name] = { features: clipped };
   }
 
   if (Object.keys(encoded).length === 0) return new Uint8Array(0);
 
   return fromGeojsonVt(encoded, { version: 2, extent });
+}
+
+/** Whether a geometry's geographic bounding box intersects `bbox` (`[west, south, east, north]`). */
+function mayReach(geometry: GeoJSON.Geometry | null, bbox: BBox): boolean {
+  if (!geometry || geometry.type === 'GeometryCollection') return false;
+  let west = Infinity;
+  let south = Infinity;
+  let east = -Infinity;
+  let north = -Infinity;
+  const extend = (p: GeoJSON.Position): void => {
+    const lng = p[0]!;
+    const lat = p[1]!;
+    if (lng < west) west = lng;
+    if (lng > east) east = lng;
+    if (lat < south) south = lat;
+    if (lat > north) north = lat;
+  };
+  switch (geometry.type) {
+    case 'Point':
+      extend(geometry.coordinates);
+      break;
+    case 'MultiPoint':
+    case 'LineString':
+      geometry.coordinates.forEach(extend);
+      break;
+    case 'MultiLineString':
+    case 'Polygon':
+      for (const line of geometry.coordinates) line.forEach(extend);
+      break;
+    case 'MultiPolygon':
+      for (const polygon of geometry.coordinates) for (const ring of polygon) ring.forEach(extend);
+      break;
+  }
+  return west <= bbox[2] && east >= bbox[0] && south <= bbox[3] && north >= bbox[1];
 }
 
 /**

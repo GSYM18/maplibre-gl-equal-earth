@@ -109,6 +109,8 @@ export {
   type WarpTileOptions,
 } from './tiles/mvt.js';
 
+export { clipFeatureToTile, type TileFeature } from './tiles/clip.js';
+
 export {
   PROTOCOL_SCHEME,
   createEqualEarthProtocol,
@@ -122,6 +124,7 @@ export {
 } from './tiles/protocol.js';
 
 export {
+  EntryCache,
   RequestCoalescer,
   TileCache,
   type TileCacheOptions,

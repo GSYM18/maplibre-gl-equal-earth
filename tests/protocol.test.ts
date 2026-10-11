@@ -1,6 +1,10 @@
+import { VectorTile } from '@mapbox/vector-tile';
+import { PbfReader } from 'pbf';
+import { fromGeojsonVt } from 'vt-pbf';
 import { describe, expect, it, vi } from 'vitest';
 
-import { RequestCoalescer, TileCache } from '../src/tiles/cache.js';
+import { EntryCache, RequestCoalescer, TileCache } from '../src/tiles/cache.js';
+import * as mvt from '../src/tiles/mvt.js';
 import { sourceTilesFor } from '../src/tiles/tile-cover.js';
 import {
   createEqualEarthProtocol,
@@ -125,6 +129,40 @@ describe('TileCache', () => {
   });
 });
 
+describe('EntryCache', () => {
+  it('evicts the least recently used entry beyond maxEntries', () => {
+    const cache = new EntryCache<number>(2);
+    cache.set('a', 1);
+    cache.set('b', 2);
+    cache.set('c', 3);
+
+    expect(cache.size).toBe(2);
+    expect(cache.get('a')).toBeUndefined();
+    expect(cache.get('b')).toBe(2);
+    expect(cache.get('c')).toBe(3);
+  });
+
+  it('refreshes recency on get', () => {
+    const cache = new EntryCache<number>(2);
+    cache.set('a', 1);
+    cache.set('b', 2);
+    cache.get('a'); // b is now the oldest
+    cache.set('c', 3);
+
+    expect(cache.get('b')).toBeUndefined();
+    expect(cache.get('a')).toBe(1);
+    expect(cache.get('c')).toBe(3);
+  });
+
+  it('replaces an existing key without growing', () => {
+    const cache = new EntryCache<number>(2);
+    cache.set('a', 1);
+    cache.set('a', 2);
+    expect(cache.size).toBe(1);
+    expect(cache.get('a')).toBe(2);
+  });
+});
+
 describe('RequestCoalescer', () => {
   it('runs a task once for concurrent callers', async () => {
     const coalescer = new RequestCoalescer<number>();
@@ -181,6 +219,61 @@ describe('RequestCoalescer', () => {
     expect(await Promise.all([first, third])).toEqual([9, 9]);
     expect(task).toHaveBeenCalledOnce();
     expect(taskSignal.aborted).toBe(false);
+  });
+
+  it("aborts the shared task when its only caller aborts, and a dead task's settlement leaves a fresh entry alone", async () => {
+    const coalescer = new RequestCoalescer<number>();
+    const signals: AbortSignal[] = [];
+    const releases: ((value: number) => void)[] = [];
+    const rejections: ((reason: unknown) => void)[] = [];
+    // The task deliberately ignores its signal, so it settles only when the test says so:
+    // that is what lets the first task settle *after* the second entry exists.
+    const task = vi.fn((signal: AbortSignal) => {
+      signals.push(signal);
+      return new Promise<number>((resolve, reject) => {
+        releases.push(resolve);
+        rejections.push(reject);
+      });
+    });
+
+    const only = new AbortController();
+    const first = coalescer.run('k', task, only.signal);
+    only.abort();
+
+    await expect(first).rejects.toMatchObject({ name: 'AbortError' });
+    expect(signals[0]!.aborted).toBe(true);
+    expect(coalescer.pending).toBe(0);
+
+    const second = coalescer.run('k', task, new AbortController().signal);
+    expect(task).toHaveBeenCalledTimes(2);
+    expect(coalescer.pending).toBe(1);
+
+    // The dead task settles now; its `finally` must not delete the fresh entry.
+    rejections[0]!(new DOMException('aborted', 'AbortError'));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(coalescer.pending).toBe(1);
+
+    releases[1]!(5);
+    expect(await second).toBe(5);
+    expect(coalescer.pending).toBe(0);
+  });
+
+  it('removes the entry on settlement, so the next call is served from the value cache', async () => {
+    const coalescer = new RequestCoalescer<number>();
+    const values = new Map<string, number>();
+    const task = vi.fn(async () => {
+      values.set('k', 11);
+      return 11;
+    });
+    // The protocol's `loadSource` pattern: value cache first, coalescer only on a miss.
+    const load = (signal: AbortSignal): Promise<number> =>
+      values.has('k') ? Promise.resolve(values.get('k')!) : coalescer.run('k', task, signal);
+
+    expect(await load(new AbortController().signal)).toBe(11);
+    expect(coalescer.pending).toBe(0);
+    expect(await load(new AbortController().signal)).toBe(11);
+    expect(task).toHaveBeenCalledOnce();
+    expect(coalescer.pending).toBe(0);
   });
 });
 
@@ -275,6 +368,58 @@ describe('protocol handler', () => {
 
     expect(first.data.byteLength).toBe(0);
     expect(second.data.byteLength).toBe(3);
+  });
+
+  /** A small MVT with one polygon covering the whole tile, in layers `a` and `b`. */
+  function sourceTileBytes(): Uint8Array {
+    const square = {
+      type: 3 as const,
+      geometry: [[[0, 0], [4096, 0], [4096, 4096], [0, 4096], [0, 0]]],
+      tags: { kind: 'square' },
+    };
+    return fromGeojsonVt({ a: { features: [square] }, b: { features: [square] } }, { version: 2, extent: 4096 });
+  }
+
+  it('decodes each source tile once across bands', async () => {
+    const bytes = sourceTileBytes();
+    const fetchImpl = vi.fn(async () => new Response(bytes.slice()));
+    const handler = createEqualEarthProtocol({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    const decode = vi.spyOn(mvt, 'decodeToGeographic');
+
+    try {
+      const tile = { z: 1, x: 0, y: 1 };
+      await handler({ url: tileUrl(tile.z, tile.x, tile.y, 0) }, new AbortController());
+      await handler({ url: tileUrl(tile.z, tile.x, tile.y, 1 / 3) }, new AbortController());
+
+      const keys = (blend: number) =>
+        sourceTilesFor(tile, { blend }).map((source) => expandTemplate(UPSTREAM, source));
+      const union = new Set([...keys(0), ...keys(1 / 3)]);
+      // The two bands share source tiles, so decoding per band would decode some twice.
+      expect(keys(0).length + keys(1 / 3).length).toBeGreaterThan(union.size);
+      expect(fetchImpl).toHaveBeenCalledTimes(union.size);
+      expect(decode).toHaveBeenCalledTimes(union.size);
+    } finally {
+      decode.mockRestore();
+    }
+  });
+
+  it('applies a layer filter to a cached decode', async () => {
+    const bytes = sourceTileBytes();
+    const fetchImpl = vi.fn(async () => new Response(bytes.slice()));
+    const handler = createEqualEarthProtocol({ fetchImpl: fetchImpl as unknown as typeof fetch });
+    const layersOf = (data: ArrayBuffer) =>
+      Object.keys(new VectorTile(new PbfReader(new Uint8Array(data))).layers).sort();
+
+    const all = await handler({ url: tileUrl(0, 0, 0) }, new AbortController());
+    const onlyA = encodeSourceUrl({ url: UPSTREAM, layers: ['a'] })
+      .replace('{z}', '0')
+      .replace('{x}', '0')
+      .replace('{y}', '0');
+    const filtered = await handler({ url: onlyA }, new AbortController());
+
+    expect(layersOf(all.data)).toEqual(['a', 'b']);
+    expect(layersOf(filtered.data)).toEqual(['a']);
+    expect(fetchImpl).toHaveBeenCalledOnce();
   });
 
   describe('aborts', () => {
