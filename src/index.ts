@@ -129,10 +129,11 @@ export {
 
 export {
   REWRITTEN_METADATA_KEY,
-  gateByState,
+  applyGate,
   rewriteStyle,
-  showKey,
-  symKey,
+  type GateHost,
+  type GatePhase,
+  type LayerGate,
   type RewriteOptions,
   type RewrittenStyle,
   type SourceTemplate,
