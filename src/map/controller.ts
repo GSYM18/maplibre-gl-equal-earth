@@ -96,7 +96,7 @@ export interface ControllerHost extends CameraHost, ConstrainHost, SwitcherHost 
   getBearing(): number;
   getRenderWorldCopies(): boolean;
   setRenderWorldCopies(value: boolean): unknown;
-  fire?(event: unknown): unknown;
+  fire?(event: unknown, properties?: object): unknown;
   /** Both majors: whether anything listens for an event type (`Evented.listens`). */
   listens?(type: string): boolean;
 }

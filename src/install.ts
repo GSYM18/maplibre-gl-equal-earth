@@ -245,6 +245,14 @@ async function install(
       }
       controllerFor(this)
         .activate(type as 'equal' | 'equal-earth')
+        .then(() => {
+          // Only a committed activation: a superseded one rejects, and a deactivation that
+          // overtook it leaves the controller without this type. MapLibre's own
+          // `GlobeControl`, `Marker` and `Popup` listen for this event.
+          if (controllerFor(this).projection === type) {
+            this.fire?.('projectiontransition', { newProjection: type });
+          }
+        })
         .catch((error: unknown) => report(this, error));
       return this;
     }

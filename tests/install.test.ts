@@ -177,6 +177,31 @@ describe('installEqualEarth', () => {
     }
   });
 
+  it('announces a committed Equal Earth activation as projectiontransition, and nothing else', async () => {
+    const { module, FakeMap } = fakeModule();
+    const install = await installEqualEarth(module);
+    const fire = vi.fn();
+    const map = Object.assign(new FakeMap(), { listens: () => false, fire });
+    const controller = install.controllerFor(map as never);
+    vi.spyOn(controller, 'activate').mockResolvedValue(undefined);
+    vi.spyOn(controller, 'projection', 'get').mockReturnValue('equal');
+    map.setProjection({ type: 'equal' });
+    await vi.waitFor(() => expect(fire).toHaveBeenCalledTimes(1));
+    expect(fire).toHaveBeenCalledWith('projectiontransition', { newProjection: 'equal' });
+    // Superseded: the controller no longer shows the type.
+    fire.mockClear();
+    vi.spyOn(controller, 'projection', 'get').mockReturnValue(undefined);
+    map.setProjection({ type: 'equal' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fire).not.toHaveBeenCalled();
+    // Failed: rejects.
+    vi.spyOn(controller, 'activate').mockRejectedValue(new Error('x'));
+    map.setProjection({ type: 'equal' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(fire).not.toHaveBeenCalledWith('projectiontransition', expect.anything());
+    install.uninstall();
+  });
+
   it('does not report an activation a later setProjection superseded (M3)', async () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
     try {
