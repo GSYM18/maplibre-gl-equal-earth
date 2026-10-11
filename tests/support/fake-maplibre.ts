@@ -556,22 +556,25 @@ export type ControllerJump = Omit<Frame, 'center'> & { center?: readonly [number
  *
  * The style events follow MapLibre (v6 `src/`):
  *
- * - **Diff path** (the default): `setStyle` swaps the style synchronously and fires `style.load`
- *   inside the call (`Style.setState`, `style/style.ts:870`). `styledata` comes only from
- *   `Style.update` on the next render (`style.ts:784`), which `_render` runs *after* the camera
- *   frames (`ui/map.ts:4250` before `4279`).
- * - **Full rebuild** (`deferStyleData`): `setStyle` fires `styledataloading` synchronously
- *   (`Style.loadJSON`, `style.ts:452`) and the style is not loaded (`getStyle()` throws) until
- *   {@link flushStyleData}, which fires `styledata` and then `style.load` (`Style._load`, 499-500).
+ * - **Diff path** (a loaded style, `diff` not `false`): `setStyle` swaps the style synchronously
+ *   and fires `style.load` inside the call (`Style.setState`, `style/style.ts:870`). A diff with
+ *   no operations fires nothing (`setState` returns `false`, 857-859). `styledata` comes only
+ *   from `Style.update` on the next render (`style.ts:784`), which `_render` runs *after* the
+ *   camera frames (`ui/map.ts:4250` before `4279`).
+ * - **Full rebuild** (`diff: false`, no loaded style, or `deferStyleData` standing in for a diff
+ *   MapLibre cannot apply): `setStyle` fires `styledataloading` synchronously (`Style.loadJSON`,
+ *   `style.ts:452`) and the style is not loaded (`getStyle()` throws) until the next render, or
+ *   with `deferStyleData` until {@link flushStyleData}; then `styledata` and `style.load` fire
+ *   (`Style._load`, 499-500).
  *
- * A render ({@link render}, and after every `applyFrame`, `jumpTo` and ease frame) fires a pending
- * `styledata`, then `render`.
+ * A render ({@link render}, and after every `applyFrame`, `jumpTo` and ease frame) completes a
+ * pending rebuild (unless deferred), fires a pending `styledata`, then `render`.
  */
 export class FakeControllerHost extends FakeV6Map {
   /** The loaded style; `undefined` while none is (then `getStyle()` throws). */
   style: StyleLike | undefined;
   readonly setStyleCalls: { layers: number; diff: boolean | undefined }[] = [];
-  /** Model the full-rebuild path: the next `setStyle` loads only on {@link flushStyleData}. */
+  /** Model a diff MapLibre cannot apply: every `setStyle` rebuilds, loading only on {@link flushStyleData}. */
   deferStyleData = false;
   #pendingStyle: StyleLike | undefined;
   /** A style change awaits the next render's `Style.update`, which fires `styledata`. */
@@ -607,29 +610,45 @@ export class FakeControllerHost extends FakeV6Map {
 
   setStyle(style: StyleLike, options?: { diff?: boolean }): this {
     this.setStyleCalls.push({ layers: style.layers.length, diff: options?.diff });
-    if (this.deferStyleData) {
+    if (this.deferStyleData || options?.diff === false || !this.style) {
       this.#pendingStyle = structuredClone(style);
       this.style = undefined;
       this.fireMapEvent('styledataloading');
       return this;
     }
+    // A diff with no operations changes nothing and fires nothing.
+    if (JSON.stringify(this.style) === JSON.stringify(style)) return this;
     this.style = structuredClone(style);
     this.#styleChanged = true;
     this.fireMapEvent('style.load');
     return this;
   }
 
-  /** Finish a deferred `setStyle`: the style loads, `styledata` and `style.load` fire. */
+  /** Finish a pending rebuild: the style loads, `styledata` and `style.load` fire. */
   flushStyleData(): void {
-    if (!this.#pendingStyle) throw new Error('No deferred setStyle to flush.');
+    if (!this.#pendingStyle) throw new Error('No pending setStyle to flush.');
     this.style = this.#pendingStyle;
     this.#pendingStyle = undefined;
     this.fireMapEvent('styledata');
     this.fireMapEvent('style.load');
   }
 
-  /** One render: `Style.update` fires a pending `styledata`, then the Map fires `render`. */
+  /**
+   * WebGL context loss and restore (`ui/map.ts:4125`, `4153`): the style is serialised and
+   * destroyed, then set again with `diff: false`, a full rebuild that keeps its metadata.
+   */
+  restoreContext(): void {
+    const saved = this.getStyle();
+    this.style = undefined;
+    this.setStyle(saved, { diff: false });
+  }
+
+  /**
+   * One render: a pending rebuild completes (unless deferred), `Style.update` fires a pending
+   * `styledata`, then the Map fires `render`.
+   */
   render(): void {
+    if (this.#pendingStyle && !this.deferStyleData) this.flushStyleData();
     if (this.#styleChanged) {
       this.#styleChanged = false;
       this.fireMapEvent('styledata');
