@@ -1,0 +1,63 @@
+/**
+ * The application's own style edits while Equal Earth is active (Task 9) on real MapLibre, both
+ * majors: a layer added under `equal` at z2 is drawn in the band shown, on the fixture's places
+ * where they are; a paint change reaches it there; a batch of `addLayer` calls neither moves the
+ * view nor raises an `error`; `removeLayer` takes every copy away.
+ */
+import type { Page } from '@playwright/test';
+
+import { centreOn, colourAt, expect, idle, openHarness, test } from './helpers.ts';
+
+const TOKYO: [number, number] = [139.69, 35.69]; // a fixture place
+
+/** The canvas colour at Tokyo is (close to) `[r, g, b]`; the fixture's own dots are #cc3333. */
+async function colourIs(page: Page, [r, g, b]: [number, number, number]): Promise<boolean> {
+  const [cr, cg, cb] = await colourAt(page, TOKYO);
+  return Math.abs(cr - r) < 16 && Math.abs(cg - g) < 16 && Math.abs(cb - b) < 16;
+}
+
+test('addLayer, setPaintProperty and removeLayer while active reach the band shown, and a batch keeps the view', async ({ page, mlv }) => {
+  await openHarness(page, { mlv, projection: 'equal' });
+  await centreOn(page, TOKYO, 2);
+  expect(await colourIs(page, [255, 0, 0])).toBe(false);
+
+  await page.evaluate(() => {
+    window.__h.map.addLayer({
+      id: 'marks',
+      type: 'circle',
+      source: 'fixture',
+      'source-layer': 'places',
+      paint: { 'circle-color': '#ff0000', 'circle-radius': 8 },
+    });
+  });
+  await idle(page);
+  expect(await colourIs(page, [255, 0, 0])).toBe(true);
+  // Drawn by the band shown (pure Equal Earth at z2), not by the Mercator band's layer.
+  expect(await page.evaluate(() => window.__h.map.getLayer('marks__b0') !== undefined)).toBe(true);
+
+  await page.evaluate(() => window.__h.map.setPaintProperty('marks', 'circle-color', '#00ff00'));
+  await idle(page);
+  expect(await colourIs(page, [0, 255, 0])).toBe(true);
+
+  const before = await page.evaluate(() => window.__h.map.getCenter().toArray());
+  await page.evaluate(() => {
+    for (let i = 0; i < 10; i++) {
+      window.__h.map.addLayer({
+        id: `batch${i}`,
+        type: 'line',
+        source: 'fixture',
+        'source-layer': 'lines',
+        paint: { 'line-color': '#000000', 'line-width': 1 },
+      });
+    }
+  });
+  await idle(page);
+  expect(await page.evaluate(() => window.__h.map.getCenter().toArray())).toEqual(before);
+  expect(await page.evaluate(() => window.__h.map.getLayer('batch9__b0') !== undefined)).toBe(true);
+
+  await page.evaluate(() => window.__h.map.removeLayer('marks'));
+  await idle(page);
+  expect(await colourIs(page, [0, 255, 0])).toBe(false);
+  expect(await page.evaluate(() => window.__h.map.getStyle().layers.filter((l) => l.id.startsWith('marks')).length)).toBe(0);
+  expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
+});

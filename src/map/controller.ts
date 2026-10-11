@@ -44,6 +44,40 @@
  * while nothing is wrapped and still with the worker at the rewrite reaches the copies only with
  * the source's next wrapped update.
  *
+ * **Live style edits** (Task 9). The map's `addSource`, `removeSource`, `addLayer`, `removeLayer`,
+ * `setPaintProperty`, `setLayoutProperty` and `setFilter` are wrapped on the instance when the
+ * controller is constructed, and pass straight through while Equal Earth is off. While it is on,
+ * an edit addresses the application's ids, which name the original's layers and sources:
+ *
+ * - A property edit is written to every live copy of the layer and kept in the original. A gated
+ *   value (an opacity the switcher fades, a hidden-by-visibility layer's `visibility`) becomes the
+ *   gate's own value instead, written only to the copies of the band shown (hidden copies keep 0
+ *   or `"none"`). The first copy written tells whether MapLibre accepted the value (its getter
+ *   reads it back); a refused value goes no further, so it cannot poison later rewrites. The
+ *   first background layer is the exception: its copies are not plain clones (outside colour,
+ *   world polygon), so its edits go through the rewrite, as structure edits do.
+ * - A structure edit calls MapLibre's own method first, so the application can use the id at once
+ *   (it lands where the Mercator band's layers are), with `beforeId` translated to the first live
+ *   copy of that layer, and applies the same change to the original. One amend per task
+ *   (`queueMicrotask`) then rewrites the original and diffs it in with `setStyle`. It **amends**
+ *   rather than re-applies: no teardown, no new switcher, camera or constraint, no `jumpTo`, so the
+ *   view and the band shown do not change. The rewrite starts its copies in the band the switcher
+ *   shows (`RewriteOptions.initialBand`), and a band still fading out keeps its live state (its
+ *   pending hide reads the new gates when it fires), so MapLibre's diff touches only what was
+ *   added or removed. Before rewriting, the GeoJSON sources take their live data (as for a
+ *   re-apply) and the style's root properties (light, sky, sprite, …) are taken from the live
+ *   style, so neither the application's `setData` nor its `setLight` is reverted. A source given
+ *   by URL that is not cached yet (an added GeoJSON source, a TileJSON) is fetched first: only then
+ *   does an amend wait, and edits made meanwhile join it. A source that cannot be resolved is
+ *   reported (an `error` event, as for a re-apply) and stays unbanded. MapLibre fires `style.load`
+ *   for every diffed `setStyle`, so it fires for each amend too.
+ * - Edits made while an activation fetches its TileJSON are taken before it commits; edits made
+ *   while a re-apply is in flight reach the original it rewrites, and an amend follows it.
+ *
+ * The plugin's own writes never pass through these wrappers (rule 4): the switcher's gates and
+ * every write the controller makes use MapLibre's methods as found before wrapping.
+ * `setLayerZoomRange`, `moveLayer` and the other style setters are not followed.
+ *
  * Like every `map/` module this has no runtime dependency on `maplibre-gl`; the host is typed
  * structurally ({@link ControllerHost}).
  */
@@ -80,11 +114,16 @@ import {
 } from './geo-api.js';
 import {
   REWRITTEN_METADATA_KEY,
+  applyGate,
   restorableStyle,
   rewriteStyle,
   withoutRewriteBounds,
+  type GateHost,
+  type LayerGate,
   type RewriteOptions,
+  type RewrittenStyle,
   type SourceTemplate,
+  type StyleLayerLike,
   type StyleLike,
 } from './style-rewrite.js';
 import { BandSwitcher, type SwitchEvent, type SwitcherHost } from './switcher.js';
@@ -132,7 +171,50 @@ export interface ControllerHost extends CameraHost, ConstrainHost, SwitcherHost,
   listens?(type: string): boolean;
   /** The live source object (both majors); read structurally ({@link GeoJSONSourceLike}). */
   getSource(id: string): unknown;
+  /** This and the next four are followed while active (Task 9), with `setPaintProperty` and `setLayoutProperty`. */
+  addSource(id: string, source: unknown): unknown;
+  removeSource(id: string): unknown;
+  addLayer(layer: unknown, beforeId?: string): unknown;
+  removeLayer(id: string): unknown;
+  setFilter(layerId: string, filter: unknown, options?: unknown): unknown;
+  /** The live layer, `undefined` when the style has none by that id. */
+  getLayer(id: string): unknown;
+  /** Read back after a write, to see whether MapLibre accepted the value (both majors). */
+  getPaintProperty?(layerId: string, name: string): unknown;
+  getLayoutProperty?(layerId: string, name: string): unknown;
+  getFilter?(layerId: string): unknown;
 }
+
+/** MapLibre's own style edits, as found before the controller wrapped them (rule 4). */
+interface RawStyle {
+  addSource(id: unknown, source: unknown, ...rest: unknown[]): unknown;
+  removeSource(id: unknown, ...rest: unknown[]): unknown;
+  addLayer(layer: unknown, beforeId: unknown, ...rest: unknown[]): unknown;
+  removeLayer(id: unknown, ...rest: unknown[]): unknown;
+  setPaintProperty(layerId: unknown, name: unknown, value: unknown, ...rest: unknown[]): unknown;
+  setLayoutProperty(layerId: unknown, name: unknown, value: unknown, ...rest: unknown[]): unknown;
+  setFilter(layerId: unknown, filter: unknown, ...rest: unknown[]): unknown;
+}
+
+const STYLE_EDITS = [
+  'addSource',
+  'removeSource',
+  'addLayer',
+  'removeLayer',
+  'setPaintProperty',
+  'setLayoutProperty',
+  'setFilter',
+] as const satisfies readonly (keyof RawStyle)[];
+
+/** Which of a layer's properties a property edit sets. */
+type PropertyKind = 'paint' | 'layout' | 'filter';
+
+/**
+ * The style's root properties `Style.serialize` reports when set (v6 and v5.24 alike), other than
+ * those the rewrite owns ({@link REWRITE_ROOT}).
+ */
+const SERIALIZED_ROOT = ['name', 'light', 'sky', 'center', 'zoom', 'bearing', 'pitch', 'sprite', 'glyphs', 'transition', 'terrain'];
+const REWRITE_ROOT = new Set(['version', 'sources', 'layers', 'metadata', 'projection']);
 
 /** The parts of a MapLibre `GeoJSONSource` the controller wraps and reads (v5.24+, v6). */
 interface GeoJSONSourceLike {
@@ -215,8 +297,14 @@ interface Installed {
   switcher: BandSwitcher;
   camera: BandCamera;
   uninstallConstrain: () => void;
-  /** Removes the `setData`/`updateData` wrappers of the GeoJSON sources. */
-  unwrapGeoJSON: () => void;
+  /** The `setData`/`updateData` wrappers of the banded GeoJSON sources, by source id. */
+  geojson: Map<string, GeoJSONWrap>;
+}
+
+/** One GeoJSON source object's wrappers: removed when the source leaves the bands or is replaced. */
+interface GeoJSONWrap {
+  source: object;
+  restore: () => void;
 }
 
 /** The name of the error an activation rejects with when a later call superseded it. */
@@ -296,10 +384,11 @@ export class EqualEarthController {
   /** The style to restore: the application's, never a rewritten one. */
   #original: StyleLike | undefined;
   /**
-   * The rewritten style we last set, until it is restored away: the base MapLibre diffs the
-   * application's next style against, whose in-place zoom bounds that style may inherit.
+   * The rewrite we last set, until it is restored away: its style is the base MapLibre diffs the
+   * application's next style against, whose in-place zoom bounds that style may inherit. A live
+   * style edit's amend replaces it; the switcher reads its sources and gates through it.
    */
-  #rewritten: StyleLike | undefined;
+  #rewritten: RewrittenStyle | undefined;
   #installed: Installed | undefined;
   /** The camera while nothing is installed (during an apply). */
   #view: View | undefined;
@@ -330,6 +419,22 @@ export class EqualEarthController {
   #raw: RawCamera;
   /** The geographic API's wrappers, once installed (the first activation). */
   #geoApi: GeoApi | undefined;
+  /** MapLibre's own style edits, captured before wrapping: the plugin's own writes (rule 4). */
+  readonly #rawStyle: RawStyle;
+  /** Restores the seven style edits the controller wrapped. */
+  readonly #unwrapStyleEdits: () => void;
+  /**
+   * Bumped by every style edit the application makes: an activation still resolving starts again
+   * from the live style, and an apply that saw one installs and then amends.
+   */
+  #edits = 0;
+  #amendQueued = false;
+  #amendRunning = false;
+  #amendRequested = false;
+  /** Warped GeoJSON by data object and band (`blend/zoom`): an amend re-warps only new data. */
+  readonly #warped = new WeakMap<object, Map<string, GeoJSON.GeoJSON>>();
+  /** Source specs whose resolution failed synchronously (TMS, no tiles): reported once. */
+  readonly #reported = new WeakSet<object>();
 
   constructor(host: ControllerHost, options: ControllerOptions) {
     this.#host = host;
@@ -341,6 +446,8 @@ export class EqualEarthController {
       );
     }
     this.#raw = rawCamera(host as GeoApiHost);
+    this.#rawStyle = rawStyle(host);
+    this.#unwrapStyleEdits = this.#wrapStyleEdits();
   }
 
   get active(): boolean {
@@ -478,7 +585,7 @@ export class EqualEarthController {
       installed.switcher.destroy();
       installed.camera.destroy();
       installed.uninstallConstrain();
-      installed.unwrapGeoJSON();
+      unwrapGeoJSON(installed);
     }
     this.#projection = undefined;
     this.#view = undefined;
@@ -529,6 +636,7 @@ export class EqualEarthController {
   #release(): void {
     this.#geoApi?.uninstall();
     this.#geoApi = undefined;
+    this.#unwrapStyleEdits();
     this.#destroyed = true;
     this.#original = undefined;
     this.#rewritten = undefined;
@@ -545,7 +653,11 @@ export class EqualEarthController {
     const original = this.#original;
     this.#projection = undefined;
     this.#unsubscribe();
-    if (original) this.#setStyle(restorableStyle(original, this.#readStyle()));
+    if (original) {
+      const live = this.#readStyle();
+      takeLiveRoot(original, live);
+      this.#setStyle(restorableStyle(original, live));
+    }
     this.#rewritten = undefined;
     this.#finishDeactivate(view);
   }
@@ -554,6 +666,9 @@ export class EqualEarthController {
     let original: StyleLike;
     let resolved: ResolvedSources;
     try {
+      // GeoJSON given by URL is fetched afresh once per activation; a pass repeated only because
+      // the application edited the style meanwhile is served from the cache.
+      let fresh = true;
       for (;;) {
         // 1. A loaded style.
         let style = this.#readStyle();
@@ -566,21 +681,26 @@ export class EqualEarthController {
         original = hasOurMetadata(style) && this.#original ? this.#original : this.#capture(style);
         // 4. Templates and GeoJSON; a failure rejects before anything on the map has changed. A style set
         // meanwhile (I3, N2) restarts from step 1: every swap fires `styledataloading` or
-        // `style.load`, so listening suffices and nothing is serialised to compare.
+        // `style.load`, so listening suffices and nothing is serialised to compare. An edit through
+        // the wrappers (`addLayer` in the tick of `setProjection`, say) is not in the captured
+        // original either: that also starts again, from the live style. Our own `setStyle` (an amend
+        // of the type still shown) changes nothing that was captured.
         let changed = false;
         const onChange = (): void => {
-          changed = true;
+          if (!this.#applying) changed = true;
         };
+        const edits = this.#edits;
         this.#host.on('styledataloading', onChange);
         this.#host.on('style.load', onChange);
         try {
-          resolved = await this.#resolveSources(original, true);
+          resolved = await this.#resolveSources(original, fresh);
         } finally {
           this.#host.off('styledataloading', onChange);
           this.#host.off('style.load', onChange);
         }
         if (generation !== this.#generation) throw superseded();
-        if (!changed) break;
+        if (!changed && this.#edits === edits) break;
+        fresh = changed;
       }
     } catch (error) {
       // N3: a type switch deferred a style the application set meanwhile (`#onStyleLoad`);
@@ -723,21 +843,55 @@ export class EqualEarthController {
 
   /**
    * The options of every `rewriteStyle` call (Ruling R2): the bands and transition of the type
-   * shown, the cartography, and `resolved` (the TileJSON templates and fetched GeoJSON).
+   * shown, the cartography, `resolved` (the TileJSON templates and fetched GeoJSON), the memoised
+   * GeoJSON warp, and for an amend the band the copies start shown in (`initialBand`).
    */
-  #rewriteOptions(resolved: ResolvedSources, initialZoom: number): RewriteOptions {
+  #rewriteOptions(resolved: ResolvedSources, initialZoom: number, initialBand?: number): RewriteOptions {
     return {
       bands: this.#bands,
       transition: this.#transition,
       templates: resolved.templates,
       geojson: resolved.geojson,
       initialZoom,
+      ...(initialBand === undefined ? {} : { initialBand }),
       cartography: this.#cartography(),
+      warp: this.#warp,
     };
   }
 
+  /** {@link rewriteStyle} of `original`, drawn with MapLibre's Mercator (I4). */
+  #rewrite(original: StyleLike, resolved: ResolvedSources, initialZoom: number, initialBand?: number): RewrittenStyle {
+    const rewritten = rewriteStyle(original, this.#rewriteOptions(resolved, initialZoom, initialBand));
+    // I4: the warp feeds MapLibre's Mercator renderer; an original globe would bend it.
+    rewritten.style.projection = { type: 'mercator' };
+    return rewritten;
+  }
+
+  /**
+   * {@link warpGeoJSON}, memoised by data object and band for the controller's life of that data:
+   * an amend's rewrite reuses the warp of unchanged data, and of data a fan-out has just warped. A
+   * `setData` with an object warped before forgets it first (an application may mutate and set the
+   * same object again).
+   */
+  readonly #warp = (data: GeoJSON.GeoJSON, blend: number, densifyZoom: number): GeoJSON.GeoJSON => {
+    let byBand = this.#warped.get(data);
+    if (!byBand) {
+      byBand = new Map();
+      this.#warped.set(data, byBand);
+    }
+    const key = `${blend}/${densifyZoom}`;
+    let warped = byBand.get(key);
+    if (!warped) {
+      warped = warpGeoJSON(data, blend, densifyZoom);
+      byBand.set(key, warped);
+    }
+    return warped;
+  };
+
   async #applyNow(generation: number, resolved?: ResolvedSources): Promise<boolean> {
     const original = this.#original!;
+    // An edit from here on reaches `original` (the wrappers keep it), but perhaps after the rewrite.
+    const edits = this.#edits;
     resolved ??= await this.#resolveSources(original);
     if (generation !== this.#generation) return false;
     // The application may have set GeoJSON data since the original was captured (its
@@ -753,15 +907,13 @@ export class EqualEarthController {
     const bands = this.#bands;
     const transition = this.#transition;
     const initialBand = bandIndexForZoom(bands, view.zoom);
-    const rewritten = rewriteStyle(original, this.#rewriteOptions(resolved, view.zoom));
-    // I4: the warp feeds MapLibre's Mercator renderer; an original globe would bend it.
-    rewritten.style.projection = { type: 'mercator' };
+    const rewritten = this.#rewrite(original, resolved, view.zoom);
 
     // C7: install only once the rewritten style has loaded. Listen first: on the diff path
     // `style.load` fires inside `setStyle`; on a full rebuild a frame or more later, or never
     // when the rebuild is aborted, in which case the generation has moved on (M2).
     const styleLoad = this.#nextEvent('style.load');
-    this.#rewritten = rewritten.style;
+    this.#rewritten = rewritten;
     this.#setStyle(rewritten.style);
     if (!styleLoad.fired()) {
       const current = this.#readStyle();
@@ -792,14 +944,16 @@ export class EqualEarthController {
     const host = this.#host;
     const { lngLatFactory, onSwitch } = this.#options;
     let camera: BandCamera | undefined = undefined;
-    const switcher = new BandSwitcher(host, {
+    // The switcher reads the rewrite live: an amend replaces it without re-installing anything.
+    const current = (): RewrittenStyle => this.#rewritten ?? rewritten;
+    const switcher = new BandSwitcher(this.#switcherHost(), {
       bands,
       transition,
       initialBand,
       requestedZoom: () => camera?.requestedZoom ?? host.getZoom(),
       zoomOffset: () => camera?.zoomOffset ?? 0,
-      sourceIdsForBand: (band) => rewritten.sourceIdsForBand(band),
-      gatesForBand: (band) => rewritten.gatesForBand(band),
+      sourceIdsForBand: (band) => current().sourceIdsForBand(band),
+      gatesForBand: (band) => current().gatesForBand(band),
       ...(onSwitch ? { onSwitch } : {}),
     });
     const mode = this.#options.compensation ?? 'zoom+bearing';
@@ -818,8 +972,9 @@ export class EqualEarthController {
       isActive: () => this.active,
     });
     switcher.start();
-    const unwrapGeoJSON = this.#wrapGeoJSONSources(rewritten.geojsonSources);
-    this.#installed = { switcher, camera, uninstallConstrain, unwrapGeoJSON };
+    const installed: Installed = { switcher, camera, uninstallConstrain, geojson: new Map() };
+    this.#wrapGeoJSONSources(installed, rewritten.geojsonSources);
+    this.#installed = installed;
     this.#view = undefined;
     this.#settle();
 
@@ -836,6 +991,9 @@ export class EqualEarthController {
       bearing: view.bearing,
     });
     announceUnwarpedRelief(original, transition);
+    // The application edited the style while this apply was resolving or loading: what the
+    // rewrite missed is amended now.
+    if (this.#edits !== edits) this.#scheduleAmend();
     return true;
   }
 
@@ -922,7 +1080,7 @@ export class EqualEarthController {
     switcher.destroy();
     camera.destroy();
     installed.uninstallConstrain();
-    installed.unwrapGeoJSON();
+    unwrapGeoJSON(installed);
     // A fetch or `updateData` the wrappers started is stale once they are gone: whatever comes
     // next (a re-apply, a deactivation and later activation) starts from the live data.
     for (const [id, version] of this.#dataVersions) this.#dataVersions.set(id, version + 1);
@@ -958,23 +1116,408 @@ export class EqualEarthController {
     this.#projection = undefined;
     this.#unsubscribe();
     const live = this.#readStyle();
-    if (this.#original && hasOurMetadata(live)) this.#setStyle(restorableStyle(this.#original, live));
+    if (this.#original && hasOurMetadata(live)) {
+      takeLiveRoot(this.#original, live);
+      this.#setStyle(restorableStyle(this.#original, live));
+    }
     this.#rewritten = undefined;
     this.#finishDeactivate(view);
   }
 
   /**
+   * The host the switcher writes its gates through: MapLibre's own `setPaintProperty` and
+   * `setLayoutProperty` (rule 4). Through the wrappers, a gate write on the Mercator band's ids
+   * (the original's) would be taken for the application's edit and fanned out.
+   */
+  #switcherHost(): SwitcherHost {
+    const host = this.#host;
+    const raw = this.#rawStyle;
+    return {
+      isSourceLoaded: (id) => host.isSourceLoaded(id),
+      getZoom: () => host.getZoom(),
+      isMoving: () => host.isMoving(),
+      jumpTo: (options) => host.jumpTo(options),
+      on: (type, listener) => host.on(type, listener),
+      off: (type, listener) => host.off(type, listener),
+      setPaintProperty: (layerId, name, value) => raw.setPaintProperty(layerId, name, value),
+      setLayoutProperty: (layerId, name, value) => raw.setLayoutProperty(layerId, name, value),
+    };
+  }
+
+  /** Wrap the seven style edits on the map instance; returns the undo (`destroy`/`dispose`). */
+  #wrapStyleEdits(): () => void {
+    type Edit = (...args: unknown[]) => unknown;
+    const handlers: Record<(typeof STYLE_EDITS)[number], Edit> = {
+      addSource: (id, source, ...rest) => this.#addSource(id, source, rest),
+      removeSource: (id, ...rest) => this.#removeSource(id, rest),
+      addLayer: (layer, beforeId, ...rest) => this.#addLayer(layer, beforeId, rest),
+      removeLayer: (id, ...rest) => this.#removeLayer(id, rest),
+      setPaintProperty: (layerId, name, value, ...rest) => this.#setProperty('paint', layerId, name, value, rest),
+      setLayoutProperty: (layerId, name, value, ...rest) => this.#setProperty('layout', layerId, name, value, rest),
+      setFilter: (layerId, filter, ...rest) => this.#setProperty('filter', layerId, undefined, filter, rest),
+    };
+    const restores = STYLE_EDITS.map((name) => wrapMethod<Edit>(this.#host, name, () => handlers[name]));
+    return () => {
+      for (const restore of restores) restore();
+    };
+  }
+
+  /** The original while Equal Earth is active: the application's edits are kept in it. */
+  #following(): StyleLike | undefined {
+    return this.active ? this.#original : undefined;
+  }
+
+  #addSource(id: unknown, source: unknown, rest: unknown[]): unknown {
+    const result = this.#rawStyle.addSource(id, source, ...rest);
+    this.#edits++;
+    const original = this.#following();
+    // MapLibre throws for a duplicate id, and refuses an invalid source with an `error` event.
+    if (original && typeof id === 'string' && isRecord(source) && !(id in original.sources) && this.#host.getSource(id) !== undefined) {
+      original.sources[id] = cloneSpec(source);
+      this.#scheduleAmend();
+    }
+    return result;
+  }
+
+  #removeSource(id: unknown, rest: unknown[]): unknown {
+    const original = this.#following();
+    if (!original || typeof id !== 'string' || !(id in original.sources)) {
+      const result = this.#rawStyle.removeSource(id, ...rest);
+      this.#edits++;
+      return result;
+    }
+    const user = original.layers.find((layer) => layer.source === id);
+    if (user) {
+      // MapLibre's refusal; under pure Equal Earth no live layer uses the original id, so it would not refuse.
+      reportError(this.#host, new Error(`Source "${id}" cannot be removed while layer "${user.id}" is using it.`));
+      return this.#host;
+    }
+    const result = this.#rawStyle.removeSource(id, ...rest);
+    delete original.sources[id];
+    this.#edits++;
+    this.#scheduleAmend();
+    return result;
+  }
+
+  #addLayer(layer: unknown, beforeId: unknown, rest: unknown[]): unknown {
+    const original = this.#following();
+    // The original's `beforeId` may have no layer of that id live (pure Equal Earth): insert
+    // before its first live copy instead, where the amend puts the new layer's copies.
+    const before = original && typeof beforeId === 'string' ? this.#liveBefore(original, beforeId) : beforeId;
+    if (!original || !isRecord(layer) || typeof layer['id'] !== 'string' || layer['type'] === 'custom') {
+      const result = this.#rawStyle.addLayer(layer, before, ...rest);
+      this.#edits++;
+      return result;
+    }
+    const id = layer['id'];
+    if (original.layers.some((existing) => existing.id === id)) {
+      // A duplicate. MapLibre refuses it itself where the id is live; elsewhere (pure Equal
+      // Earth) it would add it, so refuse it as MapLibre does.
+      if (this.#host.getLayer(id) !== undefined) return this.#rawStyle.addLayer(layer, before, ...rest);
+      reportError(this.#host, new Error(`Layer "${id}" already exists on this map.`));
+      return this.#host;
+    }
+    const result = this.#rawStyle.addLayer(layer, before, ...rest);
+    if (this.#host.getLayer(id) === undefined) return result; // refused; MapLibre reported why
+    const spec = cloneSpec(layer) as StyleLayerLike;
+    const source: unknown = spec.source;
+    if (isRecord(source)) {
+      // `Style.addLayer` adds an inline source under the layer's id.
+      original.sources[id] = source;
+      spec.source = id;
+    }
+    const at = typeof beforeId === 'string' ? original.layers.findIndex((existing) => existing.id === beforeId) : -1;
+    original.layers.splice(at < 0 ? original.layers.length : at, 0, spec);
+    this.#edits++;
+    this.#scheduleAmend();
+    return result;
+  }
+
+  #removeLayer(id: unknown, rest: unknown[]): unknown {
+    const original = this.#following();
+    const at = original && typeof id === 'string' ? original.layers.findIndex((layer) => layer.id === id) : -1;
+    if (!original || typeof id !== 'string' || at < 0) {
+      const result = this.#rawStyle.removeLayer(id, ...rest);
+      this.#edits++;
+      return result;
+    }
+    // Under pure Equal Earth, or outside the Mercator band's range, the id itself is not live.
+    const result = this.#host.getLayer(id) !== undefined ? this.#rawStyle.removeLayer(id, ...rest) : this.#host;
+    original.layers.splice(at, 1);
+    this.#edits++;
+    this.#scheduleAmend();
+    return result;
+  }
+
+  /**
+   * `setPaintProperty` (`paint`), `setLayoutProperty` (`layout`) or `setFilter` (`filter`, no
+   * `name`) by the application: see the module comment.
+   */
+  #setProperty(kind: PropertyKind, layerId: unknown, name: unknown, value: unknown, rest: unknown[]): unknown {
+    const raw = this.#rawStyle;
+    const write = (id: unknown): unknown =>
+      kind === 'paint'
+        ? raw.setPaintProperty(id, name, value, ...rest)
+        : kind === 'layout'
+          ? raw.setLayoutProperty(id, name, value, ...rest)
+          : raw.setFilter(id, value, ...rest);
+    const original = this.#following();
+    const layer = original && typeof layerId === 'string' ? original.layers.find((l) => l.id === layerId) : undefined;
+    const property = typeof name === 'string' ? name : undefined;
+    if (!original || !layer || (kind !== 'filter' && property === undefined)) {
+      const result = write(layerId);
+      this.#edits++;
+      return result;
+    }
+    const installed = this.#installed;
+    const rewritten = installed ? this.#rewritten : undefined;
+    // The first background's copies are not plain clones (outside colour, world polygon): the
+    // rewrite derives them, so its edits are amended in. With nothing installed, a re-apply is in
+    // flight and rewrites the original. Either way only the layer under the id itself is written.
+    const derived = layer.type === 'background' && original.layers.find((l) => l.type === 'background') === layer;
+    const plain = rewritten !== undefined && !derived;
+    const copies = this.#liveCopies(layer.id).filter((id) => plain || id === layer.id);
+    const shown = installed?.switcher.current();
+    const fading = new Set(installed?.switcher.pendingHides());
+    const gateOf = (id: string): LayerGate | undefined => rewritten?.gates.find((gate) => gate.layerId === id);
+    const gated = (gate: LayerGate | undefined): gate is LayerGate =>
+      gate !== undefined &&
+      (kind === 'paint' ? property! in gate.paint : kind === 'layout' && property === 'visibility' && gate.hideByVisibility);
+    let checked = false;
+    for (const id of copies) {
+      const gate = gateOf(id);
+      // A gated value is the gate's own: written only where the gate shows it.
+      if (gated(gate) && gate.band !== shown && !(gate.holdWhileFading && fading.has(gate.band))) continue;
+      write(id);
+      if (!checked) {
+        checked = true;
+        if (!this.#accepted(kind, id, property, value)) return this.#host;
+      }
+    }
+    if (plain) {
+      for (const id of copies) {
+        const gate = gateOf(id);
+        if (!gated(gate)) continue;
+        if (kind === 'paint') gate.paint = { ...gate.paint, [property!]: ownValue(value) };
+        else gate.visibility = ownValue(value);
+      }
+    }
+    setLayerProperty(layer, kind, property, value);
+    this.#edits++;
+    if (derived) this.#scheduleAmend();
+    return this.#host;
+  }
+
+  /**
+   * Whether MapLibre took `value` on live layer `id`, read back through its getter: an invalid
+   * value is refused with an `error` event and must not reach the other copies or the original.
+   * Without the getter, assumed.
+   */
+  #accepted(kind: PropertyKind, id: string, property: string | undefined, value: unknown): boolean {
+    const host = this.#host;
+    let read: unknown;
+    try {
+      if (kind === 'paint') {
+        if (!host.getPaintProperty) return true;
+        read = host.getPaintProperty(id, property!);
+      } else if (kind === 'layout') {
+        if (!host.getLayoutProperty) return true;
+        read = host.getLayoutProperty(id, property!);
+      } else {
+        if (!host.getFilter) return true;
+        read = host.getFilter(id);
+      }
+    } catch {
+      return true;
+    }
+    return JSON.stringify(read ?? null) === JSON.stringify(value ?? null);
+  }
+
+  /** The live layers drawn for the original's layer `id`, in style order: its band copies, then itself. */
+  #liveCopies(id: string): string[] {
+    const ids = this.#bands.flatMap((band, k) => (band.blend < 1 ? [`${id}__b${k}`] : []));
+    ids.push(id);
+    return ids.filter((candidate) => this.#host.getLayer(candidate) !== undefined);
+  }
+
+  /** The live layer to insert before for the original's `beforeId`: its first live copy, else the next layer's. */
+  #liveBefore(original: StyleLike, beforeId: string): string | undefined {
+    const at = original.layers.findIndex((layer) => layer.id === beforeId);
+    if (at < 0) return beforeId;
+    for (const layer of original.layers.slice(at)) {
+      const first = this.#liveCopies(layer.id)[0];
+      if (first !== undefined) return first;
+    }
+    return undefined;
+  }
+
+  /** One amend per task, however many edits it holds. */
+  #scheduleAmend(): void {
+    this.#amendRequested = true;
+    if (this.#amendQueued || this.#amendRunning) return;
+    this.#amendQueued = true;
+    queueMicrotask(() => {
+      this.#amendQueued = false;
+      void this.#runAmend();
+    });
+  }
+
+  /**
+   * Rewrite the original with the application's edits and diff it in (see the module comment).
+   * Only while installed: a re-apply in flight reads the original itself and amends after it has
+   * installed. Waits only to fetch a source that is not cached yet; edits made meanwhile join it.
+   */
+  async #runAmend(): Promise<void> {
+    this.#amendRunning = true;
+    try {
+      while (this.#amendRequested) {
+        this.#amendRequested = false;
+        const installed = this.#installed;
+        const original = this.#original;
+        if (!this.active || !installed || !original || this.#inFlight !== undefined || this.#applying) return;
+        const generation = this.#generation;
+        const failed = new Set<string>();
+        for (;;) {
+          this.#refreshGeoJSONData(original);
+          const { resolved, missing } = this.#resolveNow(original, failed);
+          if (missing.length === 0) {
+            this.#amendNow(installed, original, resolved);
+            break;
+          }
+          await Promise.all(
+            missing.map(({ id, load }) =>
+              load().catch((error: unknown) => {
+                failed.add(id);
+                if (generation === this.#generation) reportError(this.#host, error);
+              }),
+            ),
+          );
+          if (generation !== this.#generation || this.#installed !== installed || this.#original !== original) return;
+          this.#amendRequested = false; // the edits made meanwhile are in the original: this pass takes them
+        }
+      }
+    } catch (error) {
+      reportError(this.#host, error);
+    } finally {
+      this.#amendRunning = false;
+    }
+  }
+
+  /**
+   * The sources of `style` resolved from the caches alone, and the fetches still missing. A source
+   * that cannot be resolved at all (TMS, no tiles) is reported once and stays unbanded, as do those
+   * in `failed`.
+   */
+  #resolveNow(
+    style: StyleLike,
+    failed: ReadonlySet<string>,
+  ): { resolved: ResolvedSources; missing: { id: string; load: () => Promise<unknown> }[] } {
+    const resolved: ResolvedSources = { templates: {}, geojson: {} };
+    const missing: { id: string; load: () => Promise<unknown> }[] = [];
+    for (const [id, source] of Object.entries(style.sources)) {
+      if (failed.has(id)) continue;
+      const data = source['data'];
+      if (source['type'] === 'geojson' && typeof data === 'string') {
+        const cached = this.#geojson.get(data);
+        if (cached) resolved.geojson[id] = cached;
+        else missing.push({ id, load: () => this.#loadGeoJSON(id, data, false) });
+        continue;
+      }
+      try {
+        const template = this.#templateNow(id, source);
+        if (template) resolved.templates[id] = template;
+        else if (template === undefined) missing.push({ id, load: () => this.#tileJsonTemplate(id, source['url'] as string) });
+      } catch (error) {
+        if (!this.#reported.has(source)) {
+          this.#reported.add(source);
+          reportError(this.#host, error);
+        }
+      }
+    }
+    return { resolved, missing };
+  }
+
+  /** Rewrite `original` in the band shown and diff it in over the live style. */
+  #amendNow(installed: Installed, original: StyleLike, resolved: ResolvedSources): void {
+    const previous = this.#rewritten;
+    const live = this.#readStyle();
+    if (!previous || !live) return;
+    try {
+      takeLiveRoot(original, live);
+      const { switcher, camera } = installed;
+      const rewritten = this.#rewrite(original, resolved, camera.requestedZoom, switcher.current());
+      // A band still fading out keeps its live state (gated paint 0, but held bases shown and
+      // labels visible) until its pending hide, which reads these gates, fires.
+      const existed = new Set(previous.style.layers.map((layer) => layer.id));
+      const into = gateHostOf(rewritten.style);
+      for (const band of switcher.pendingHides()) {
+        for (const gate of rewritten.gatesForBand(band)) {
+          if (!existed.has(gate.layerId)) continue;
+          applyGate(into, gate, 'shown');
+          applyGate(into, gate, 'fading');
+        }
+      }
+      const host = this.#host;
+      let loads = 0;
+      let rebuilt = false;
+      const onLoad = (): void => {
+        loads++;
+      };
+      const onLoading = (): void => {
+        rebuilt = true;
+      };
+      host.on('style.load', onLoad);
+      host.on('styledataloading', onLoading);
+      this.#rewritten = rewritten;
+      try {
+        this.#setStyle(rewritten.style);
+      } finally {
+        host.off('style.load', onLoad);
+        host.off('styledataloading', onLoading);
+      }
+      if (loads > 1 || rebuilt) {
+        // A diff fires one `style.load`. More, or a rebuild: an application `style.load` listener
+        // set a style of its own inside ours (or MapLibre could not diff ours), and `#applying`
+        // hid its events. Handle them now, as if they had been heard.
+        const after = this.#readStyle();
+        if (after === undefined) this.#onStyleLoading();
+        else if (!hasOurMetadata(after)) this.#onStyleLoad();
+        return;
+      }
+      // No `style.load`: nothing changed, or MapLibre refused the style (its validation errors
+      // are `error` events). A refused style left the previous rewrite live.
+      const added = rewritten.style.layers.find((layer) => !existed.has(layer.id));
+      if (loads === 0 && added && host.getLayer(added.id) === undefined) {
+        this.#rewritten = previous;
+        throw new Error('Equal Earth: the map did not accept the amended style; the edit reaches the Mercator band only.');
+      }
+      this.#wrapGeoJSONSources(installed, rewritten.geojsonSources);
+    } catch (error) {
+      reportError(this.#host, error);
+    }
+  }
+
+  /**
    * Wrap the live `setData`/`updateData` of each banded GeoJSON source (spec §7, rule 4) so every
    * band copy follows. The Mercator band keeps the original id, so `getSource(id)` is the
-   * application's own source object under either type. Returns the undo.
+   * application's own source object under either type. `installed.geojson` ends up holding exactly
+   * the sources of `ids`: one already wrapped keeps its wrappers, one that left the bands (an
+   * amend after `removeSource`) or whose object was replaced loses them, and any fetch or
+   * `updateData` its wrappers started is dropped.
    */
-  #wrapGeoJSONSources(ids: readonly string[]): () => void {
+  #wrapGeoJSONSources(installed: Installed, ids: readonly string[]): void {
     type Method = (first: unknown, ...rest: unknown[]) => unknown;
-    const restores: (() => void)[] = [];
+    const wanted = new Set(ids);
+    for (const [id, wrap] of installed.geojson) {
+      if (wanted.has(id) && this.#host.getSource(id) === wrap.source) continue;
+      wrap.restore();
+      installed.geojson.delete(id);
+      this.#nextDataVersion(id);
+    }
     for (const id of ids) {
       const source = this.#host.getSource(id);
-      if (typeof source !== 'object' || source === null) continue;
-      restores.push(
+      if (installed.geojson.has(id) || typeof source !== 'object' || source === null) continue;
+      const restores = [
         wrapMethod<Method>(source, 'setData', (original) => (data, ...rest) => {
           const result = original(data, ...rest);
           this.#onSetData(id, data);
@@ -985,11 +1528,14 @@ export class EqualEarthController {
           this.#onUpdateData(id, source);
           return result;
         }),
-      );
+      ];
+      installed.geojson.set(id, {
+        source,
+        restore: () => {
+          for (const restore of restores) restore();
+        },
+      });
     }
-    return () => {
-      for (const restore of restores) restore();
-    };
   }
 
   /** The next data version of GeoJSON source `id`: a result for an older one is stale. */
@@ -1002,6 +1548,7 @@ export class EqualEarthController {
   /** The application set `data` on GeoJSON source `id`: keep it as the original's and fan it out. */
   #onSetData(id: string, data: unknown): void {
     const version = this.#nextDataVersion(id);
+    if (typeof data === 'object' && data !== null) this.#warped.delete(data); // perhaps mutated since
     this.#keepOriginalData(id, data);
     if (typeof data !== 'string') {
       this.#fanOut(id, data);
@@ -1065,7 +1612,7 @@ export class EqualEarthController {
       bands.forEach((band, k) => {
         if (band.blend >= 1) return;
         const copy = this.#host.getSource(bandSourceId(id, bands, k)) as GeoJSONSourceLike | undefined;
-        copy?.setData?.(warpGeoJSON(data as GeoJSON.GeoJSON, band.blend, geojsonZoomForBand(transition, k)));
+        copy?.setData?.(this.#warp(data as GeoJSON.GeoJSON, band.blend, geojsonZoomForBand(transition, k)));
       });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -1146,28 +1693,30 @@ export class EqualEarthController {
     const templates: Record<string, SourceTemplate> = {};
     await Promise.all(
       Object.entries(style.sources).map(async ([id, source]) => {
-        if (source['type'] !== 'vector') return;
-        const url = source['url'];
-        if (!Array.isArray(source['tiles']) && typeof url !== 'string') return;
-        let resolved: SourceTemplate & { tms?: boolean };
-        if (Array.isArray(source['tiles'])) {
-          resolved = template(source);
-          if (resolved.tiles.length === 0) throw unresolved(id, 'the source lists no tiles');
-        } else {
-          resolved = await this.#tileJsonTemplate(id, url as string);
-        }
-        if (source['scheme'] === 'tms' || resolved.tms) {
-          // The eqearth URL's {z}/{x}/{y} are the output tile; MapLibre's TMS y-flip would
-          // corrupt them.
-          throw new Error(`Equal Earth: TMS tile schemes are not supported yet (source "${id}").`);
-        }
-        const kept: SourceTemplate & { tms?: boolean } = { ...resolved };
-        delete kept.tms;
-        if (source['promoteId'] !== undefined) kept.promoteId = source['promoteId'];
-        templates[id] = kept;
+        let resolved = this.#templateNow(id, source);
+        if (resolved === undefined) resolved = finishTemplate(id, source, await this.#tileJsonTemplate(id, source['url'] as string));
+        if (resolved) templates[id] = resolved;
       }),
     );
     return templates;
+  }
+
+  /**
+   * Source `id`'s template without fetching: `null` when it is not a vector source with tiles or a
+   * TileJSON URL, `undefined` when its TileJSON is not cached yet. Throws as resolving does (TMS,
+   * no tiles).
+   */
+  #templateNow(id: string, source: Record<string, unknown>): SourceTemplate | null | undefined {
+    if (source['type'] !== 'vector') return null;
+    if (Array.isArray(source['tiles'])) {
+      const resolved = template(source);
+      if (resolved.tiles.length === 0) throw unresolved(id, 'the source lists no tiles');
+      return finishTemplate(id, source, resolved);
+    }
+    const url = source['url'];
+    if (typeof url !== 'string') return null;
+    const cached = this.#tileJson.get(url);
+    return cached ? finishTemplate(id, source, cached) : undefined;
   }
 
   async #tileJsonTemplate(id: string, url: string): Promise<SourceTemplate & { tms?: boolean }> {
@@ -1193,7 +1742,7 @@ export class EqualEarthController {
    * zoom bounds a diff over our rewritten style left on it ({@link withoutRewriteBounds}).
    */
   #capture(style: StyleLike): StyleLike {
-    return withoutRewriteBounds(structuredClone(style), this.#rewritten, this.#original);
+    return withoutRewriteBounds(structuredClone(style), this.#rewritten?.style, this.#original);
   }
 
   /** The host's style if it is loaded, else `undefined`. Not a copy: clone before keeping it. */
@@ -1224,6 +1773,102 @@ function unresolved(id: string, reason: string, cause?: unknown): Error {
 
 function unloaded(id: string, reason: string, cause?: unknown): Error {
   return new Error(`Equal Earth: could not load GeoJSON for source "${id}": ${reason}`, { cause });
+}
+
+/** MapLibre's style edits on `host` as found now, before the controller wraps them. */
+function rawStyle(host: ControllerHost): RawStyle {
+  const slots = host as unknown as Record<string, unknown>;
+  const bind = (name: (typeof STYLE_EDITS)[number]) => {
+    const method = slots[name];
+    return (...args: unknown[]): unknown => {
+      if (typeof method !== 'function') throw new TypeError(`Equal Earth: the map has no ${name}.`);
+      return (method as (...args: unknown[]) => unknown).apply(host, args);
+    };
+  };
+  return {
+    addSource: bind('addSource'),
+    removeSource: bind('removeSource'),
+    addLayer: bind('addLayer'),
+    removeLayer: bind('removeLayer'),
+    setPaintProperty: bind('setPaintProperty'),
+    setLayoutProperty: bind('setLayoutProperty'),
+    setFilter: bind('setFilter'),
+  };
+}
+
+function unwrapGeoJSON(installed: Installed): void {
+  for (const wrap of installed.geojson.values()) wrap.restore();
+  installed.geojson.clear();
+}
+
+/**
+ * Take the style's root properties from the live style into `original`: what the application
+ * changed through setters the controller does not follow (`setLight`, `setSky`, `setGlyphs`, …),
+ * so that a rewrite of `original` diffed over the live style, or its restore, does not revert it.
+ * The properties the rewrite owns are left alone.
+ */
+function takeLiveRoot(original: StyleLike, live: StyleLike | undefined): void {
+  if (!live) return;
+  for (const [key, value] of Object.entries(live)) {
+    if (!REWRITE_ROOT.has(key)) original[key] = structuredClone(value);
+  }
+  for (const key of SERIALIZED_ROOT) if (!(key in live)) delete original[key];
+}
+
+/** A {@link GateHost} that writes into a style object rather than a map. */
+function gateHostOf(style: StyleLike): GateHost {
+  const layers = new Map(style.layers.map((layer) => [layer.id, layer]));
+  return {
+    setPaintProperty: (id, name, value) => {
+      const layer = layers.get(id);
+      if (layer) setOrDelete((layer.paint ??= {}), name, value);
+    },
+    setLayoutProperty: (id, name, value) => {
+      const layer = layers.get(id);
+      if (layer) setOrDelete((layer.layout ??= {}), name, value);
+    },
+  };
+}
+
+function setLayerProperty(layer: StyleLayerLike, kind: PropertyKind, property: string | undefined, value: unknown): void {
+  if (kind === 'filter') setOrDelete(layer, 'filter', value);
+  else setOrDelete((layer[kind] ??= {}), property!, value);
+}
+
+/** `target[key] = value`, or its removal for `undefined` or `null` (MapLibre's reset to the default). */
+function setOrDelete(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (value === undefined || value === null) delete target[key];
+  else target[key] = structuredClone(value);
+}
+
+/** A gate's own value: `null` resets, as `undefined` does. */
+function ownValue(value: unknown): unknown {
+  return value === null || value === undefined ? undefined : structuredClone(value);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** A copy of an application's source or layer spec to keep; shallow if it holds what cannot be cloned. */
+function cloneSpec(spec: Record<string, unknown>): Record<string, unknown> {
+  try {
+    return structuredClone(spec);
+  } catch {
+    return { ...spec };
+  }
+}
+
+/** A resolved template as a band source inherits it: refused for TMS, with the source's `promoteId`. */
+function finishTemplate(id: string, source: Record<string, unknown>, resolved: SourceTemplate & { tms?: boolean }): SourceTemplate {
+  if (source['scheme'] === 'tms' || resolved.tms) {
+    // The eqearth URL's {z}/{x}/{y} are the output tile; MapLibre's TMS y-flip would corrupt them.
+    throw new Error(`Equal Earth: TMS tile schemes are not supported yet (source "${id}").`);
+  }
+  const kept: SourceTemplate & { tms?: boolean } = { ...resolved };
+  delete kept.tms;
+  if (source['promoteId'] !== undefined) kept.promoteId = source['promoteId'];
+  return kept;
 }
 
 /** The template fields of an inline source or a TileJSON; `tms` flags a TMS scheme. */

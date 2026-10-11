@@ -610,6 +610,12 @@ export class FakeGeoJSONSource {
   }
 }
 
+/** Set `target[key]` to `value`, or delete it for `undefined`/`null` (MapLibre's reset). */
+function setOrDelete(target: Record<string, unknown>, key: string, value: unknown): void {
+  if (value === undefined || value === null) delete target[key];
+  else target[key] = structuredClone(value);
+}
+
 /** What `jumpTo` accepts on a controller host: a `LngLat`-like centre as well as a tuple. */
 export type ControllerJump = Omit<Frame, 'center'> & { center?: readonly [number, number] | LngLat };
 
@@ -807,15 +813,125 @@ export class FakeControllerHost extends FakeV6Map {
     return this.loaded.has(id);
   }
 
+  /**
+   * Errors MapLibre fires (and does not throw) for a style edit it refuses: a write to a layer
+   * that does not exist, an invalid value, a duplicate layer id (`style/style.ts`).
+   */
+  readonly styleErrors: string[] = [];
+  /** Values `setPaintProperty`/`setLayoutProperty`/`setFilter` reject as invalid (validation errors). */
+  readonly invalid = new Set<unknown>(['invalid']);
+  /** Calls of the style-edit methods (other than paint and layout), in order. */
+  readonly edits: { method: string; args: unknown[] }[] = [];
+
+  /** The loaded style's layer `id`; records MapLibre's error when there is none. */
+  #layerFor(layerId: string): StyleLike['layers'][number] | undefined {
+    const layer = this.style?.layers.find((l) => l.id === layerId);
+    if (!layer && this.style) this.styleErrors.push(`Cannot style non-existing layer "${layerId}".`);
+    return layer;
+  }
+
+  #invalid(layerId: string, value: unknown): boolean {
+    if (!this.invalid.has(value)) return false;
+    this.styleErrors.push(`${layerId}: invalid value ${JSON.stringify(value)}`);
+    return true;
+  }
+
+  /** As MapLibre: the write reaches the style (and so `getStyle()`), unless refused. */
   setPaintProperty(layerId: string, name: string, value: unknown): this {
     (this.paint[layerId] ??= {})[name] = value;
     this.writes.push({ kind: 'paint', layerId, name, value });
+    const layer = this.#layerFor(layerId);
+    if (layer && !this.#invalid(layerId, value)) setOrDelete((layer.paint ??= {}), name, value);
     return this;
   }
 
   setLayoutProperty(layerId: string, name: string, value: unknown): this {
     (this.layout[layerId] ??= {})[name] = value;
     this.writes.push({ kind: 'layout', layerId, name, value });
+    const layer = this.#layerFor(layerId);
+    if (layer && !this.#invalid(layerId, value)) setOrDelete((layer.layout ??= {}), name, value);
+    return this;
+  }
+
+  setFilter(layerId: string, filter: unknown): this {
+    this.edits.push({ method: 'setFilter', args: [layerId, filter] });
+    const layer = this.#layerFor(layerId);
+    if (layer && !this.#invalid(layerId, filter)) setOrDelete(layer, 'filter', filter ?? undefined);
+    return this;
+  }
+
+  getLayer(layerId: string): StyleLike['layers'][number] | undefined {
+    return this.style?.layers.find((l) => l.id === layerId);
+  }
+
+  getPaintProperty(layerId: string, name: string): unknown {
+    return structuredClone(this.getLayer(layerId)?.paint?.[name]);
+  }
+
+  getLayoutProperty(layerId: string, name: string): unknown {
+    return structuredClone(this.getLayer(layerId)?.layout?.[name]);
+  }
+
+  getFilter(layerId: string): unknown {
+    return structuredClone(this.getLayer(layerId)?.['filter']);
+  }
+
+  /** `Style.addLayer`: an inline source is added under the layer's id; refusals are error events. */
+  addLayer(layer: StyleLike['layers'][number], beforeId?: string): this {
+    this.edits.push({ method: 'addLayer', args: [structuredClone(layer), beforeId] });
+    if (!this.style) throw new Error('Style is not done loading.');
+    if (this.getLayer(layer.id)) {
+      this.styleErrors.push(`Layer "${layer.id}" already exists on this map.`);
+      return this;
+    }
+    const added = structuredClone(layer);
+    if (typeof added.source === 'object' && added.source !== null) {
+      this.addSource(layer.id, added.source);
+      added.source = layer.id;
+    }
+    if (typeof added.source === 'string' && !this.style.sources[added.source]) {
+      this.styleErrors.push(`Source "${added.source}" not found`);
+      return this;
+    }
+    const at = beforeId === undefined ? -1 : this.style.layers.findIndex((l) => l.id === beforeId);
+    if (beforeId !== undefined && at < 0) {
+      this.styleErrors.push(`Cannot add layer "${layer.id}" before non-existing layer "${beforeId}".`);
+      return this;
+    }
+    this.style.layers.splice(at < 0 ? this.style.layers.length : at, 0, added);
+    return this;
+  }
+
+  removeLayer(layerId: string): this {
+    this.edits.push({ method: 'removeLayer', args: [layerId] });
+    if (!this.style) throw new Error('Style is not done loading.');
+    const at = this.style.layers.findIndex((l) => l.id === layerId);
+    if (at < 0) this.styleErrors.push(`Cannot remove non-existing layer "${layerId}".`);
+    else this.style.layers.splice(at, 1);
+    return this;
+  }
+
+  /** `Style.addSource` throws for a duplicate id. */
+  addSource(id: string, source: Record<string, unknown>): this {
+    this.edits.push({ method: 'addSource', args: [id, structuredClone(source)] });
+    if (!this.style) throw new Error('Style is not done loading.');
+    if (this.style.sources[id]) throw new Error(`Source "${id}" already exists.`);
+    this.style.sources[id] = structuredClone(source);
+    return this;
+  }
+
+  /** `Style.removeSource` throws for an unknown id and refuses a source a layer still uses. */
+  removeSource(id: string): this {
+    this.edits.push({ method: 'removeSource', args: [id] });
+    if (!this.style) throw new Error('Style is not done loading.');
+    if (!this.style.sources[id]) throw new Error('There is no source with this ID');
+    const user = this.style.layers.find((l) => l.source === id);
+    if (user) {
+      this.styleErrors.push(`Source "${id}" cannot be removed while layer "${user.id}" is using it.`);
+      return this;
+    }
+    delete this.style.sources[id];
+    this.#sources.delete(id);
     return this;
   }
 

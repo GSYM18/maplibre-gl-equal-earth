@@ -42,7 +42,9 @@ export interface SwitchEvent {
 export interface SwitcherOptions {
   bands: readonly Band[];
   transition: ResolvedTransition | null;
+  /** Read on every use: the controller's live style edits replace the rewrite behind it. */
   sourceIdsForBand(band: number): string[];
+  /** Read on every use, as {@link sourceIdsForBand}: a pending hide reads the gates when it fires. */
   gatesForBand(band: number): readonly LayerGate[];
   initialBand: number;
   requestedZoom(): number;
@@ -145,6 +147,11 @@ export class BandSwitcher implements BandSelector {
     return this.#shown;
   }
 
+  /** Bands that are fading out: switched away from, their hide (`symbolFadeMs`) still pending. */
+  pendingHides(): number[] {
+    return [...this.#pendingHides.keys()];
+  }
+
   start(): void {
     if (this.#started) return;
     this.#started = true;
@@ -235,15 +242,15 @@ export class BandSwitcher implements BandSelector {
     this.#pendingHides.get(to)?.();
     this.#pendingHides.delete(to);
     for (const g of this.#o.gatesForBand(to)) applyGate(this.#host, g, 'shown');
-    const oldGates = this.#o.gatesForBand(from);
-    for (const g of oldGates) applyGate(this.#host, g, 'fading');
+    for (const g of this.#o.gatesForBand(from)) applyGate(this.#host, g, 'fading');
     this.#pendingHides.get(from)?.();
     this.#pendingHides.set(
       from,
       this.#schedule(() => {
         this.#pendingHides.delete(from);
-        // Visibility-hidden gates (symbols) and held bases (R7) are hidden only now.
-        for (const g of oldGates) if (g.hideByVisibility || g.holdWhileFading) applyGate(this.#host, g, 'hidden');
+        // Visibility-hidden gates (symbols) and held bases (R7) are hidden only now. The gates are
+        // read now, not at the switch: a live style edit meanwhile may have added or removed copies.
+        for (const g of this.#o.gatesForBand(from)) if (g.hideByVisibility || g.holdWhileFading) applyGate(this.#host, g, 'hidden');
       }, this.#symbolFadeMs),
     );
     this.#shown = to;

@@ -288,10 +288,19 @@ prints say nothing about latency on real hardware.
   new original and is rewritten. But `getStyle()` → modify → `setStyle()` hands back our
   rewritten style, which still counts as ours: the change is not captured as the original and
   is dropped on deactivation, and layers added against the original source id find no band
-  source. Your own `setPaintProperty` on an opacity the transition gates (`fill-opacity`,
-  `text-opacity`, …), or `setLayoutProperty` on a gated layer's `visibility`, is undone at the
-  next band switch, which restores the original style's values, and never reaches the other
-  bands' copies. Change the style before activating, or deactivate first.
+  source. Change such a style before activating, or deactivate first.
+- **Style edits while active.** `addSource`, `removeSource`, `addLayer`, `removeLayer`,
+  `setPaintProperty`, `setLayoutProperty` and `setFilter` reach every band: address your own
+  ids, the plugin fans the change out to the band copies (`<id>__b<k>`) and keeps it for
+  deactivation. A layer or source you add is drawn warped in each band from the next microtask
+  on (several edits in one task cost one style diff; a GeoJSON or TileJSON given by URL is
+  fetched first). An opacity the transition gates, or a symbol layer's `visibility`, becomes the
+  value its band shows. MapLibre fires `style.load` for each such diff, so a `style.load`
+  listener that re-adds layers should check `getLayer` first. Under pure Equal Earth (and
+  outside the Mercator band's zoom range) only the copies exist, so `getLayer(id)` returns
+  `undefined` for your id. `setLayerZoomRange` and `moveLayer` are not fanned out: they reach
+  only the layer under your id (the Mercator band's), and the next such diff or the
+  deactivation undoes them.
 - **Sources.** Band sources inherit `attribution`, `minzoom` and `promoteId` from the original
   source, but not `bounds` (geographic bounds would cut off map-space tiles). TMS sources are
   rejected on activation.
