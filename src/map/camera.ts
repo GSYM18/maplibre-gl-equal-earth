@@ -451,6 +451,15 @@ export class BandCamera {
   }
 
   /**
+   * The zoom and bearing offsets the requested camera state carries (spec §4.2 "baseline
+   * offsets"): what the hook subtracts from a requested zoom and bearing. Zero without
+   * compensation.
+   */
+  get baselineOffsets(): SimilarityOffsets {
+    return this.#baseline.offsets;
+  }
+
+  /**
    * The `transformCameraUpdate` implementation. Exposed for testing; MapLibre calls it
    * once per camera change, including every frame of an animation or gesture, each time with
    * the requested state rather than with what this returned the time before.

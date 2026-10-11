@@ -3,9 +3,9 @@
  * conversion between geographic positions and the map.
  *
  * Specs convert geographic positions **only** through {@link pixelOf}, {@link centreOn} and
- * {@link geographicCentreOffsetPx}, never with `controller.toMapSpace` inline: once `project` and
- * `jumpTo` become geographic, only these bodies change. `project` is geographic since Task 6
- * (unless the page runs with `geoapi: false`); `jumpTo` is not yet.
+ * {@link geographicCentreOffsetPx}, never with `controller.toMapSpace` inline. Since Task 7 both
+ * `project` and `jumpTo` are geographic while Equal Earth is active, so these helpers hand them
+ * geographic positions; only a page run with `geoapi: false` still needs the conversion.
  */
 import { test as base, expect, type Page } from '@playwright/test';
 import type { Map as MapLibreMap, StyleSpecification } from 'maplibre-gl';
@@ -120,6 +120,7 @@ export async function canvasDataUrl(page: Page): Promise<string> {
 export async function pixelOf(page: Page, lngLat: [number, number]): Promise<[number, number]> {
   return page.evaluate((c) => {
     const { map, controller, geoApi } = window.__h;
+    // Low-level on purpose: with `geoapi: false` the map speaks map space while active.
     const point = map.project(!geoApi && controller?.active ? controller.toMapSpace(c) : c);
     return [point.x, point.y] as [number, number];
   }, lngLat);
@@ -148,8 +149,9 @@ export async function colourAt(page: Page, lngLat: [number, number]): Promise<[n
 export async function centreOn(page: Page, lngLat: [number, number], zoom: number): Promise<void> {
   await page.evaluate(
     ({ c, z }) => {
-      const { map, controller } = window.__h;
-      map.jumpTo({ center: controller?.active ? controller.toMapSpace(c) : c, zoom: z });
+      const { map, controller, geoApi } = window.__h;
+      // Low-level on purpose: with `geoapi: false` the map speaks map space while active.
+      map.jumpTo({ center: !geoApi && controller?.active ? controller.toMapSpace(c) : c, zoom: z });
     },
     { c: lngLat, z: zoom },
   );

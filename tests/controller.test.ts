@@ -9,13 +9,14 @@ import { FakeControllerHost } from './support/fake-maplibre.js';
 const liberty = (): StyleLike => JSON.parse(readFileSync(new URL('./fixtures/liberty.json', import.meta.url), 'utf8')) as StyleLike;
 const TILEJSON = { tiles: ['https://tiles.example/planet/{z}/{x}/{y}.pbf'], maxzoom: 14 };
 const lngLatFactory = (lng: number, lat: number) => ({ lng, lat });
+const lngLatBoundsFactory = (sw: [number, number], ne: [number, number]) => ({ sw, ne });
 const TOKYO: [number, number] = [139.69, 35.69];
 
 function setup(zoom = 4.6, style: StyleLike | undefined = liberty()) {
   const host = new FakeControllerHost(TOKYO, zoom);
   host.style = style;
   const fetchJson = vi.fn(async () => TILEJSON);
-  const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+  const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson });
   return { host, controller, fetchJson };
 }
 
@@ -56,7 +57,7 @@ describe('EqualEarthController', () => {
   it('rejects, and leaves the map untouched, when a TileJSON cannot be fetched', async () => {
     const host = new FakeControllerHost(TOKYO, 4.6);
     host.style = liberty();
-    const controller = new EqualEarthController(host, { lngLatFactory, fetchJson: async () => { throw new Error('offline'); } });
+    const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson: async () => { throw new Error('offline'); } });
     await expect(controller.activate('equal')).rejects.toThrow(/openmaptiles.*offline/);
     expect(host.setStyleCalls).toHaveLength(0);
     expect(controller.active).toBe(false);
@@ -149,7 +150,7 @@ describe('EqualEarthController', () => {
     const onSwitch = vi.fn();
     const host = new FakeControllerHost(TOKYO, 4.6);
     host.style = liberty();
-    const controller = new EqualEarthController(host, { lngLatFactory, fetchJson: async () => TILEJSON, onSwitch });
+    const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson: async () => TILEJSON, onSwitch });
     await controller.activate('equal');
     host.loaded.add('openmaptiles__b2');
     host.applyFrame({ zoomDelta: 0.4 }); // z5.0 → band 2
@@ -214,7 +215,7 @@ describe('EqualEarthController', () => {
     const at = (center: [number, number]) => {
       const host = new FakeControllerHost(center, 4.6); // a world copy, with renderWorldCopies on
       host.style = liberty();
-      return { host, controller: new EqualEarthController(host, { lngLatFactory, fetchJson: async () => TILEJSON }) };
+      return { host, controller: new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson: async () => TILEJSON }) };
     };
     const { host, controller } = at([TOKYO[0] + 360, TOKYO[1]]);
     await controller.activate('equal');
@@ -325,7 +326,7 @@ describe('EqualEarthController', () => {
         if (url.includes('offline')) throw new Error('offline');
         return TILEJSON;
       });
-      const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+      const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson });
       await controller.activate('equal');
       host.on('error', () => {});
       const replacement = liberty();
@@ -343,7 +344,7 @@ describe('EqualEarthController', () => {
     host.style = liberty();
     let release!: (json: unknown) => void;
     const fetchJson = vi.fn(() => new Promise<unknown>((resolve) => { release = resolve; }));
-    const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+    const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson });
     const pending = controller.activate('equal');
     await vi.waitFor(() => expect(fetchJson).toHaveBeenCalledOnce());
     const replacement = liberty();
@@ -373,7 +374,7 @@ describe('EqualEarthController', () => {
       const host = new FakeControllerHost(TOKYO, 4.6);
       host.style = style;
       const fetchJson = async () => ({ ...TILEJSON, minzoom: 0, attribution: '© OpenMapTiles © OpenStreetMap contributors' });
-      await new EqualEarthController(host, { lngLatFactory, fetchJson }).activate('equal');
+      await new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson }).activate('equal');
       expect(host.style.sources['openmaptiles__b1']).toMatchObject({
         attribution: '© OpenMapTiles © OpenStreetMap contributors',
         minzoom: 0,
@@ -389,7 +390,7 @@ describe('EqualEarthController', () => {
       expect(host.setStyleCalls).toHaveLength(0);
       const other = new FakeControllerHost(TOKYO, 4.6);
       other.style = liberty();
-      const fromJson = new EqualEarthController(other, { lngLatFactory, fetchJson: async () => ({ ...TILEJSON, scheme: 'tms' }) });
+      const fromJson = new EqualEarthController(other, { lngLatFactory, lngLatBoundsFactory, fetchJson: async () => ({ ...TILEJSON, scheme: 'tms' }) });
       await expect(fromJson.activate('equal')).rejects.toThrow(/TMS/);
     });
 
@@ -452,7 +453,7 @@ describe('EqualEarthController', () => {
     host.style = liberty();
     let release!: (json: unknown) => void;
     const fetchJson = vi.fn(() => new Promise<unknown>((resolve) => { release = resolve; }));
-    const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+    const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson });
     const pending = controller.activate('equal');
     await vi.waitFor(() => expect(fetchJson).toHaveBeenCalledOnce());
     const dark = liberty(); // same sources and layer ids, different paint
@@ -504,7 +505,7 @@ describe('EqualEarthController', () => {
     const fetchJson = vi.fn((url: string) =>
       url.includes('other') ? new Promise<unknown>((resolve) => { release = resolve; }) : Promise.resolve(TILEJSON),
     );
-    const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+    const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson });
     host.deferStyleData = true; // our setStyle rebuilds: the activation waits for its load
     const pending = controller.activate('equal');
     let settled = false;
@@ -537,7 +538,7 @@ describe('EqualEarthController', () => {
         if (url.includes('offline')) throw new Error('offline');
         return TILEJSON;
       });
-      const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+      const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson });
       const appStyle = liberty();
       appStyle.sources['openmaptiles']!['url'] = 'https://offline.example/planet';
       let swapped = false;
@@ -571,7 +572,7 @@ describe('EqualEarthController', () => {
         if (calls === 2) return Promise.reject(new Error('offline')); // the type switch
         return Promise.resolve(TILEJSON); // the fallback re-apply
       });
-      const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+      const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson });
       await controller.activate('equal');
       const replacement = liberty();
       replacement.sources['openmaptiles']!['url'] = 'https://tiles.example/other';
@@ -603,7 +604,7 @@ describe('EqualEarthController', () => {
       const fetchJson = vi.fn((url: string): Promise<unknown> =>
         url.includes('other') ? new Promise((resolve, reject) => { held.push({ resolve, reject }); }) : Promise.resolve(TILEJSON),
       );
-      const controller = new EqualEarthController(host, { lngLatFactory, fetchJson });
+      const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson });
       const before = listeners(host);
       host.deferStyleData = true;
       const pending = controller.activate('equal');
@@ -729,6 +730,34 @@ describe('EqualEarthController', () => {
       expect(after.lat).toBeCloseTo(TOKYO[1], 9);
     });
 
+    it('offsetsAt is what the camera renders, and the baseline carries it (Ruling R11)', async () => {
+      const { host, controller } = setup();
+      expect(controller.offsetsAt(TOKYO, 1, 4.6)).toEqual({ deltaZoom: 0, deltaBearing: 0 }); // inactive
+      await controller.activate('equal');
+      const band = controller.bands.findIndex((b) => b.blend === controller.blend);
+      const rendered = host.getZoom() - controller.requestedZoom;
+      const offsets = controller.offsetsAt(TOKYO, band, controller.requestedZoom);
+      expect(Math.abs(rendered)).toBeGreaterThan(1e-3); // compensation is on by default
+      expect(offsets.deltaZoom).toBeCloseTo(rendered, 9);
+      expect(controller.baselineOffsets.deltaZoom).toBeCloseTo(rendered, 9); // idle: the baseline is what rendered
+
+      const none = new FakeControllerHost(TOKYO, 4.6);
+      none.style = liberty();
+      const plain = new EqualEarthController(none, { lngLatFactory, lngLatBoundsFactory, fetchJson: async () => TILEJSON, compensation: 'none' });
+      await plain.activate('equal');
+      expect(plain.offsetsAt(TOKYO, band, 4.6)).toEqual({ deltaZoom: 0, deltaBearing: 0 });
+    });
+
+    it('requires lngLatBoundsFactory unless geographicApi is false', () => {
+      const host = new FakeControllerHost(TOKYO, 4.6);
+      const fetchJson = async () => TILEJSON;
+      // @ts-expect-error -- the type requires it too
+      expect(() => new EqualEarthController(host, { lngLatFactory, fetchJson })).toThrow(/lngLatBoundsFactory/);
+      // @ts-expect-error -- `true` is the default, and needs it as well
+      expect(() => new EqualEarthController(host, { lngLatFactory, fetchJson, geographicApi: true })).toThrow(/lngLatBoundsFactory/);
+      expect(() => new EqualEarthController(host, { lngLatFactory, fetchJson, geographicApi: false })).not.toThrow();
+    });
+
     it('touches nothing on the map until the first activation', () => {
       const { host } = setup();
       expect(own(host, 'getCenter')).toBe(false);
@@ -785,7 +814,7 @@ describe('EqualEarthController', () => {
       const make = (style: StyleLike) => {
         const host = new FakeControllerHost(TOKYO, 4.6);
         host.style = style;
-        return new mod.EqualEarthController(host, { lngLatFactory, fetchJson: async () => TILEJSON });
+        return new mod.EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson: async () => TILEJSON });
       };
       return make;
     }
