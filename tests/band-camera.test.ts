@@ -779,6 +779,7 @@ describe('BandCamera with a selector (spec §4.3)', () => {
     expect(camera.requestedZoom).toBeCloseTo(4.5, 9);
     expect(map.zoom).not.toBeCloseTo(4.5, 3);
     expect(camera.shownBand).toBe(1);
+    expect(camera.requestedZoom + camera.zoomOffset).toBeCloseTo(map.getZoom(), 9);
     // The bearing's mirror: what was requested, before the compensation's offset.
     expect(camera.requestedBearing).toBeCloseTo(0, 9);
     expect(map.bearing).not.toBeCloseTo(0, 6);
