@@ -74,6 +74,7 @@ export {
   warpOnly,
   type SubdivideOptions,
 } from './math/subdivide.js';
+export {  relativeJacobian,  similarity,  similarityOffsets,  type CompensationMode,  type Matrix2,  type SimilarityOffsets,} from './math/jacobian.js';
 
 export {
   preimageBBox,
