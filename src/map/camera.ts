@@ -419,6 +419,14 @@ export class BandCamera {
     return this.#host.getZoom() - this.#lastOffsets.deltaZoom;
   }
 
+  /**
+   * The zoom offset in effect: rendered zoom minus requested zoom. The switcher adds it to the
+   * requested zoom to know which zoom MapLibre hides the held band's layers by.
+   */
+  get zoomOffset(): number {
+    return this.#lastOffsets.deltaZoom;
+  }
+
   /** The rendered bearing minus the bearing offset in effect: what was requested. */
   get requestedBearing(): number {
     return (this.#host.getBearing?.() ?? 0) - this.#lastOffsets.deltaBearing;

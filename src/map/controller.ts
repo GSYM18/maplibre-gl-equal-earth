@@ -491,6 +491,7 @@ export class EqualEarthController {
       transition,
       initialBand,
       requestedZoom: () => camera?.requestedZoom ?? host.getZoom(),
+      zoomOffset: () => camera?.zoomOffset ?? 0,
       sourceIdsForBand: (band) => rewritten.sourceIdsForBand(band),
       gatesForBand: (band) => rewritten.gatesForBand(band),
       ...(onSwitch ? { onSwitch } : {}),

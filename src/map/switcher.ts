@@ -46,6 +46,8 @@ export interface SwitcherOptions {
   gatesForBand(band: number): readonly LayerGate[];
   initialBand: number;
   requestedZoom(): number;
+  /** Rendered minus requested zoom (the camera's compensation). @defaultValue `() => 0` */
+  zoomOffset?: () => number;
   /** @defaultValue 0.1 */
   hysteresis?: number;
   /** @defaultValue 300 */
@@ -64,19 +66,26 @@ export function chooseBand(input: {
   transition: ResolvedTransition | null;
   shown: number;
   requestedZoom: number;
+  /** The zoom MapLibre hides layers by: requested plus the camera's offset. @defaultValue `requestedZoom` */
+  renderedZoom?: number;
   hysteresis: number;
   isReady(band: number): boolean;
 }): { band: number; forced: boolean; target: number } {
   const { bands, transition, shown, requestedZoom: z, hysteresis } = input;
-  const parsedAt = (k: number): boolean => {
+  const rendered = input.renderedZoom ?? z;
+  const parsedAt = (k: number, at: number = z): boolean => {
     if (!transition) return true;
     const [lo, hi] = parseRange(transition, k);
-    return z >= lo && z < hi;
+    return at >= lo && at < hi;
   };
   const target = bandIndexWithHysteresis(bands, z, shown, hysteresis);
   if (target === shown) return { band: shown, forced: false, target };
   const step = target > shown ? -1 : 1;
-  const shownParsed = parsedAt(shown);
+  // The held band is still drawn only while the *rendered* zoom (requested plus the camera's
+  // offset, which grows while a band is held) is inside its parse range. Candidates are judged
+  // at the requested zoom: after a switch their offset is at most half a step, inside the
+  // one-spacing slack of the parse range.
+  const shownParsed = parsedAt(shown, rendered);
   // The first ready, parsed band from the target towards the shown one. The switch is forced
   // when the shown band can no longer be drawn here (its tiles do not contain this zoom).
   for (let k = target; k !== shown; k += step) {
@@ -214,6 +223,7 @@ export class BandSwitcher implements BandSelector {
       transition: this.#o.transition,
       shown: this.#shown,
       requestedZoom,
+      renderedZoom: requestedZoom + (this.#o.zoomOffset?.() ?? 0),
       hysteresis: this.#hysteresis,
       isReady: (k) => this.#isReady(k),
     });

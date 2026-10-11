@@ -77,6 +77,14 @@ describe('chooseBand (spec §4.3 rules)', () => {
     expect(chooseBand({ ...base, shown: 2, requestedZoom: 7.3, isReady: (k) => k === 4 })).toEqual({ band: 4, forced: true, target: 5 });
   });
 
+  it('forces a switch when the rendered zoom left the held band even though the requested one has not', () => {
+    // Band 3 is parsed on [4.8, 7.2); requested 6.45 (target 4, not ready) alone would hold it.
+    expect(chooseBand({ ...base, shown: 3, requestedZoom: 6.45, isReady: () => false })).toMatchObject({ band: 3, forced: false });
+    expect(chooseBand({ ...base, shown: 3, requestedZoom: 6.45, renderedZoom: 7.25, isReady: () => false })).toMatchObject({ band: 4, forced: true });
+    // The mirror at the low end: band 2 is parsed on [4, 6.4); requested 4.55 holds, rendered 3.95 is out.
+    expect(chooseBand({ ...base, shown: 2, requestedZoom: 4.55, renderedZoom: 3.95, isReady: () => false })).toMatchObject({ band: 1, forced: true });
+  });
+
   it('pure Equal Earth (no transition) always returns band 0', () => {
     expect(chooseBand({ bands: [{ minZoom: -Infinity, blend: 0 }], transition: null, hysteresis: 0.1, shown: 0, requestedZoom: 12, isReady: () => false })).toMatchObject({ band: 0, forced: false });
   });
@@ -221,6 +229,15 @@ describe('BandSwitcher', () => {
       c.advance(1000);
       expect(host.jumps).toBe(0);
     }
+  });
+
+  it("forces the switch once the camera's zoom offset carries the held band out of its range", () => {
+    let offset = 0;
+    const { host, zoomTo } = setup(3, 6.0, { zoomOffset: () => offset });
+    expect(zoomTo(6.55)).toBe(3); // target 4, not ready: held (band 3 parsed to 7.2)
+    offset = 0.9; // rendered 7.45 is outside band 3's range
+    expect(zoomTo(6.55)).toBe(4);
+    expect(host.jumps).toBe(0);
   });
 
   it('rejects a hysteresis that reaches the band spacing', () => {
