@@ -4,7 +4,8 @@
  *
  * URL parameters: `?mlv=5|6` (default 6), `?plugin=0|1` (default 1), `?dpr=` (the map's
  * `pixelRatio`), `?projection=mercator|globe|equal|equal-earth` (default mercator, set after
- * `load`) and `?compensation=` (passed to `installEqualEarth` when present).
+ * `load`), `?compensation=`, `?outside=` (colour), `?outline=1` and `?graticule=<step>|1` (all
+ * passed to `installEqualEarth` when present).
  */
 import type { StyleSpecification } from 'maplibre-gl';
 
@@ -18,6 +19,11 @@ const dprParam = Number(params.get('dpr'));
 const dpr = params.get('dpr') !== null && dprParam > 0 ? dprParam : undefined;
 const projection = (params.get('projection') ?? 'mercator') as HarnessProjection;
 const compensation = (params.get('compensation') ?? undefined) as CompensationMode | undefined;
+
+const outside = params.get('outside') ?? undefined;
+const outline = params.get('outline') === '1';
+const graticuleParam = params.get('graticule');
+const graticule = graticuleParam === null ? undefined : graticuleParam === '1' ? true : { step: Number(graticuleParam) };
 
 const fixtureStyle = (): StyleSpecification => ({
   version: 8,
@@ -119,6 +125,9 @@ async function start(): Promise<void> {
       workerUrl: new URL(`${worker}?v=${Date.now()}`, location.href),
       workerTimeoutMs: 15000,
       ...(compensation ? { compensation } : {}),
+      ...(outside ? { outsideColor: outside } : {}),
+      ...(outline ? { outline: true } : {}),
+      ...(graticule ? { graticule } : {}),
     });
   }
   const map = new maplibregl.Map({

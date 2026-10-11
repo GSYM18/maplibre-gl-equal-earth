@@ -71,6 +71,15 @@ export {
 } from './map/bands.js';
 
 export {
+  graticule,
+  worldOutline,
+  worldPolygon,
+  type CartographyOptions,
+  type GraticuleOptions,
+  type OutlineOptions,
+} from './map/cartography.js';
+
+export {
   createEqualEarthConstrain,
   installEqualEarthConstrain,
   type ConstrainHost,

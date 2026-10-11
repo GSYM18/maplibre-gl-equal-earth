@@ -51,6 +51,7 @@ import {
   type ResolvedTransition,
   type Transition,
 } from './bands.js';
+import type { CartographyOptions } from './cartography.js';
 import { BandCamera, type CameraHost, type LngLatFactory } from './camera.js';
 import { installEqualEarthConstrain, type ConstrainHost } from './constrain.js';
 import {
@@ -100,7 +101,11 @@ export interface ControllerHost extends CameraHost, ConstrainHost, SwitcherHost 
   listens?(type: string): boolean;
 }
 
-export interface ControllerOptions {
+/**
+ * Options of one map's controller. The cartography options (spec §5) are those of
+ * {@link CartographyOptions}: `outsideColor`, `outline` and `graticule`.
+ */
+export interface ControllerOptions extends CartographyOptions {
   /** Builds the centre objects handed to MapLibre. Pass `(lng, lat) => new maplibregl.LngLat(lng, lat)`. */
   lngLatFactory: LngLatFactory;
   /** The `equal` transition (spec §3). */
@@ -524,6 +529,15 @@ export class EqualEarthController {
     }
   }
 
+  #cartography(): CartographyOptions {
+    const { outsideColor, outline, graticule } = this.#options;
+    return {
+      ...(outsideColor === undefined ? {} : { outsideColor }),
+      ...(outline === undefined ? {} : { outline }),
+      ...(graticule === undefined ? {} : { graticule }),
+    };
+  }
+
   async #applyNow(generation: number, templates?: Record<string, SourceTemplate>): Promise<boolean> {
     const original = this.#original!;
     templates ??= await this.#templates(original);
@@ -533,7 +547,13 @@ export class EqualEarthController {
     const bands = this.#bands;
     const transition = this.#transition;
     const initialBand = bandIndexForZoom(bands, view.zoom);
-    const rewritten = rewriteStyle(original, { bands, transition, templates, initialZoom: view.zoom });
+    const rewritten = rewriteStyle(original, {
+      bands,
+      transition,
+      templates,
+      initialZoom: view.zoom,
+      cartography: this.#cartography(),
+    });
     // I4: the warp feeds MapLibre's Mercator renderer; an original globe would bend it.
     rewritten.style.projection = { type: 'mercator' };
 

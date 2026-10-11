@@ -25,11 +25,27 @@
  *    symbol, hillshade and color-relief copies are `visibility: "none"`. `gates` records the
  *    own values for the switcher.
  * 4. Raster, hillshade and color-relief layers are kept once, in the Mercator band, or removed
- *    under pure Equal Earth. Background and layers of other sources are untouched.
+ *    under pure Equal Earth. Layers of other sources are untouched.
+ * 5. Cartography (spec §5; `options.cartography`). The style's first background layer `bg` gets
+ *    one gated copy per band at its position: bands with blend < 1 paint `outsideColor`
+ *    (default transparent) as `<bg.id>__b<k>`, the Mercator band keeps `bg`. Directly above,
+ *    each such band gets a `fill` world polygon (source `equal-earth:world__b<k>`) in the
+ *    paint of `bg`, so the world keeps the background and only the outside is recoloured.
+ *    Without a background layer there is no polygon, and a non-transparent `outsideColor`
+ *    becomes a background layer of its own (`equal-earth:background__b<k>`). Opt-in graticule
+ *    (every band) and outline (bands with blend < 1) lines go directly before the first symbol
+ *    layer. Generated layers are band copies like any other: gated, no zoom range, ids checked.
  */
 
 import { bandIndexForZoom, bandSourceId, parseRange, type Band, type ResolvedTransition } from './bands.js';
 import { encodeSourceUrl } from '../tiles/protocol.js';
+import {
+  CARTOGRAPHY_PREFIX,
+  graticule,
+  worldOutline,
+  worldPolygon,
+  type CartographyOptions,
+} from './cartography.js';
 
 export interface StyleLayerLike {
   id: string;
@@ -78,6 +94,8 @@ export interface RewriteOptions {
   fadeMs?: number;
   /** @defaultValue 300 */
   symbolFadeMs?: number;
+  /** Outside colour, world polygon, outline and graticule (spec §5). */
+  cartography?: CartographyOptions;
 }
 
 export interface LayerGate {
@@ -126,6 +144,7 @@ const OPACITY: Record<string, readonly string[]> = {
   circle: ['circle-opacity', 'circle-stroke-opacity'],
   heatmap: ['heatmap-opacity'],
   symbol: ['text-opacity', 'icon-opacity'],
+  background: ['background-opacity'],
   raster: ['raster-opacity'],
   hillshade: [],
   'color-relief': ['color-relief-opacity'],
@@ -277,6 +296,130 @@ export function withoutRewriteBounds(
   };
 }
 
+interface ResolvedCartography {
+  outsideColor: string;
+  outline: { color: string; width: number } | null;
+  graticule: { step: number; color: string; width: number } | null;
+}
+
+function resolveCartography(options: CartographyOptions = {}): ResolvedCartography {
+  const outline = options.outline === true ? {} : options.outline;
+  const grid = options.graticule === true ? {} : options.graticule;
+  return {
+    outsideColor: options.outsideColor ?? 'transparent',
+    outline: outline ? { color: outline.color ?? '#9a9a9a', width: outline.width ?? 1 } : null,
+    graticule: grid
+      ? { step: grid.step ?? 30, color: grid.color ?? 'rgba(0,0,0,0.2)', width: grid.width ?? 0.75 }
+      : null,
+  };
+}
+
+interface GeneratedContext {
+  original: StyleLike;
+  style: StyleLike;
+  bands: readonly Band[];
+  layerIds: Set<string>;
+  /** Gate `copy` as band `band`'s copy of `layer` (see {@link gateCopy}). */
+  gate: (copy: StyleLayerLike, layer: StyleLayerLike, band: number) => LayerGate | null;
+  emit: (copy: StyleLayerLike, layer: StyleLayerLike, band: number) => void;
+}
+
+function claimLayerId(context: GeneratedContext, id: string): string {
+  if (context.layerIds.has(id)) throw new TypeError(`rewriteStyle: layer id "${id}" already exists in the style.`);
+  context.layerIds.add(id);
+  return id;
+}
+
+function addGeoJsonSource(context: GeneratedContext, id: string, data: unknown): void {
+  if (id in context.original.sources || id in context.style.sources) {
+    throw new TypeError(`rewriteStyle: source id "${id}" already exists in the style.`);
+  }
+  context.style.sources[id] = { type: 'geojson', data, buffer: 0, tolerance: 0 };
+}
+
+/** Without a background layer: the outside colour as a background layer of its own, at the bottom. */
+function emitOutsideBackground(context: GeneratedContext, color: string): void {
+  context.bands.forEach((band, k) => {
+    if (band.blend >= 1) return;
+    const id = claimLayerId(context, `${CARTOGRAPHY_PREFIX}background__b${k}`);
+    const layer: StyleLayerLike = { id, type: 'background', paint: { 'background-color': color } };
+    context.emit(structuredClone(layer), layer, k);
+  });
+}
+
+/** Rule 5: the background copies, then each Equal Earth band's world polygon. */
+function emitBackground(context: GeneratedContext, bg: StyleLayerLike, outsideColor: string): void {
+  const { bands } = context;
+  bands.forEach((band, k) => {
+    const copy = structuredClone(bg);
+    if (band.blend < 1) {
+      copy.id = claimLayerId(context, `${bg.id}__b${k}`);
+      copy.paint = { ...copy.paint, 'background-color': outsideColor };
+      delete copy.paint['background-pattern'];
+    }
+    context.emit(copy, bg, k);
+  });
+  bands.forEach((band, k) => {
+    if (band.blend >= 1) return;
+    const id = `${CARTOGRAPHY_PREFIX}world__b${k}`;
+    addGeoJsonSource(context, id, worldPolygon(band.blend));
+    const paint: Record<string, unknown> = {};
+    for (const [from, to] of [
+      ['background-color', 'fill-color'],
+      ['background-opacity', 'fill-opacity'],
+      ['background-pattern', 'fill-pattern'],
+    ] as const) {
+      if (bg.paint?.[from] !== undefined) paint[to] = structuredClone(bg.paint[from]);
+    }
+    paint['fill-antialias'] = false;
+    const layer: StyleLayerLike = { id: claimLayerId(context, id), type: 'fill', source: id, paint };
+    context.emit(structuredClone(layer), layer, k);
+  });
+}
+
+/**
+ * Rule 5: graticule (every band), then outline (bands with blend < 1), spliced in directly
+ * before the first symbol layer of `layers` (at the end without one).
+ */
+function emitLines(
+  context: GeneratedContext,
+  layers: StyleLayerLike[],
+  gates: LayerGate[],
+  cartography: ResolvedCartography,
+): void {
+  const { graticule: grid, outline } = cartography;
+  if (!grid && !outline) return;
+  const lines: StyleLayerLike[] = [];
+  const lineGates: LayerGate[] = [];
+  const emitLine = (name: string, k: number, data: unknown, color: string, width: number): void => {
+    const id = `${CARTOGRAPHY_PREFIX}${name}__b${k}`;
+    addGeoJsonSource(context, id, data);
+    const layer: StyleLayerLike = {
+      id: claimLayerId(context, id),
+      type: 'line',
+      source: id,
+      layout: { 'line-cap': 'round' },
+      paint: { 'line-color': color, 'line-width': width },
+    };
+    const copy = structuredClone(layer);
+    const gate = context.gate(copy, layer, k);
+    if (gate) lineGates.push(gate);
+    lines.push(copy);
+  };
+  const { bands } = context;
+  if (grid) bands.forEach((band, k) => emitLine('graticule', k, graticule(band.blend, grid.step), grid.color, grid.width));
+  if (outline) {
+    bands.forEach((band, k) => {
+      if (band.blend < 1) emitLine('outline', k, worldOutline(band.blend), outline.color, outline.width);
+    });
+  }
+  const at = layers.findIndex((l) => l.type === 'symbol');
+  const gateAt = at < 0 ? -1 : gates.findIndex((g) => g.layerId === layers[at]!.id);
+  layers.splice(at < 0 ? layers.length : at, 0, ...lines);
+  gates.splice(gateAt < 0 ? gates.length : gateAt, 0, ...lineGates);
+}
+
+
 export function rewriteStyle(original: StyleLike, options: RewriteOptions): RewrittenStyle {
   const { bands, transition, templates } = options;
   if (original.metadata?.[REWRITTEN_METADATA_KEY]) {
@@ -334,13 +477,26 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
   const layers: StyleLayerLike[] = [];
   const gates: LayerGate[] = [];
 
+  const gate = (copy: StyleLayerLike, layer: StyleLayerLike, band: number): LayerGate | null =>
+    gateCopy(copy, layer, band, initial, fadeMs, symbolFadeMs);
   const emit = (copy: StyleLayerLike, layer: StyleLayerLike, band: number): void => {
-    const gate = gateCopy(copy, layer, band, initial, fadeMs, symbolFadeMs);
-    if (gate) gates.push(gate);
+    const g = gate(copy, layer, band);
+    if (g) gates.push(g);
     layers.push(copy);
   };
 
+  const cartography = resolveCartography(options.cartography);
+  const generated: GeneratedContext = { original, style, bands, layerIds, gate, emit };
+  const firstBackground = original.layers.find((l) => l.type === 'background');
+  if (firstBackground === undefined && cartography.outsideColor !== 'transparent') {
+    emitOutsideBackground(generated, cartography.outsideColor);
+  }
+
   for (const layer of original.layers) {
+    if (layer === firstBackground) {
+      emitBackground(generated, layer, cartography.outsideColor);
+      continue;
+    }
     if (RELIEF.has(layer.type)) {
       const lo = transition ? Math.max(layer.minzoom ?? 0, parseRange(transition, steps)[0]) : Infinity;
       if (transition === null || !(lo < (layer.maxzoom ?? 24))) {
@@ -381,6 +537,7 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
     }
     if (copies === 0) removedLayers.push(layer.id);
   }
+  emitLines(generated, layers, gates, cartography);
   style.layers = layers;
   style.metadata = {
     ...structuredClone(original.metadata),
