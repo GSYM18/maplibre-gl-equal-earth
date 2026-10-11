@@ -189,6 +189,31 @@ describe('rewriteStyle', () => {
     expect(atMercator.layers[0]!.paint!['raster-opacity']).toBe(0.5);
   });
 
+  it('clamps copy zoom bounds to [0, 24] when the parse range reaches below 0', () => {
+    const wide = resolveTransition({ from: 1, to: 8, steps: 6 });
+    const { style } = rewrite(tiny(vec('a', 'fill')), wide, 1.5);
+    const copies = style.layers.filter((l) => l.id.startsWith('a'));
+    for (const l of copies) expect(l.minzoom ?? 0).toBeGreaterThanOrEqual(0);
+    expect(copies.find((l) => l.id === 'a__b0')!.minzoom).toBeUndefined();
+    expect(copies.find((l) => l.id === 'a__b1')!.minzoom).toBeUndefined();
+    expect(copies.find((l) => l.id === 'a')!.maxzoom).toBeUndefined();
+    expect(validateStyleMin(rewrite(liberty(), wide, 1.5).style as never)).toEqual([]);
+  });
+
+  it('keeps color-relief once in the Mercator band, gated', () => {
+    const { style, gates } = rewrite(tiny({ id: 'cr', type: 'color-relief', source: 'geo' }), SIX, 4.6);
+    const layer = style.layers.filter((l) => l.id === 'cr');
+    expect(layer).toHaveLength(1);
+    expect(layer[0]!.minzoom).toBeCloseTo(7.2, 12);
+    expect(layer[0]!.paint!['color-relief-opacity']).toBe(0);
+    expect(gates.find((g) => g.layerId === 'cr')).toMatchObject({ band: 6 });
+  });
+
+  it('rejects bands whose blends differ from the transition at equal length', () => {
+    const bands = SIX.bands.map((b, i) => (i === 3 ? { ...b, blend: 0.9 } : b));
+    expect(() => rewriteStyle(tiny(), { bands, transition: SIX, templates: TEMPLATES, initialZoom: 4 })).toThrow(TypeError);
+  });
+
   it('removes Liberty natural_earth, whose maxzoom 7 lies below the Mercator band', () => {
     const { style, removedLayers } = rewrite();
     expect(removedLayers).toEqual(['natural_earth']);
@@ -284,6 +309,12 @@ describe('applyGate', () => {
       ['paint', 's__b2', 'icon-opacity', undefined],
       ['paint', 'f__b2', 'fill-opacity', 0.5],
     ]);
+  });
+
+  it('shown writes an undefined own visibility verbatim', () => {
+    const host = new FakeGateHost();
+    applyGate(host, { ...symbol, visibility: undefined }, 'shown');
+    expect(host.calls[0]).toEqual(['layout', 's__b2', 'visibility', undefined]);
   });
 
   it('fading zeroes paint and leaves visibility alone', () => {

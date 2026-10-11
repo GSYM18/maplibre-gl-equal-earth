@@ -261,9 +261,9 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
         }
         copy.source = bandSourceId(layer.source, bands, k);
       }
-      // An infinite bound leaves the layer's own bound (or none) in place.
-      if (Number.isFinite(lo)) copy.minzoom = lo;
-      if (Number.isFinite(hi)) copy.maxzoom = hi;
+      // Bounds are clamped to MapLibre's 0 to 24; the layer's own bound (or none) stays otherwise.
+      if (lo > 0) copy.minzoom = lo;
+      if (hi < 24) copy.maxzoom = hi;
       emit(copy, layer, k);
       copies++;
     }
