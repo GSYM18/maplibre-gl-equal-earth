@@ -27,7 +27,7 @@ jobs:
       - run: npm run build
 
       # Guards the failure mode that broke 0.2.1: the published artifact drifting from
-      # source. `npm pack` is run against the freshly built dist, and the export names are
-      # compared with what src/index.ts declares.
+      # source. The export names of the freshly built dist are compared with what
+      # src/index.ts declares, and both worker bundles are loaded the way MapLibre loads them.
       - name: Verify built bundle exports and worker bundles
         run: npm run check:exports

@@ -31,10 +31,10 @@ const workerSelf = globalThis as unknown as WorkerGlobal;
 if (typeof workerSelf.addProtocol === 'function') {
   workerSelf.addProtocol(PROTOCOL_SCHEME, createEqualEarthProtocol());
 } else {
-  // Loaded outside a MapLibre worker. Not fatal — the main thread registers a fallback
-  // handler — but it means the warp will run on the UI thread, so make it visible.
+  // Loaded outside a MapLibre worker. Nothing registers a main-thread fallback yet, so
+  // tiles will fail to load until the application registers the protocol on the main thread.
   console.warn(
     '[equal-earth] worker entry loaded but self.addProtocol is unavailable; ' +
-      'tile warping will fall back to the main thread.',
+      'tiles will fail to load until the protocol is registered on the main thread.',
   );
 }

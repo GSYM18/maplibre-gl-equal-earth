@@ -1,8 +1,8 @@
 /**
  * Camera constraint for the Equal Earth world.
  *
- * On the Mercator grid the Equal Earth world only reaches map-space latitude ±65.46°
- * (see `MAP_SPACE_MAX_LATITUDE`), but Mercator itself will happily pan on to ±85°, showing
+ * On the Mercator grid the Equal Earth world only reaches map-space latitude ±65.54°
+ * (see `MAP_SPACE_MAX_LATITUDE`; each band has its own world edge), but Mercator itself will happily pan on to ±85°, showing
  * empty background above and below the map. This clamps the centre to keep the world in view.
  *
  * Implemented against `transformConstrain` rather than `transformCameraUpdate` deliberately:

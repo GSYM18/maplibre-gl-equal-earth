@@ -6,10 +6,10 @@ The [Equal Earth projection](https://equal-earth.com/) (Šavrič, Patterson & Je
 equal-area pseudocylindrical projection — countries appear at their true relative size, unlike
 Web Mercator, while still looking like a world map rather than a sinusoid.
 
-> **Status: `1.0.0-alpha.1`.** The coordinate math and camera handling are complete and tested.
-> The tile pipeline and the projection polyfill are not yet implemented — see
-> [Roadmap](#roadmap). Until then this package gives you the conversion primitives and the
-> zoom-threshold camera hook, not a turnkey Equal Earth basemap.
+> **Status: `1.0.0-alpha.1`.** The coordinate math, camera handling and the tile pipeline (the
+> `eqearth://` protocol and its worker bundles) are implemented and tested. The projection
+> polyfill is not — see [Roadmap](#roadmap). Until then you wire the protocol, camera and
+> constraint up yourself rather than calling `map.setProjection(...)`.
 
 ## Install
 
@@ -17,7 +17,8 @@ Web Mercator, while still looking like a world map rather than a sinusoid.
 npm install @yellowmap/maplibre-gl-equal-earth maplibre-gl
 ```
 
-ESM only. `maplibre-gl >= 6` is a peer dependency.
+ESM only. MapLibre v6 is the peer dependency today; v5 support is experimental until the peer
+range widens to `>=5.24 <7`.
 
 ## How it works, and what that costs you
 
@@ -112,7 +113,7 @@ Both cameras work on MapLibre v5 and v6: v6 moved the hook behind `setTransformC
 
 ### Keeping the world in view
 
-On the Mercator grid the Equal Earth world only reaches map-space latitude ±65.46°, but Mercator
+On the Mercator grid the Equal Earth world only reaches map-space latitude ±65.54°, but Mercator
 will happily pan on to ±85° and show empty background above and below:
 
 ```js
@@ -142,17 +143,13 @@ projection switch — `migrateProjection` replaces the transform wholesale.
 | `createEqualEarthConstrain(opts)` | The bare `TransformConstrainFunction`, if you want to compose it yourself. |
 | `GRID_FACTOR` | ≈1.162, the Equal Earth → Mercator grid scale. |
 | `EQUAL_EARTH_X_MAX` / `EQUAL_EARTH_Y_MAX` | Half-extents in metres, derived from `EARTH_RADIUS`. |
-| `MAP_SPACE_MAX_LATITUDE` | Map-space latitude of the geographic pole (≈65.46°). |
+| `MAP_SPACE_MAX_LATITUDE` | Map-space latitude of the geographic pole (≈65.54°). |
 | `MERCATOR_MAX_LATITUDE` | 85.051128779806589. |
 
 Full TypeScript declarations ship with the package.
 
 ## Roadmap
 
-- **Phase 2** — client-side tile reprojection: an `addProtocol` handler running in MapLibre's
-  worker pool that decodes standard Web Mercator vector tiles, adaptively subdivides and warps the
-  geometry, and re-encodes MVT. This is what makes an Equal Earth basemap possible from any
-  ordinary tileset, such as [OpenFreeMap](https://openfreemap.org/) Liberty.
 - **Phase 3** — projection polyfill: `map.setProjection({type: 'equal-earth'})` and
   `{type: 'equal'}`, matching the names proposed in
   [style-spec#1623](https://github.com/maplibre/maplibre-style-spec/pull/1623).
