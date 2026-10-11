@@ -159,3 +159,44 @@ test('the outline and the graticule are drawn on the world', async ({ page, mlv 
   expect(near(await colourAtPixel(page, x, y), BACKGROUND, 2), 'graticule meridian darkens the ocean').toBe(false);
   expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
 });
+
+test('a band switch does not let the container colour through the base (R7)', async ({ page, mlv }) => {
+  test.setTimeout(240_000);
+  await openHarness(page, { mlv, projection: 'equal', container: '#0b1a2e' });
+  await centreOn(page, [20, -45], 4.4); // open ocean at the canvas centre: only the base is drawn there; band 1
+  const shownBand = (): Promise<number> => page.evaluate(() => [0, 1, 2, 3, 4, 5].find((k) => window.__h.map.getPaintProperty(`equal-earth:world__b${k}`, 'fill-opacity') !== 0)!);
+  const before = await shownBand();
+  // Sample the canvas centre on every rendered frame across the switch to band 2.
+  const samples = await page.evaluate(async () => {
+    const { map } = window.__h;
+    const canvas = map.getCanvas();
+    const scale = canvas.width / canvas.clientWidth;
+    const copy = document.createElement('canvas');
+    copy.width = canvas.width;
+    copy.height = canvas.height;
+    const context = copy.getContext('2d')!;
+    const out: number[][] = [];
+    const onRender = (): void => {
+      context.clearRect(0, 0, copy.width, copy.height); // else frames accumulate into an opaque pixel
+      context.drawImage(canvas, 0, 0);
+      out.push([...context.getImageData(Math.round(256 * scale), Math.round(192 * scale), 1, 1).data]);
+    };
+    map.on('render', onRender);
+    map.jumpTo({ zoom: 4.9 });
+    // Until the band has switched (its tiles must load first), then past the end of the fade.
+    const started = performance.now();
+    while (map.getPaintProperty('equal-earth:world__b2', 'fill-opacity') === 0 && performance.now() - started < 30000) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    map.off('render', onRender);
+    return out;
+  });
+  expect(await shownBand(), 'a band switch happened').toBeGreaterThan(before);
+  expect(samples.length).toBeGreaterThan(2);
+  // Every frame is opaque background (a pixel of the transparent canvas is composited over the
+  // dark container, so any alpha below 255 lets it through) in the background colour.
+  for (const [i, s] of samples.entries()) {
+    expect(near(s, [...BACKGROUND, 255]), `frame ${i} ${s.join(',')}`).toBe(true);
+  }
+});

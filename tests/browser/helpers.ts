@@ -50,6 +50,8 @@ export interface HarnessOptions {
   compensation?: CompensationMode;
   /** `outsideColor` of `installEqualEarth`. */
   outside?: string;
+  /** Background colour of the map container (what shows through a transparent canvas). */
+  container?: string;
   /** `outline: true`. */
   outline?: boolean;
   /** `graticule: { step }`, or `true` for the default. */
@@ -74,6 +76,7 @@ export async function openHarness(page: Page, options: HarnessOptions): Promise<
   if (options.projection && options.projection !== 'mercator') params.set('projection', options.projection);
   if (options.compensation) params.set('compensation', options.compensation);
   if (options.outside) params.set('outside', options.outside);
+  if (options.container) params.set('container', options.container);
   if (options.outline) params.set('outline', '1');
   if (options.graticule !== undefined) params.set('graticule', options.graticule === true ? '1' : String(options.graticule));
   await page.goto(`/tests/browser/harness.html?${params.toString()}`);

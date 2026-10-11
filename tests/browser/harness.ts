@@ -21,6 +21,8 @@ const projection = (params.get('projection') ?? 'mercator') as HarnessProjection
 const compensation = (params.get('compensation') ?? undefined) as CompensationMode | undefined;
 
 const outside = params.get('outside') ?? undefined;
+const container = params.get('container');
+if (container) document.getElementById('map')!.style.background = container;
 const outline = params.get('outline') === '1';
 const graticuleParam = params.get('graticule');
 const graticule = graticuleParam === null ? undefined : graticuleParam === '1' ? true : { step: Number(graticuleParam) };

@@ -585,3 +585,30 @@ describe('cartography', () => {
     expect(r.style.layers.some((l) => l.id === 'background')).toBe(false);
   });
 });
+
+describe('cartography base layers (R7)', () => {
+  it('flags exactly the background copies and the world polygons as held while fading', () => {
+    const r = rewriteStyle(liberty(), { bands: SIX.bands, transition: SIX, templates: TEMPLATES, initialZoom: 4.6, cartography: { outline: true, graticule: true } });
+    const held = r.gates.filter((g) => g.holdWhileFading).map((g) => g.layerId);
+    expect(held).toEqual([
+      'background__b0', 'background__b1', 'background__b2', 'background__b3', 'background__b4', 'background__b5', 'background',
+      ...[0, 1, 2, 3, 4, 5].map((k) => `equal-earth:world__b${k}`),
+    ]);
+  });
+
+  it('flags the outside-colour background layers of a style without one', () => {
+    const style = liberty();
+    style.layers = style.layers.filter((l) => l.type !== 'background');
+    const r = rewriteStyle(style, { bands: SIX.bands, transition: SIX, templates: TEMPLATES, initialZoom: 4.6, cartography: { outsideColor: '#000' } });
+    expect(r.gates.filter((g) => g.holdWhileFading).map((g) => g.layerId)).toEqual([0, 1, 2, 3, 4, 5].map((k) => `equal-earth:background__b${k}`));
+  });
+
+  it('applyGate ignores the fading phase of a held gate and hides it in the hidden phase', () => {
+    const gate: LayerGate = { layerId: 'b', band: 0, paint: { 'fill-opacity': undefined }, hideByVisibility: false, holdWhileFading: true };
+    const host = new FakeGateHost();
+    applyGate(host, gate, 'fading');
+    expect(host.calls).toEqual([]);
+    applyGate(host, gate, 'hidden');
+    expect(host.calls).toEqual([['paint', 'b', 'fill-opacity', 0]]);
+  });
+});
