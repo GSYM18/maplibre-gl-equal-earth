@@ -2,7 +2,7 @@
  * The application's own style edits while Equal Earth is active (Task 9) on real MapLibre, both
  * majors: a layer added under `equal` at z2 is drawn in the band shown, on the fixture's places
  * where they are; a paint change reaches it there; a batch of `addLayer` calls neither moves the
- * view nor raises an `error`; `removeLayer` takes every copy away.
+ * view nor raises an `error`; `removeLayer` takes every copy away. None of it fires `style.load`.
  */
 import type { Page } from '@playwright/test';
 
@@ -20,6 +20,14 @@ test('addLayer, setPaintProperty and removeLayer while active reach the band sho
   await openHarness(page, { mlv, projection: 'equal' });
   await centreOn(page, TOKYO, 2);
   expect(await colourIs(page, [255, 0, 0])).toBe(false);
+  // An amend is invisible, as a native addLayer is: no `style.load` reaches the application (R15).
+  await page.evaluate(() => {
+    const kept = window as unknown as { __loads: number };
+    kept.__loads = 0;
+    window.__h.map.on('style.load', () => {
+      kept.__loads++;
+    });
+  });
 
   await page.evaluate(() => {
     window.__h.map.addLayer({
@@ -32,6 +40,7 @@ test('addLayer, setPaintProperty and removeLayer while active reach the band sho
   });
   await idle(page);
   expect(await colourIs(page, [255, 0, 0])).toBe(true);
+  expect(await page.evaluate(() => (window as unknown as { __loads: number }).__loads)).toBe(0);
   // Drawn by the band shown (pure Equal Earth at z2), not by the Mercator band's layer.
   expect(await page.evaluate(() => window.__h.map.getLayer('marks__b0') !== undefined)).toBe(true);
 
@@ -59,5 +68,6 @@ test('addLayer, setPaintProperty and removeLayer while active reach the band sho
   await idle(page);
   expect(await colourIs(page, [0, 255, 0])).toBe(false);
   expect(await page.evaluate(() => window.__h.map.getStyle().layers.filter((l) => l.id.startsWith('marks')).length)).toBe(0);
+  expect(await page.evaluate(() => (window as unknown as { __loads: number }).__loads)).toBe(0);
   expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
 });

@@ -45,8 +45,9 @@
  * the source's next wrapped update.
  *
  * **Live style edits** (Task 9). The map's `addSource`, `removeSource`, `addLayer`, `removeLayer`,
- * `setPaintProperty`, `setLayoutProperty` and `setFilter` are wrapped on the instance when the
- * controller is constructed, and pass straight through while Equal Earth is off. While it is on,
+ * `setPaintProperty`, `setLayoutProperty` and `setFilter` (and `setStyle`, `fire` and the reads
+ * below) are wrapped on the instance when the controller is constructed, and pass straight
+ * through while Equal Earth is off. While it is on,
  * an edit addresses the application's ids, which name the original's layers and sources:
  *
  * - A property edit is written to every live copy of the layer and kept in the original. A gated
@@ -69,13 +70,24 @@
  *   style, so neither the application's `setData` nor its `setLight` is reverted. A source given
  *   by URL that is not cached yet (an added GeoJSON source, a TileJSON) is fetched first: only then
  *   does an amend wait, and edits made meanwhile join it. A source that cannot be resolved is
- *   reported (an `error` event, as for a re-apply) and stays unbanded. MapLibre fires `style.load`
- *   for every diffed `setStyle`, so it fires for each amend too.
+ *   reported (an `error` event, as for a re-apply) and stays unbanded.
+ * - An amend is invisible, as a native `addLayer` is (R15): the `style.load` that `Style.setState`
+ *   fires for its diff bubbles through the Map's `fire`, which is wrapped to swallow it while the
+ *   amend's `setStyle` runs. An edit made inside the plugin's own `setStyle` (an application
+ *   listener of an event it fires) is amended in a new macrotask, never in the running amend loop.
  * - Edits made while an activation fetches its TileJSON are taken before it commits; edits made
- *   while a re-apply is in flight reach the original it rewrites, and an amend follows it.
+ *   while a re-apply is in flight reach the original it rewrites, and an amend follows the apply
+ *   once it has finished (R17).
+ * - The application's `setStyle` is wrapped too (R16): from the call until `#onStyleLoad` has
+ *   captured the new style, the wrappers pass straight through, so a `style.load` listener that
+ *   re-adds its layers to the new basemap edits the live style, where the capture finds them.
+ * - `getLayer`, `getPaintProperty`, `getLayoutProperty`, `getFilter` and the `layers` of
+ *   `queryRenderedFeatures` read an original id that is not live (pure Equal Earth, or outside
+ *   the Mercator band's range) as its copy in the band shown, else its first live copy (R18): the
+ *   application's guards agree with what the wrappers accept and refuse.
  *
- * The plugin's own writes never pass through these wrappers (rule 4): the switcher's gates and
- * every write the controller makes use MapLibre's methods as found before wrapping.
+ * The plugin's own writes and reads never pass through these wrappers (rule 4): the switcher's
+ * gates and every call the controller makes use MapLibre's methods as found before wrapping.
  * `setLayerZoomRange`, `moveLayer` and the other style setters are not followed.
  *
  * Like every `map/` module this has no runtime dependency on `maplibre-gl`; the host is typed
@@ -194,7 +206,30 @@ interface RawStyle {
   setPaintProperty(layerId: unknown, name: unknown, value: unknown, ...rest: unknown[]): unknown;
   setLayoutProperty(layerId: unknown, name: unknown, value: unknown, ...rest: unknown[]): unknown;
   setFilter(layerId: unknown, filter: unknown, ...rest: unknown[]): unknown;
+  setStyle(style: unknown, ...rest: unknown[]): unknown;
+  getLayer(...args: unknown[]): unknown;
+  /** These three throw on a map without them; `#accepted` then assumes acceptance. */
+  getPaintProperty(...args: unknown[]): unknown;
+  getLayoutProperty(...args: unknown[]): unknown;
+  getFilter(...args: unknown[]): unknown;
+  queryRenderedFeatures(...args: unknown[]): unknown;
 }
+
+/** The style reads that resolve an original id while active (R18), by their id argument. */
+const LAYER_READS = ['getLayer', 'getPaintProperty', 'getLayoutProperty', 'getFilter'] as const;
+
+const RAW_METHODS = [
+  'addSource',
+  'removeSource',
+  'addLayer',
+  'removeLayer',
+  'setPaintProperty',
+  'setLayoutProperty',
+  'setFilter',
+  'setStyle',
+  ...LAYER_READS,
+  'queryRenderedFeatures',
+] as const satisfies readonly (keyof RawStyle)[];
 
 const STYLE_EDITS = [
   'addSource',
@@ -431,6 +466,16 @@ export class EqualEarthController {
   #amendQueued = false;
   #amendRunning = false;
   #amendRequested = false;
+  /** An amend deferred to a new macrotask (an edit made inside the plugin's own `setStyle`, R15). */
+  #amendTimer: ReturnType<typeof setTimeout> | undefined;
+  #amendDeferred = false;
+  /** Set around an amend's `setStyle`: the `style.load` events it fires, swallowed (R15). */
+  #amendLoads: { count: number } | undefined;
+  /**
+   * An application `setStyle` while active (R16): `call` during the call, `loading` while its
+   * rebuild loads, `none` once `#onStyleLoad` has captured it (or nothing changed).
+   */
+  #appStyle: 'none' | 'call' | 'loading' = 'none';
   /** Warped GeoJSON by data object and band (`blend/zoom`): an amend re-warps only new data. */
   readonly #warped = new WeakMap<object, Map<string, GeoJSON.GeoJSON>>();
   /** Source specs whose resolution failed synchronously (TMS, no tiles): reported once. */
@@ -589,6 +634,7 @@ export class EqualEarthController {
     }
     this.#projection = undefined;
     this.#view = undefined;
+    this.#appStyle = 'none';
     this.#unsubscribe(); // `off` only: the map's state is not touched
     this.#release();
   }
@@ -637,6 +683,8 @@ export class EqualEarthController {
     this.#geoApi?.uninstall();
     this.#geoApi = undefined;
     this.#unwrapStyleEdits();
+    clearTimeout(this.#amendTimer);
+    this.#amendTimer = undefined;
     this.#destroyed = true;
     this.#original = undefined;
     this.#rewritten = undefined;
@@ -829,6 +877,8 @@ export class EqualEarthController {
       return await this.#applyNow(generation, resolved);
     } finally {
       if (this.#inFlight === generation) this.#inFlight = undefined;
+      // An amend this apply blocked (R17): installed now, or abandoned, which drops it.
+      if (this.#amendRequested && this.#inFlight === undefined) this.#scheduleAmend();
     }
   }
 
@@ -1013,6 +1063,7 @@ export class EqualEarthController {
    */
   readonly #onStyleLoading = (): void => {
     if (!this.active || this.#applying) return;
+    if (this.#appStyle === 'call') this.#appStyle = 'loading';
     this.#view = this.#detach();
     if (!this.#switchPending()) this.#nextGeneration();
   };
@@ -1034,6 +1085,7 @@ export class EqualEarthController {
     if (!this.active || this.#applying) return;
     const style = this.#readStyle();
     if (!style) return;
+    this.#appStyle = 'none'; // captured below (or ours again): the wrappers follow the original
     if (hasOurMetadata(style)) {
       if (this.#installed || this.#inFlight === this.#generation || this.#switchPending()) return;
       this.#view = this.#detach();
@@ -1055,7 +1107,7 @@ export class EqualEarthController {
   #setStyle(style: StyleLike): void {
     this.#applying = true;
     try {
-      this.#host.setStyle(style, { diff: true });
+      this.#rawStyle.setStyle(style, { diff: true });
     } finally {
       this.#applying = false;
     }
@@ -1091,6 +1143,7 @@ export class EqualEarthController {
   /** After the style is dealt with: world copies back, the camera back in geographic space. */
   #finishDeactivate(view: View): void {
     this.#view = undefined;
+    this.#appStyle = 'none';
     this.#geojson.clear(); // the next activation fetches afresh
 
     if (this.#worldCopies !== undefined) {
@@ -1156,18 +1209,85 @@ export class EqualEarthController {
       setLayoutProperty: (layerId, name, value, ...rest) => this.#setProperty('layout', layerId, name, value, rest),
       setFilter: (layerId, filter, ...rest) => this.#setProperty('filter', layerId, undefined, filter, rest),
     };
-    const restores = STYLE_EDITS.map((name) => wrapMethod<Edit>(this.#host, name, () => handlers[name]));
+    const host = this.#host;
+    const raw = this.#rawStyle;
+    const restores = STYLE_EDITS.map((name) => wrapMethod<Edit>(host, name, () => handlers[name]));
+    // R16: the application's own `setStyle`; the plugin's calls use the raw one.
+    restores.push(wrapMethod<Edit>(host, 'setStyle', () => (style, ...rest) => this.#appSetStyle(style, rest)));
+    // R18: an original id that is not live reads as the copy shown, so that `getLayer` agrees
+    // with what the wrappers accept and refuse; `queryRenderedFeatures`'s `layers` alike.
+    for (const name of LAYER_READS) {
+      restores.push(wrapMethod<Edit>(host, name, () => (id, ...rest) => raw[name](this.#resolveId(id), ...rest)));
+    }
+    restores.push(
+      wrapMethod<Edit>(host, 'queryRenderedFeatures', () => (...args) => raw.queryRenderedFeatures(...this.#resolveQuery(args))),
+    );
+    // R15: an amend is invisible, as a native `addLayer` is: the `style.load` its `setStyle`
+    // fires (`Style.setState`, bubbling through the Map's `fire`) is counted, not delivered.
+    restores.push(
+      wrapMethod<Edit>(host, 'fire', (original) => (event, ...rest) => {
+        const loads = this.#amendLoads;
+        if (loads && eventType(event) === 'style.load') {
+          loads.count++;
+          return host;
+        }
+        return original(event, ...rest);
+      }),
+    );
     return () => {
       for (const restore of restores) restore();
     };
   }
 
-  /** The original while Equal Earth is active: the application's edits are kept in it. */
+  /**
+   * The original while Equal Earth is active, unless an application `setStyle` awaits capture
+   * (R16): the application's edits are kept in it. While that style is pending, edits go straight
+   * to the live style, where the capture finds them.
+   */
   #following(): StyleLike | undefined {
-    return this.active ? this.#original : undefined;
+    return this.active && this.#appStyle === 'none' ? this.#original : undefined;
+  }
+
+  /** The application's `setStyle`: marks its style pending capture while active (R16). */
+  #appSetStyle(style: unknown, rest: unknown[]): unknown {
+    if (!this.active) return this.#rawStyle.setStyle(style, ...rest);
+    this.#appStyle = 'call';
+    try {
+      return this.#rawStyle.setStyle(style, ...rest);
+    } finally {
+      // A diff captured it (`#onStyleLoad`) or changed nothing; a rebuild stays pending until it loads.
+      if (this.#appStyle === 'call') this.#appStyle = 'none';
+    }
+  }
+
+  /** The live layer an application id reads as: itself if live, else its copy shown, else its first live copy (R18). */
+  #resolveId(id: unknown): unknown {
+    const original = this.#following();
+    if (!original || typeof id !== 'string' || this.#rawStyle.getLayer(id) !== undefined) return id;
+    if (!original.layers.some((layer) => layer.id === id)) return id;
+    const copies = this.#liveCopies(id);
+    const shown = this.#installed?.switcher.current();
+    return copies.find((copy) => shown !== undefined && copy === `${id}__b${shown}`) ?? copies[0] ?? id;
+  }
+
+  /** `queryRenderedFeatures` arguments with the ids of `options.layers` resolved ({@link #resolveId}). */
+  #resolveQuery(args: unknown[]): unknown[] {
+    const at = args.findIndex((arg) => isRecord(arg) && 'layers' in arg);
+    const options = args[at] as Record<string, unknown> | undefined;
+    const layers = options?.['layers'];
+    if (!options || !(Array.isArray(layers) || layers instanceof Set) || !this.#following()) return args;
+    const resolved = [...(layers as Iterable<unknown>)].map((id) => this.#resolveId(id));
+    const copy = [...args];
+    copy[at] = { ...options, layers: layers instanceof Set ? new Set(resolved) : resolved };
+    return copy;
   }
 
   #addSource(id: unknown, source: unknown, rest: unknown[]): unknown {
+    const before = this.#following();
+    if (before && typeof id === 'string' && id in before.sources && this.#host.getSource(id) === undefined) {
+      // An original source the live style lacks: refused as MapLibre refuses a duplicate.
+      throw new Error(`Source "${id}" already exists.`);
+    }
     const result = this.#rawStyle.addSource(id, source, ...rest);
     this.#edits++;
     const original = this.#following();
@@ -1192,7 +1312,8 @@ export class EqualEarthController {
       reportError(this.#host, new Error(`Source "${id}" cannot be removed while layer "${user.id}" is using it.`));
       return this.#host;
     }
-    const result = this.#rawStyle.removeSource(id, ...rest);
+    // An original source the live style lacks is removed from the original alone, without error.
+    const result = this.#host.getSource(id) !== undefined ? this.#rawStyle.removeSource(id, ...rest) : this.#host;
     delete original.sources[id];
     this.#edits++;
     this.#scheduleAmend();
@@ -1210,15 +1331,16 @@ export class EqualEarthController {
       return result;
     }
     const id = layer['id'];
+    // A live id (the application's, or a plugin layer's such as `water__b1`): MapLibre refuses it.
+    if (this.#rawStyle.getLayer(id) !== undefined) return this.#rawStyle.addLayer(layer, before, ...rest);
     if (original.layers.some((existing) => existing.id === id)) {
-      // A duplicate. MapLibre refuses it itself where the id is live; elsewhere (pure Equal
-      // Earth) it would add it, so refuse it as MapLibre does.
-      if (this.#host.getLayer(id) !== undefined) return this.#rawStyle.addLayer(layer, before, ...rest);
+      // An original layer that is not live (pure Equal Earth): `getLayer` reads it as its copy
+      // (R18), so refuse it as MapLibre refuses a duplicate.
       reportError(this.#host, new Error(`Layer "${id}" already exists on this map.`));
       return this.#host;
     }
     const result = this.#rawStyle.addLayer(layer, before, ...rest);
-    if (this.#host.getLayer(id) === undefined) return result; // refused; MapLibre reported why
+    if (this.#rawStyle.getLayer(id) === undefined) return result; // refused; MapLibre reported why
     const spec = cloneSpec(layer) as StyleLayerLike;
     const source: unknown = spec.source;
     if (isRecord(source)) {
@@ -1242,7 +1364,7 @@ export class EqualEarthController {
       return result;
     }
     // Under pure Equal Earth, or outside the Mercator band's range, the id itself is not live.
-    const result = this.#host.getLayer(id) !== undefined ? this.#rawStyle.removeLayer(id, ...rest) : this.#host;
+    const result = this.#rawStyle.getLayer(id) !== undefined ? this.#rawStyle.removeLayer(id, ...rest) : this.#host;
     original.layers.splice(at, 1);
     this.#edits++;
     this.#scheduleAmend();
@@ -1314,19 +1436,13 @@ export class EqualEarthController {
    * Without the getter, assumed.
    */
   #accepted(kind: PropertyKind, id: string, property: string | undefined, value: unknown): boolean {
-    const host = this.#host;
+    const raw = this.#rawStyle;
     let read: unknown;
     try {
-      if (kind === 'paint') {
-        if (!host.getPaintProperty) return true;
-        read = host.getPaintProperty(id, property!);
-      } else if (kind === 'layout') {
-        if (!host.getLayoutProperty) return true;
-        read = host.getLayoutProperty(id, property!);
-      } else {
-        if (!host.getFilter) return true;
-        read = host.getFilter(id);
-      }
+      // A map without the getter throws here (`rawStyle`): assumed accepted.
+      if (kind === 'paint') read = raw.getPaintProperty(id, property);
+      else if (kind === 'layout') read = raw.getLayoutProperty(id, property);
+      else read = raw.getFilter(id);
     } catch {
       return true;
     }
@@ -1337,7 +1453,7 @@ export class EqualEarthController {
   #liveCopies(id: string): string[] {
     const ids = this.#bands.flatMap((band, k) => (band.blend < 1 ? [`${id}__b${k}`] : []));
     ids.push(id);
-    return ids.filter((candidate) => this.#host.getLayer(candidate) !== undefined);
+    return ids.filter((candidate) => this.#rawStyle.getLayer(candidate) !== undefined);
   }
 
   /** The live layer to insert before for the original's `beforeId`: its first live copy, else the next layer's. */
@@ -1353,6 +1469,19 @@ export class EqualEarthController {
 
   /** One amend per task, however many edits it holds. */
   #scheduleAmend(): void {
+    if (this.#applying) {
+      // An edit inside the plugin's own `setStyle` (an application listener of an event it fires):
+      // amend in a new macrotask, never in the running amend loop, so no listener can spin it. An
+      // amend that reads the original before then takes the edit, and the timer finds nothing to do.
+      this.#amendDeferred = true;
+      this.#amendTimer ??= setTimeout(() => {
+        this.#amendTimer = undefined;
+        if (!this.#amendDeferred) return;
+        this.#amendDeferred = false;
+        this.#scheduleAmend();
+      }, 0);
+      return;
+    }
     this.#amendRequested = true;
     if (this.#amendQueued || this.#amendRunning) return;
     this.#amendQueued = true;
@@ -1371,13 +1500,16 @@ export class EqualEarthController {
     this.#amendRunning = true;
     try {
       while (this.#amendRequested) {
+        // An apply in flight keeps the request: it re-schedules it once it has finished (R17).
+        if (this.#inFlight !== undefined || this.#applying) return;
         this.#amendRequested = false;
         const installed = this.#installed;
         const original = this.#original;
-        if (!this.active || !installed || !original || this.#inFlight !== undefined || this.#applying) return;
+        if (!this.active || !installed || !original) return;
         const generation = this.#generation;
         const failed = new Set<string>();
         for (;;) {
+          this.#amendDeferred = false; // this pass reads the original: it takes every edit so far
           this.#refreshGeoJSONData(original);
           const { resolved, missing } = this.#resolveNow(original, failed);
           if (missing.length === 0) {
@@ -1458,24 +1590,21 @@ export class EqualEarthController {
         }
       }
       const host = this.#host;
-      let loads = 0;
+      const loads = { count: 0 };
       let rebuilt = false;
-      const onLoad = (): void => {
-        loads++;
-      };
       const onLoading = (): void => {
         rebuilt = true;
       };
-      host.on('style.load', onLoad);
       host.on('styledataloading', onLoading);
       this.#rewritten = rewritten;
+      this.#amendLoads = loads; // the `fire` wrapper counts and swallows `style.load` (R15)
       try {
         this.#setStyle(rewritten.style);
       } finally {
-        host.off('style.load', onLoad);
+        this.#amendLoads = undefined;
         host.off('styledataloading', onLoading);
       }
-      if (loads > 1 || rebuilt) {
+      if (loads.count > 1 || rebuilt) {
         // A diff fires one `style.load`. More, or a rebuild: an application `style.load` listener
         // set a style of its own inside ours (or MapLibre could not diff ours), and `#applying`
         // hid its events. Handle them now, as if they had been heard.
@@ -1487,7 +1616,7 @@ export class EqualEarthController {
       // No `style.load`: nothing changed, or MapLibre refused the style (its validation errors
       // are `error` events). A refused style left the previous rewrite live.
       const added = rewritten.style.layers.find((layer) => !existed.has(layer.id));
-      if (loads === 0 && added && host.getLayer(added.id) === undefined) {
+      if (loads.count === 0 && added && this.#rawStyle.getLayer(added.id) === undefined) {
         this.#rewritten = previous;
         throw new Error('Equal Earth: the map did not accept the amended style; the edit reaches the Mercator band only.');
       }
@@ -1778,22 +1907,20 @@ function unloaded(id: string, reason: string, cause?: unknown): Error {
 /** MapLibre's style edits on `host` as found now, before the controller wraps them. */
 function rawStyle(host: ControllerHost): RawStyle {
   const slots = host as unknown as Record<string, unknown>;
-  const bind = (name: (typeof STYLE_EDITS)[number]) => {
+  const raw: Partial<Record<keyof RawStyle, (...args: unknown[]) => unknown>> = {};
+  for (const name of RAW_METHODS) {
     const method = slots[name];
-    return (...args: unknown[]): unknown => {
+    raw[name] = (...args: unknown[]): unknown => {
       if (typeof method !== 'function') throw new TypeError(`Equal Earth: the map has no ${name}.`);
       return (method as (...args: unknown[]) => unknown).apply(host, args);
     };
-  };
-  return {
-    addSource: bind('addSource'),
-    removeSource: bind('removeSource'),
-    addLayer: bind('addLayer'),
-    removeLayer: bind('removeLayer'),
-    setPaintProperty: bind('setPaintProperty'),
-    setLayoutProperty: bind('setLayoutProperty'),
-    setFilter: bind('setFilter'),
-  };
+  }
+  return raw as RawStyle;
+}
+
+/** An event's type, as `Evented.fire` takes it: an event object or a type string. */
+function eventType(event: unknown): unknown {
+  return typeof event === 'string' ? event : (event as { type?: unknown } | null)?.type;
 }
 
 function unwrapGeoJSON(installed: Installed): void {

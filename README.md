@@ -295,12 +295,16 @@ prints say nothing about latency on real hardware.
   deactivation. A layer or source you add is drawn warped in each band from the next microtask
   on (several edits in one task cost one style diff; a GeoJSON or TileJSON given by URL is
   fetched first). An opacity the transition gates, or a symbol layer's `visibility`, becomes the
-  value its band shows. MapLibre fires `style.load` for each such diff, so a `style.load`
-  listener that re-adds layers should check `getLayer` first. Under pure Equal Earth (and
-  outside the Mercator band's zoom range) only the copies exist, so `getLayer(id)` returns
-  `undefined` for your id. `setLayerZoomRange` and `moveLayer` are not fanned out: they reach
-  only the layer under your id (the Mercator band's), and the next such diff or the
-  deactivation undoes them.
+  value its band shows. Like a native `addLayer`, none of this fires `style.load`, so a
+  `style.load` listener that re-adds its layers runs only for a real style change (a `setStyle`
+  of yours, or the activation itself). Under pure Equal Earth (and outside the Mercator band's
+  zoom range) only the copies exist; `getLayer(id)`, `getPaintProperty`, `getLayoutProperty`,
+  `getFilter` and the `layers` of `queryRenderedFeatures` then read your id as the copy the
+  shown band draws, so the usual `if (!map.getLayer(id)) map.addLayer(…)` guard and
+  layer-scoped listeners (`map.on('click', id, …)`) keep working. The layer `getLayer` returns
+  is that copy (its `id` is `<id>__b<k>`). `setLayerZoomRange` and `moveLayer` are not fanned
+  out: they reach only the layer under your id (the Mercator band's), and the next such diff or
+  the deactivation undoes them.
 - **Sources.** Band sources inherit `attribution`, `minzoom` and `promoteId` from the original
   source, but not `bounds` (geographic bounds would cut off map-space tiles). TMS sources are
   rejected on activation.
