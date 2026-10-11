@@ -323,6 +323,14 @@ describe.each(SHAPES)('BandCamera on a MapLibre $shape-shaped host', ({ shape, c
     expectAt(map, geographicToMap([-170, 0], 2 / 3));
   });
 
+  it('returns promptly for an absurdly large longitude instead of looping', { timeout: 1000 }, () => {
+    const onConversionFailure = vi.fn();
+    const map = create([1e300, 0], 8);
+    new BandCamera(map, { bands: EQUAL, onConversionFailure });
+
+    expect(() => map.applyFrame({ zoom: 6.5 })).not.toThrow();
+  });
+
   it('leaves exactly ±180° alone — on Equal Earth those are opposite map edges', () => {
     const map = create([180, 0], 8);
     new BandCamera(map, { bands: EQUAL });
