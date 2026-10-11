@@ -11,11 +11,19 @@
  * from the main thread is reachable.
  */
 
-import { TileCache, RequestCoalescer, type TileCacheOptions } from './cache.js';
-import { warpTiles, type WarpTileOptions } from './mvt.js';
+import { EntryCache, TileCache, RequestCoalescer, type TileCacheOptions } from './cache.js';
+import {
+  buildTile,
+  decodeToGeographic,
+  mergeLayers,
+  type GeographicLayers,
+  type WarpTileOptions,
+} from './mvt.js';
 import { sourceTilesFor, type TileId, type TileCoverOptions } from './tile-cover.js';
 
 export const PROTOCOL_SCHEME = 'eqearth';
+
+const DEFAULT_DECODED_TILES = 32;
 
 /**
  * Everything the handler needs, encoded into the tile URL.
@@ -75,7 +83,19 @@ export function expandTemplate(template: string, tile: TileId): string {
 }
 
 export interface ProtocolOptions {
+  /** The raw source-tile cache (the fetch tier). */
   cache?: TileCacheOptions;
+  /**
+   * How many decoded source tiles to keep, by upstream URL. Decoding does not depend on the
+   * blend, so one decode serves every band and every overlapping output tile.
+   *
+   * Decoded GeoJSON is large: measured on OpenFreeMap at ~4.4× the raw tile bytes, ~4.5 MB of
+   * heap for a z2–z3 source tile, per worker. 32 holds the source cover of a z3 viewport
+   * across bands (~20–30 tiles) at a worst case of ~150 MB per worker; 64 would double that.
+   *
+   * @defaultValue 32
+   */
+  decodedTiles?: number;
   /** Injectable for testing. @defaultValue global `fetch` */
   fetchImpl?: typeof fetch;
 }
@@ -93,6 +113,7 @@ export type ProtocolHandler = (
 /** Create the protocol handler, with its own cache and in-flight request table. */
 export function createEqualEarthProtocol(options: ProtocolOptions = {}): ProtocolHandler {
   const cache = new TileCache(options.cache);
+  const decoded = new EntryCache<GeographicLayers>(options.decodedTiles ?? DEFAULT_DECODED_TILES);
   const coalescer = new RequestCoalescer<ArrayBuffer | null>();
   const doFetch = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
 
@@ -123,6 +144,29 @@ export function createEqualEarthProtocol(options: ProtocolOptions = {}): Protoco
     }, signal);
   }
 
+  /**
+   * Decode a fetched source tile, or reuse its decode. All layers are decoded and cached, so
+   * sources that filter layers differently still share one decode; the filter is applied to
+   * the result. The cached layers are never mutated downstream (`mergeLayers` copies, the
+   * warp builds new features).
+   */
+  function decodeSource(
+    url: string,
+    bytes: ArrayBuffer,
+    tile: TileId,
+    layers: readonly string[] | undefined,
+  ): GeographicLayers {
+    let all = decoded.get(url);
+    if (all === undefined) {
+      all = decodeToGeographic(bytes, tile);
+      decoded.set(url, all);
+    }
+    if (!layers) return all;
+    const filtered: GeographicLayers = new Map();
+    for (const [name, features] of all) if (layers.includes(name)) filtered.set(name, features);
+    return filtered;
+  }
+
   return async (params, abortController) => {
     const { config, tile } = parseTileUrl(params.url);
 
@@ -148,9 +192,17 @@ export function createEqualEarthProtocol(options: ProtocolOptions = {}): Protoco
     );
 
     // Sources fetched for other tiles can resolve after this one was abandoned; skip the
-    // 100-750 ms warp rather than compute a result nobody will read.
+    // decode and warp rather than compute a result nobody will read.
     abortController.signal.throwIfAborted();
-    const warped = warpTiles(fetched, tile, config);
+    const layers: GeographicLayers[] = [];
+    for (const source of fetched) {
+      if (!source.data || source.data.byteLength === 0) continue;
+      layers.push(
+        decodeSource(expandTemplate(config.url, source.tile), source.data, source.tile, config.layers),
+      );
+    }
+    if (layers.length === 0) return { data: new ArrayBuffer(0) };
+    const warped = buildTile(mergeLayers(layers), tile, config);
     // MapLibre treats a zero-length ArrayBuffer as a legitimately empty tile.
     return { data: toArrayBuffer(warped) };
   };

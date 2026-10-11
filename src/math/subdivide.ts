@@ -110,8 +110,8 @@ export function densifyAndWarp(
  *
  * Same refinement decisions as {@link densifyAndWarp} — deviation is still measured in world
  * space, because that is what the renderer sees — but the output stays in lng/lat. This is
- * what the tile pipeline wants: `geojson-vt` performs its own Mercator projection when
- * indexing, so it must be handed lng/lat, and pre-projecting would be undone.
+ * what the tile pipeline wants: the warp turns it into map-space lng/lat, which the clip
+ * (`tiles/clip.ts`) projects with Mercator into tile units, as the renderer will.
  */
 export function densify(
   points: readonly LngLatTuple[],

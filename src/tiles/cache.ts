@@ -92,6 +92,47 @@ export class TileCache {
   }
 }
 
+/**
+ * A count-bounded LRU, for values whose size cannot be read off cheaply — decoded source
+ * tiles in the protocol. Same recency trick as {@link TileCache}: `Map` keeps insertion
+ * order, and a hit is moved to the end by deleting and re-inserting it.
+ */
+export class EntryCache<T> {
+  readonly #entries = new Map<string, T>();
+  readonly #maxEntries: number;
+
+  constructor(maxEntries: number) {
+    this.#maxEntries = Math.max(0, Math.floor(maxEntries));
+  }
+
+  get size(): number {
+    return this.#entries.size;
+  }
+
+  get(key: string): T | undefined {
+    if (!this.#entries.has(key)) return undefined;
+    const value = this.#entries.get(key) as T;
+    this.#entries.delete(key);
+    this.#entries.set(key, value);
+    return value;
+  }
+
+  set(key: string, value: T): void {
+    this.#entries.delete(key);
+    if (this.#maxEntries === 0) return;
+    this.#entries.set(key, value);
+    while (this.#entries.size > this.#maxEntries) {
+      const oldest = this.#entries.keys().next();
+      if (oldest.done) return;
+      this.#entries.delete(oldest.value);
+    }
+  }
+
+  clear(): void {
+    this.#entries.clear();
+  }
+}
+
 interface InFlight<T> {
   promise: Promise<T>;
   controller: AbortController;

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  clipLinesToWorld,
   clipLineToWorld,
   clipPointsToWorld,
   clipPolygonToWorld,
@@ -105,6 +106,102 @@ describe('clipLineToWorld', () => {
       [10, 10],
     ];
     expect(clipLineToWorld(line)).toEqual([line]);
+  });
+
+  it('keeps the inner piece of a segment crossing both -180 and +180', () => {
+    const parts = clipLineToWorld([
+      [-190, 0],
+      [190, 38],
+    ]);
+    expect(parts).toHaveLength(1);
+    expect(parts[0]).toHaveLength(2);
+    expect(parts[0]![0]![0]).toBeCloseTo(-180, 12);
+    expect(parts[0]![0]![1]).toBeCloseTo(1, 12);
+    expect(parts[0]![1]![0]).toBeCloseTo(180, 12);
+    expect(parts[0]![1]![1]).toBeCloseTo(37, 12);
+  });
+
+  it('splits a line that crosses both antimeridians on its way back', () => {
+    const parts = clipLineToWorld([
+      [170, 0],
+      [190, 0],
+      [-190, 38],
+      [-170, 38],
+    ]);
+    expect(parts).toHaveLength(3);
+    expect(parts[0]!.at(-1)![0]).toBeCloseTo(180, 12);
+    expect(parts[1]![0]![0]).toBeCloseTo(180, 12);
+    expect(parts[1]![1]![0]).toBeCloseTo(-180, 12);
+    expect(parts[2]![0]![0]).toBeCloseTo(-180, 12);
+    expect(parts[2]!.at(-1)).toEqual([-170, 38]);
+  });
+
+  it('keeps a vertex lying exactly on +180 and -180', () => {
+    expect(
+      clipLineToWorld([
+        [190, 0],
+        [180, 5],
+        [170, 10],
+      ]),
+    ).toEqual([
+      [
+        [180, 5],
+        [170, 10],
+      ],
+    ]);
+    expect(
+      clipLineToWorld([
+        [-170, 0],
+        [-180, 5],
+        [-190, 10],
+      ]),
+    ).toEqual([
+      [
+        [-170, 0],
+        [-180, 5],
+      ],
+    ]);
+  });
+
+  it('starts at the crossing for a line entering the world from outside', () => {
+    const parts = clipLineToWorld([
+      [200, 0],
+      [170, 30],
+      [160, 30],
+    ]);
+    expect(parts).toHaveLength(1);
+    expect(parts[0]).toHaveLength(3);
+    expect(parts[0]![0]![0]).toBeCloseTo(180, 12);
+    expect(parts[0]![0]![1]).toBeCloseTo(20, 12);
+    expect(parts[0]!.slice(1)).toEqual([
+      [170, 30],
+      [160, 30],
+    ]);
+  });
+
+  it('drops degenerate members on the in-range fast path as the slow path does', () => {
+    // Fewer than two positions is not a line. Both paths must agree on dropping it.
+    expect(clipLineToWorld([[5, 5]])).toEqual([]);
+    expect(clipLineToWorld([])).toEqual([]);
+    const line = [
+      [0, 0],
+      [1, 1],
+    ];
+    expect(clipLinesToWorld([[[5, 5]], line])).toEqual([line]);
+    expect(
+      clipLinesToWorld([
+        [[5, 5]],
+        [
+          [200, 0],
+          [170, 0],
+        ],
+      ]),
+    ).toEqual([
+      [
+        [180, 0],
+        [170, 0],
+      ],
+    ]);
   });
 });
 

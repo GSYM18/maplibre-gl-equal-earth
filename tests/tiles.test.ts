@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   geographicToMap,
+  geographicToMapWorld,
   mapToGeographic,
   WORLD_Y_MAX,
   WORLD_Y_MIN,
@@ -23,6 +24,7 @@ import {
 } from '../src/tiles/tile-cover.js';
 import { VectorTile } from '@mapbox/vector-tile';
 import { PbfReader } from 'pbf';
+import { fromGeojsonVt } from 'vt-pbf';
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -268,8 +270,8 @@ describe('buildTile', () => {
 
   it('subdivision measurably survives the full pipeline', () => {
     // A long meridian is the worst case for backprojection: straight in Mercator,
-    // strongly curved in Equal Earth. This is the end-to-end guard that neither
-    // geojson-vt's simplification nor the encoder discards the added vertices.
+    // strongly curved in Equal Earth. This is the end-to-end guard that neither the
+    // clip nor the encoder discards the added vertices.
     const layers = lineLayer([
       [150, -80],
       [150, 80],
@@ -282,21 +284,30 @@ describe('buildTile', () => {
     expect(curved).toBeGreaterThan(flat * 5);
   });
 
-  it('geojson-vt simplification would otherwise erase the subdivision', () => {
-    // Regression guard for the default: geojson-vt's own default tolerance of 3 removes
-    // vertices within 3 tile units of the chord, i.e. everything a 1-tile-unit
-    // subdivision target adds.
+  it('keeps subdivision vertices through the clip of a partial tile', () => {
+    // The old pipeline's geojson-vt simplification (default tolerance 3) deleted exactly the
+    // vertices a 1-tile-unit subdivision adds. The direct clip simplifies nothing; this pins
+    // that on a tile which cuts the meridian, so the clip path itself is exercised.
     const layers = lineLayer([
       [150, -80],
       [150, 80],
     ]);
+    const northEast: TileId = { z: 1, x: 1, y: 0 };
 
-    const withDefault = countVertices(buildTile(layers, output));
-    const withGeojsonVtDefault = countVertices(
-      buildTile(layers, output, { simplifyTolerance: 3 }),
-    );
+    const flat = countVertices(buildTile(layers, northEast, { maxDepth: 0 }));
+    const curved = countVertices(buildTile(layers, northEast));
 
-    expect(withDefault).toBeGreaterThan(withGeojsonVtDefault);
+    expect(flat).toBeGreaterThan(0);
+    expect(curved).toBeGreaterThan(flat * 5);
+    const decoded = new VectorTile(new PbfReader(buildTile(layers, northEast))).layers['test']!;
+    for (const ring of decoded.feature(0).loadGeometry()) {
+      for (const p of ring) {
+        expect(p.x).toBeGreaterThanOrEqual(-64);
+        expect(p.x).toBeLessThanOrEqual(4096 + 64);
+        expect(p.y).toBeGreaterThanOrEqual(-64);
+        expect(p.y).toBeLessThanOrEqual(4096 + 64);
+      }
+    }
   });
 
   it('emits an empty buffer when nothing survives clipping', () => {
@@ -349,6 +360,76 @@ describe('mergeLayers', () => {
     mergeLayers([a, new Map([['x', [2 as unknown as GeoJSON.Feature]]])]);
     expect(a.get('x')).toHaveLength(1);
   });
+
+  const point = (id: number | undefined, coordinates: [number, number]): GeoJSON.Feature => ({
+    type: 'Feature',
+    id,
+    properties: { name: 'label' },
+    geometry: { type: 'Point', coordinates },
+  });
+
+  it('drops a point repeated with the same id and coordinates by another source tile', () => {
+    const merged = mergeLayers([
+      new Map([['place', [point(7, [10, 20])]]]),
+      new Map([['place', [point(7, [10, 20])]]]),
+    ]);
+    expect(merged.get('place')).toHaveLength(1);
+  });
+
+  it('keeps two different points with the same id, and points without an id', () => {
+    const merged = mergeLayers([
+      new Map([['place', [point(7, [10, 20]), point(undefined, [1, 1])]]]),
+      new Map([['place', [point(7, [10, 21]), point(undefined, [1, 1])]]]),
+    ]);
+    expect(merged.get('place')).toHaveLength(4);
+  });
+
+  it('drops a label repeated as a MultiPoint with a world copy in another source tile', () => {
+    // OpenFreeMap z1: Algeria is a MultiPoint [[2.99, 27.99], [-357.01, 27.99]] in the western
+    // source tiles and a Point [2.99, 27.99] in the eastern ones.
+    const withCopy: GeoJSON.Feature = {
+      type: 'Feature',
+      id: 7,
+      properties: { name: 'label' },
+      geometry: { type: 'MultiPoint', coordinates: [[10, 20], [-350, 20]] },
+    };
+    const merged = mergeLayers([
+      new Map([['place', [withCopy]]]),
+      new Map([['place', [point(7, [10, 20])]]]),
+      new Map([['place', [withCopy]]]),
+    ]);
+    expect(merged.get('place')).toEqual([withCopy]);
+  });
+
+  it('dedupes per layer, not across layers', () => {
+    const merged = mergeLayers([
+      new Map([['a', [point(7, [10, 20])]]]),
+      new Map([['b', [point(7, [10, 20])]]]),
+    ]);
+    expect(merged.get('a')).toHaveLength(1);
+    expect(merged.get('b')).toHaveLength(1);
+  });
+
+  it("emits a label in two source tiles' buffers once in the output tile", () => {
+    // Global tile-unit position 4096 + 10 at z1: inside 1/1/0 near its west edge, and in
+    // the east buffer of 1/0/0. MVT encodes both as the same integer global position.
+    const label = (x: number, y: number) =>
+      fromGeojsonVt(
+        { place: { features: [{ type: 1, id: 42, geometry: [[x, y]], tags: { name: 'twice' } }] } },
+        { version: 2, extent: 4096 },
+      );
+    const west = { z: 1, x: 0, y: 0 };
+    const east = { z: 1, x: 1, y: 0 };
+    const merged = mergeLayers([
+      decodeToGeographic(label(4096 + 10, 3000), west),
+      decodeToGeographic(label(10, 3000), east),
+    ]);
+
+    const out = new VectorTile(new PbfReader(buildTile(merged, { z: 0, x: 0, y: 0 })));
+    const layer = out.layers['place']!;
+    expect(layer.length).toBe(1);
+    expect(layer.feature(0).id).toBe(42);
+  });
 });
 
 describe('blended warp in the tile pipeline', () => {
@@ -393,6 +474,25 @@ describe('blended warp in the tile pipeline', () => {
     ];
     const options = { tolerance: toleranceForZoom(4) };
     expect(densify(meridian, { ...options, blend: 2 / 3 })).not.toEqual(densify(meridian, options));
+
+    // Every chord the densified line keeps is within the tolerance of the blended warp at
+    // its midpoint, measured in the blended world space it will be drawn in.
+    const blend = 1 / 2;
+    const deviation = (a: [number, number], b: [number, number]): number => {
+      const aw = geographicToMapWorld(a, blend);
+      const bw = geographicToMapWorld(b, blend);
+      const mw = geographicToMapWorld([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2], blend);
+      return Math.hypot(mw[0] - (aw[0] + bw[0]) / 2, mw[1] - (aw[1] + bw[1]) / 2);
+    };
+    const densified = densify(meridian, { ...options, blend });
+    expect(densified.length).toBeGreaterThan(2);
+    let worst = 0;
+    for (let i = 1; i < densified.length; i++) {
+      worst = Math.max(worst, deviation(densified[i - 1]!, densified[i]!));
+    }
+    expect(worst).toBeLessThanOrEqual(options.tolerance);
+    // ...and the bound is not trivially loose: the unrefined chord exceeds it.
+    expect(deviation(meridian[0]!, meridian[1]!)).toBeGreaterThan(options.tolerance);
   });
 });
 
@@ -462,8 +562,9 @@ describe('geometry beyond the antimeridian', () => {
       for (const ring of layer.feature(i).loadGeometry()) for (const p of ring) xs.push(p.x);
     }
     expect(xs.length).toBeGreaterThan(0);
-    // x <= 0 is geojson-vt's copy of the east-edge content into the (undrawn) western buffer;
-    // its clipped apex lands exactly on x = 0. Anything in (0, 2048) would be visible.
+    // The overhang must stay at the east edge: anything in (0, 2048) would be visible in the
+    // western half. (geojson-vt also copied it into the undrawn western buffer at x <= 0; the
+    // direct clip does not wrap at all.)
     expect(xs.filter((x) => x > 0 && x < 2048)).toEqual([]);
   });
 });

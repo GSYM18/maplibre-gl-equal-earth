@@ -5,10 +5,11 @@
  * whole-world copies (a z0 tile holds the United Kingdom at −3°, +357° and −363°), and
  * polygons and lines overhang by the tile buffer. Mercator is periodic in longitude, so a
  * copy simply lands one world over. Equal Earth is not — easting is `lng × f(lat)` with
- * `f < 1` off the equator — so a copy lands *short* of one world over, and `geojson-vt`'s
- * `wrap()` then folds it back into the visible map at the wrong place. Equal Earth has no
- * world copies (`renderWorldCopies` is off), so anything beyond ±180° has no valid place and
- * is removed before warping.
+ * `f < 1` off the equator — so a copy lands *short* of one world over: in the empty corners
+ * beside the rounded outline, or, through geojson-vt's `wrap()` (which the pipeline used to
+ * clip with), folded back into the map at the wrong place. Equal Earth has no world copies
+ * (`renderWorldCopies` is off), so anything beyond ±180° has no valid place and is removed
+ * before warping.
  *
  * Geometry already inside the band is returned by reference: this runs per feature per tile.
  */
@@ -32,9 +33,11 @@ export function clipPointsToWorld(points: Position[]): Position[] {
 
 /**
  * Clip a line to the band, splitting it where it leaves and re-enters. Parts with fewer than
- * two positions are dropped.
+ * two positions are dropped — on the in-range fast path too, so a degenerate input line is
+ * dropped whether or not it lies in the band.
  */
 export function clipLineToWorld(line: Position[]): Position[][] {
+  if (line.length < 2) return [];
   if (line.every(inBand)) return [line];
 
   const parts: Position[][] = [];
@@ -83,9 +86,14 @@ export function clipLineToWorld(line: Position[]): Position[][] {
   return parts;
 }
 
-/** Clip several lines; returns the input unchanged when every line is already in range. */
+/**
+ * Clip several lines; returns the input unchanged when every line is already in range and has
+ * at least two positions.
+ */
 export function clipLinesToWorld(lines: Position[][]): Position[][] {
-  return lines.every((line) => line.every(inBand)) ? lines : lines.flatMap(clipLineToWorld);
+  return lines.every((line) => line.length >= 2 && line.every(inBand))
+    ? lines
+    : lines.flatMap(clipLineToWorld);
 }
 
 /** Sutherland–Hodgman against one vertical half-plane, over an open vertex list. */
