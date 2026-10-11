@@ -89,9 +89,10 @@ export function decodeToGeographic(
  *
  * Some tiles carry the same label as a `MultiPoint` with a world copy (Algeria at 3° and
  * −357°), others as a plain `Point`. The copy beyond ±180° is removed before warping anyway, so
- * only positions inside the world are compared: a `Point` or `MultiPoint` none of whose
- * in-world positions is new for its `id` is dropped. Features without an `id` are kept:
- * nothing says they are the same feature.
+ * only positions inside the world are compared, per position: a `Point` or `MultiPoint` none
+ * of whose in-world positions is new for its `id` is dropped, and a `MultiPoint` with some
+ * seen and some new positions is replaced by a copy holding only the new ones (the input is
+ * not mutated). Features without an `id` are kept: nothing says they are the same feature.
  */
 export function mergeLayers(tiles: readonly GeographicLayers[]): GeographicLayers {
   const merged: GeographicLayers = new Map();
@@ -112,16 +113,23 @@ export function mergeLayers(tiles: readonly GeographicLayers[]): GeographicLayer
             seenPoints.set(name, seen);
           }
           const positions = geometry.type === 'Point' ? [geometry.coordinates] : geometry.coordinates;
-          let fresh = false;
-          for (const [lng, lat] of positions) {
-            if (Math.abs(lng!) > 180) continue;
-            const key = `${feature.id}|${lng}|${lat}`;
-            if (!seen.has(key)) {
+          const fresh: GeoJSON.Position[] = [];
+          let repeated = false;
+          for (const position of positions) {
+            if (Math.abs(position[0]!) > 180) continue;
+            const key = `${feature.id}|${position[0]}|${position[1]}`;
+            if (seen.has(key)) {
+              repeated = true;
+            } else {
               seen.add(key);
-              fresh = true;
+              fresh.push(position);
             }
           }
-          if (!fresh) continue;
+          if (fresh.length === 0) continue;
+          if (repeated) {
+            target.push({ ...feature, geometry: { type: 'MultiPoint', coordinates: fresh } });
+            continue;
+          }
         }
         target.push(feature);
       }
@@ -228,10 +236,19 @@ export function buildTile(
 
   // Most features handed in lie wholly outside this output tile: the source cover overlaps
   // several output tiles, and low-zoom source tiles carry wide buffers. Rejecting them on
-  // their geographic bounding box skips the warp, which dominates the cost. The pre-image is
-  // taken with twice the tile buffer, so a feature whose densified chords could still reach
-  // the buffered tile is never rejected.
-  const reach = preimageBBox(output, { blend, buffer: (2 * buffer * TILE_EXTENT) / extent });
+  // their geographic bounding box skips the warp, which dominates the cost.
+  //
+  // Why this never drops a feature that reaches the buffered tile: the blended warp is
+  // pseudocylindrical (northing depends on latitude alone; easting is linear in longitude at
+  // a fixed latitude). So the tile's horizontal edges map back to parallels, and on its
+  // vertical edges `lng(x, lat)` is monotone in |lat|; the geographic pre-image's extremes
+  // therefore sit at the edge endpoints (or at latitude 0, itself a tile boundary for z ≥ 1),
+  // which `preimageBBox` samples. A feature whose bbox misses that box has every vertex
+  // outside the buffered tile, and its densified chords deviate from the true curve by about
+  // one tile unit, far inside the margin: the box is taken with twice the tile buffer (64 extra
+  // units). `tests/clip.test.ts` "buildTile pre-warp reject" fails with a reach buffer of 0.
+  const reachBuffer = (2 * buffer * TILE_EXTENT) / extent;
+  const reach = preimageBBox(output, { blend, buffer: reachBuffer });
   if (!reach) return new Uint8Array(0);
 
   const encoded: Record<string, { features: TileFeature[] }> = {};

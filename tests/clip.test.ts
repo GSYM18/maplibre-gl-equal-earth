@@ -25,16 +25,26 @@ function referenceTile(layers: GeographicLayers): Uint8Array {
   return fromGeojsonVt(encoded, { version: 2, extent: EXTENT });
 }
 
-type Summary = { count: number; area: number; length: number; points: Set<string> };
+/**
+ * `polygons`/`holes` come from `toGeoJSON`, which classifies rings by winding relative to the
+ * feature's first ring, as MapLibre does: a hole wound like its shell counts as a polygon.
+ */
+type Summary = { count: number; area: number; length: number; points: Set<string>; polygons: number; holes: number };
 function decode(bytes: Uint8Array): Record<string, Summary> {
   const out: Record<string, Summary> = {};
   if (bytes.byteLength === 0) return out;
   const tile = new VectorTile(new PbfReader(bytes));
   for (const name of Object.keys(tile.layers)) {
     const layer = tile.layers[name]!;
-    const s: Summary = { count: layer.length, area: 0, length: 0, points: new Set() };
+    const s: Summary = { count: layer.length, area: 0, length: 0, points: new Set(), polygons: 0, holes: 0 };
     for (let i = 0; i < layer.length; i++) {
       const feature = layer.feature(i);
+      if (feature.type === 3) {
+        const geometry = feature.toGeoJSON(OUT.x, OUT.y, OUT.z).geometry;
+        const polygons = geometry.type === 'Polygon' ? [geometry.coordinates] : geometry.type === 'MultiPolygon' ? geometry.coordinates : [];
+        s.polygons += polygons.length;
+        for (const polygon of polygons) s.holes += polygon.length - 1;
+      }
       for (const ring of feature.loadGeometry()) {
         if (feature.type === 1) for (const p of ring) s.points.add(`${p.x},${p.y}`);
         if (feature.type === 2) for (let k = 1; k < ring.length; k++) s.length += Math.hypot(ring[k]!.x - ring[k - 1]!.x, ring[k]!.y - ring[k - 1]!.y);
@@ -64,8 +74,36 @@ function world(): GeographicLayers {
     ] }, 2)]],
     ['line', [feature({ type: 'LineString', coordinates: [[-30, -10], [60, 50]] }, 3)]],   // diagonal through the tile
     ['points', [feature({ type: 'MultiPoint', coordinates: [[20, 20], [-0.4, 20], [80, 20]] }, 4)]], // inside, in the buffer, outside
+    // These cross all four edges of the tile, in map space and once warped from geographic.
+    ['frame', [feature({ type: 'Polygon', coordinates: [
+      [[-20, -20], [60, -20], [60, 60], [-20, 60], [-20, -20]],     // outer, around the whole tile
+      [[5, 10], [5, 20], [15, 20], [15, 10], [5, 10]],              // hole, wound against it
+    ] }, 5)]],
+    ['cross', [
+      feature({ type: 'LineString', coordinates: [[-20, 20], [60, 20]] }, 6),  // west to east
+      feature({ type: 'LineString', coordinates: [[20, 60], [20, -20]] }, 7),  // north to south
+    ]],
   ]);
 }
+
+/** Every vertex of every feature in an encoded tile, in tile units. */
+function vertices(bytes: Uint8Array): { x: number; y: number }[] {
+  const out: { x: number; y: number }[] = [];
+  if (bytes.byteLength === 0) return out;
+  const tile = new VectorTile(new PbfReader(bytes));
+  for (const name of Object.keys(tile.layers)) {
+    const layer = tile.layers[name]!;
+    for (let i = 0; i < layer.length; i++) for (const ring of layer.feature(i).loadGeometry()) out.push(...ring);
+  }
+  return out;
+}
+
+const withinBuffer = (x: number, y: number): void => {
+  expect(x).toBeGreaterThanOrEqual(-BUFFER);
+  expect(x).toBeLessThanOrEqual(EXTENT + BUFFER);
+  expect(y).toBeGreaterThanOrEqual(-BUFFER);
+  expect(y).toBeLessThanOrEqual(EXTENT + BUFFER);
+};
 
 describe('clipFeatureToTile', () => {
   it('drops geometry entirely outside the buffered tile', () => {
@@ -84,6 +122,41 @@ describe('clipFeatureToTile', () => {
     expect(Math.sign(signedArea(rings[0]!))).toBe(-1);
     expect(Math.sign(signedArea(rings[1]!))).toBe(1);
     for (const [x, y] of rings[0]!) { expect(x).toBeGreaterThanOrEqual(-BUFFER); expect(y).toBeGreaterThanOrEqual(-BUFFER); expect(x).toBeLessThanOrEqual(EXTENT + BUFFER); expect(y).toBeLessThanOrEqual(EXTENT + BUFFER); }
+  });
+
+  it('clips a ring on all four edges of the buffered tile', () => {
+    const result = clipFeatureToTile(world().get('frame')![0]!, OUT, EXTENT, BUFFER)!;
+    const [outer, hole] = result.geometry as number[][][];
+    for (const [x, y] of outer!) withinBuffer(x!, y!);
+    // The shell covers the whole buffered tile: its corners are exactly the four buffer corners.
+    const corners = new Set(outer!.map(([x, y]) => `${x},${y}`));
+    for (const [x, y] of [[-BUFFER, -BUFFER], [EXTENT + BUFFER, -BUFFER], [EXTENT + BUFFER, EXTENT + BUFFER], [-BUFFER, EXTENT + BUFFER]]) {
+      expect(corners.has(`${x},${y}`)).toBe(true);
+    }
+    expect(hole!.length).toBe(5);
+  });
+
+  it('clips segments on all four edges of the buffered tile', () => {
+    for (const line of world().get('cross')!) {
+      const runs = clipFeatureToTile(line, OUT, EXTENT, BUFFER)!.geometry as number[][][];
+      expect(runs).toHaveLength(1);
+      for (const [x, y] of runs[0]!) withinBuffer(x!, y!);
+      // Each line enters on one edge and leaves on the opposite one.
+      const onEdge = (p: number[]) => p.some((v) => v === -BUFFER || v === EXTENT + BUFFER);
+      expect(onEdge(runs[0]![0]!)).toBe(true);
+      expect(onEdge(runs[0]!.at(-1)!)).toBe(true);
+    }
+  });
+
+  it('keeps a point exactly on the buffer edge and drops one a unit beyond it', () => {
+    // Map-space lng to Mercator world x is linear: x = 0.5 + lng / 360, so these land on whole
+    // tile units: the buffer edges of 3/4/3 and one unit beyond them.
+    const lngAt = (tileX: number) => ((OUT.x + tileX / EXTENT) / 2 ** OUT.z - 0.5) * 360;
+    const at = (tileX: number) => clipFeatureToTile(feature({ type: 'Point', coordinates: [lngAt(tileX), 20] }), OUT, EXTENT, BUFFER);
+    expect((at(EXTENT + BUFFER)!.geometry as number[][])[0]![0]).toBe(EXTENT + BUFFER);
+    expect((at(-BUFFER)!.geometry as number[][])[0]![0]).toBe(-BUFFER);
+    expect(at(EXTENT + BUFFER + 1)).toBeNull();
+    expect(at(-BUFFER - 1)).toBeNull();
   });
 
   it('splits a line that leaves and re-enters into two runs', () => {
@@ -138,6 +211,48 @@ describe('buildTile (direct clip) against geojson-vt', () => {
       expect(ours[name]!.area).toBeCloseTo(reference[name]!.area, -Math.log10(Math.max(1, reference[name]!.area * 1e-3)));
       expect(ours[name]!.length).toBeCloseTo(reference[name]!.length, -Math.log10(Math.max(1, reference[name]!.length * 1e-3)));
       expect(ours[name]!.points).toEqual(reference[name]!.points);
+      // Winding: the same rings must classify as shells and holes in both.
+      expect([ours[name]!.polygons, ours[name]!.holes]).toEqual([reference[name]!.polygons, reference[name]!.holes]);
     }
+    expect(reference['frame']!.holes).toBe(1);
+    expect(reference['poly']!.holes).toBe(1);
+  });
+
+  it('keeps every vertex within the buffered tile on all four edges', () => {
+    const all = vertices(buildTile(world(), OUT, { blend: 0 }));
+    for (const { x, y } of all) withinBuffer(x, y);
+    // ...and the fixture really reaches every edge, so each edge's clip is exercised.
+    expect(all.some((p) => p.x === -BUFFER)).toBe(true);
+    expect(all.some((p) => p.x === EXTENT + BUFFER)).toBe(true);
+    expect(all.some((p) => p.y === -BUFFER)).toBe(true);
+    expect(all.some((p) => p.y === EXTENT + BUFFER)).toBe(true);
+  });
+});
+
+describe('buildTile pre-warp reject', () => {
+  const lone = (geometry: GeoJSON.Geometry): GeographicLayers => new Map([['lone', [feature(geometry, 1)]]]);
+
+  it('keeps a lone point whose warped position lies in the west buffer', () => {
+    const all = vertices(buildTile(lone({ type: 'Point', coordinates: [-0.4, 20] }), OUT, { blend: 0 }));
+    expect(all).toHaveLength(1);
+    expect(all[0]!.x).toBeLessThan(0);
+    expect(all[0]!.x).toBeGreaterThanOrEqual(-BUFFER);
+  });
+
+  it('keeps a short line lying wholly in the west buffer', () => {
+    const all = vertices(buildTile(lone({ type: 'LineString', coordinates: [[-0.6, 25], [-0.3, 25]] }), OUT, { blend: 0 }));
+    expect(all.length).toBeGreaterThanOrEqual(2);
+    for (const { x } of all) {
+      expect(x).toBeLessThan(0);
+      expect(x).toBeGreaterThanOrEqual(-BUFFER);
+    }
+  });
+
+  it('keeps a lone point in the south buffer at an intermediate blend', () => {
+    // 3/4/3's south edge is the equator at every blend.
+    const all = vertices(buildTile(lone({ type: 'Point', coordinates: [20, -0.5] }), OUT, { blend: 1 / 3 }));
+    expect(all).toHaveLength(1);
+    expect(all[0]!.y).toBeGreaterThan(EXTENT);
+    expect(all[0]!.y).toBeLessThanOrEqual(EXTENT + BUFFER);
   });
 });

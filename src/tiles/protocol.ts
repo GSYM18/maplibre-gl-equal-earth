@@ -93,6 +93,10 @@ export interface ProtocolOptions {
    * heap for a z2–z3 source tile, per worker. 32 holds the source cover of a z3 viewport
    * across bands (~20–30 tiles) at a worst case of ~150 MB per worker; 64 would double that.
    *
+   * Only reachable when you create the handler yourself: the shipped worker bundle
+   * (`worker-entry.ts`) calls `createEqualEarthProtocol()` without options, so inside
+   * MapLibre's workers the default always applies.
+   *
    * @defaultValue 32
    */
   decodedTiles?: number;
