@@ -291,7 +291,9 @@ prints say nothing about latency on real hardware.
   source. Change such a style before activating, or deactivate first. A `setStyle(url)` is
   never cancelled by the plugin: while MapLibre fetches it, the plugin's own style updates wait
   (edits made meanwhile are kept if the fetch fails, and dropped with the old style, as in
-  MapLibre, when it arrives), and a deactivation meanwhile requests the URL again.
+  MapLibre, when it arrives); a deactivation meanwhile leaves the fetch running, or requests the
+  URL again when it has to put your style back. A layer added while such a style is still
+  loading shows unwarped until that style arrives.
 - **Style edits while active.** `addSource`, `removeSource`, `addLayer`, `removeLayer`,
   `setPaintProperty`, `setLayoutProperty` and `setFilter` reach every band: address your own
   ids, the plugin fans the change out to the band copies (`<id>__b<k>`) and keeps it for
