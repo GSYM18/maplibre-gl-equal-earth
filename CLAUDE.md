@@ -80,7 +80,7 @@ Equal Earth projection support for MapLibre GL JS v6, and v5 from 5.24, publishe
 `@yellowmap/maplibre-gl-equal-earth`. It is a rewrite of, and a hard fork from,
 [pka/maplibre-gl-equal-earth](https://github.com/pka/maplibre-gl-equal-earth) (the old `lib/`,
 proj4, and the `0.2.x` line are gone). ESM (`dist/index.js`) plus a UMD file for classic
-`<script>` pages (`dist/maplibre-gl-equal-earth.umd.js`, global `maplibreglEqualEarth`); no CJS
+`<script>` pages (`dist/maplibre-gl-equal-earth.umd.min.js`, global `maplibreglEqualEarth`); no CJS
 entry (`require()` of the ESM works from Node 20.19).
 
 **Registry note:** this environment's npm proxy refuses packages published after 2026-08-31.
@@ -243,6 +243,10 @@ affects the absolute metre values from `toEqualEarth`.
   the run instructions into the readout: any non-Vite static server sends `.ts` as
   `video/mp2t`, which the browser refuses.
 - `demo/` + root `index.html` — Vite demo pages, not part of the published package.
+- `demo/umd.html` — the one demo without TypeScript: the built UMD from a classic `<script>`,
+  MapLibre 5.24 (or `?mlv=6`, `import()`ed) from unpkg, OpenFreeMap Liberty by default. Any
+  static server rooted at the repository runs it once `dist/` is built; needs the network.
+  `window.__umdDemo` holds `{ map, eqe }`.
 - `demo/transition.html` + `.ts` — the adaptive transition on any EPSG:3857 vector style
   (`?style=`, default OpenFreeMap Liberty; a SmartMaps URL with its `?key=` works the same way,
   and none may be committed), public API only. Its parameters are listed in its header and the

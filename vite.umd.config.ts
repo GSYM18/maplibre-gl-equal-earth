@@ -1,5 +1,5 @@
 /**
- * Builds `dist/maplibre-gl-equal-earth.umd.js`: the library for a classic `<script src>` next to
+ * Builds `dist/maplibre-gl-equal-earth.umd.min.js`: the library for a classic `<script src>` next to
  * MapLibre's own script, exposing the `maplibreglEqualEarth` global. The bundle imports nothing
  * (MapLibre is handed to `installEqualEarth`), so it needs no global for its peer.
  *
@@ -23,7 +23,7 @@ import { eqeVersion } from './scripts/build-id.ts';
 
 const resolveFromRoot = (path: string) => fileURLToPath(new URL(path, import.meta.url));
 
-const FILE_NAME = 'maplibre-gl-equal-earth.umd.js';
+const FILE_NAME = 'maplibre-gl-equal-earth.umd.min.js';
 const SCRIPT_URL = '__eqeScriptUrl';
 
 /** Mirrors Rollup's own UMD `import.meta.url`: the running script, else the page's base. */
