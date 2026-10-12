@@ -8,7 +8,14 @@
  *   2. Is geometry actually curved after warping (i.e. is subdivision doing its job)?
  *   3. What does the warp cost per tile?
  *
- * Run with:  node --experimental-strip-types scripts/probe-openfreemap.ts
+ * Run with:  npx vite-node scripts/probe-openfreemap.ts
+ *
+ * `--budget` measures the cold world view instead (spec §6, Task 10): every output tile at z1 and
+ * z2 inside the Equal Earth rows, blend 0, built by the real protocol handler at
+ * `sourceZoomOffset` 0 and −1, one fresh handler per offset. It prints upstream bytes and
+ * requests, the decode + warp + encode time with the network excluded (a second fresh handler
+ * replays the recorded bytes), and the output features of `place`, `water`, `boundary` and
+ * `transportation`:  npx vite-node scripts/probe-openfreemap.ts -- --budget
  */
 
 import { VectorTile } from '@mapbox/vector-tile';
@@ -17,6 +24,7 @@ import { PbfReader } from 'pbf';
 import { geographicToMapWorld } from '../src/math/backproject.ts';
 import { sourceTilesFor, tileWorldBounds, type TileId } from '../src/tiles/tile-cover.ts';
 import { decodeToGeographic, mergeLayers, buildTile, type GeographicLayers } from '../src/tiles/mvt.ts';
+import { createEqualEarthProtocol, encodeSourceUrl, type ProtocolHandler } from '../src/tiles/protocol.ts';
 
 const TILE_URL = 'https://tiles.openfreemap.org/planet/latest';
 
@@ -211,6 +219,141 @@ function sanityCheckGeometry(): void {
     const [wx, wy] = geographicToMapWorld(lngLat);
     console.log(`  ${name.padEnd(24)} world = ${wx.toFixed(5)}, ${wy.toFixed(5)}`);
   }
+}
+
+/* ------------------------------------------------------------------ --budget */
+
+const BUDGET_LAYERS = ['place', 'water', 'boundary', 'transportation'] as const;
+
+/** Every output tile at `z` inside the Equal Earth rows at blend 0. */
+function worldViewTiles(z: number): TileId[] {
+  const tiles: TileId[] = [];
+  for (let y = 0; y < 2 ** z; y++) {
+    for (let x = 0; x < 2 ** z; x++) {
+      if (sourceTilesFor({ z, x, y }).length > 0) tiles.push({ z, x, y });
+    }
+  }
+  return tiles;
+}
+
+interface BudgetRow {
+  offset: number;
+  zoom: string;
+  tiles: number;
+  bytes: number;
+  requests: number;
+  warpMs: number;
+  features: Record<(typeof BUDGET_LAYERS)[number], number>;
+}
+
+const tileUrl = (offset: number, { z, x, y }: TileId): string =>
+  encodeSourceUrl({
+    url: `${TILE_URL}/{z}/{x}/{y}.pbf`,
+    blend: 0,
+    sourceMaxZoom: 14,
+    sourceZoomOffset: offset,
+    persistentCache: false,
+  })
+    .replace('{z}', String(z))
+    .replace('{x}', String(x))
+    .replace('{y}', String(y));
+
+/** A fresh handler: cold fetch, decode and persistent tiers (no Cache Storage in Node anyway). */
+const freshHandler = (fetchImpl: typeof fetch): ProtocolHandler =>
+  createEqualEarthProtocol({ fetchImpl, cacheStorage: undefined, version: 'probe' });
+
+async function budgetRun(offset: number, zooms: readonly number[]): Promise<BudgetRow[]> {
+  // Pass 1, over the network: what a cold page fetches. The bytes are kept for pass 2.
+  const recorded = new Map<string, { status: number; body: ArrayBuffer }>();
+  const counts = new Map<number, { bytes: number; requests: number }>();
+  let zoomNow = zooms[0]!;
+  // The handler always fetches a string URL.
+  const networkFetch = (async (url: string, init?: RequestInit) => {
+    const response = await fetch(url, init);
+    const body = await response.arrayBuffer();
+    recorded.set(url, { status: response.status, body });
+    const count = counts.get(zoomNow) ?? { bytes: 0, requests: 0 };
+    count.bytes += body.byteLength;
+    count.requests++;
+    counts.set(zoomNow, count);
+    // A 204 must not carry a body, not even an empty one.
+    return new Response(response.status === 204 ? null : body, { status: response.status });
+  }) as unknown as typeof fetch;
+  const network = freshHandler(networkFetch);
+  for (const z of zooms) {
+    zoomNow = z;
+    await Promise.all(worldViewTiles(z).map((tile) => network({ url: tileUrl(offset, tile) }, new AbortController())));
+  }
+
+  // Pass 2, from memory: decode + warp + encode only, tile after tile.
+  const replay = ((url: string) => {
+    const hit = recorded.get(url);
+    if (!hit) return Promise.reject(new Error(`budget: ${url} was not recorded`));
+    const empty = hit.status === 204 || hit.status === 404;
+    return Promise.resolve(new Response(empty ? null : hit.body.slice(0), { status: hit.status }));
+  }) as unknown as typeof fetch;
+  const offline = freshHandler(replay);
+  const rows: BudgetRow[] = [];
+  for (const z of zooms) {
+    const tiles = worldViewTiles(z);
+    const features = Object.fromEntries(BUDGET_LAYERS.map((name) => [name, 0])) as BudgetRow['features'];
+    let warpMs = 0;
+    for (const tile of tiles) {
+      const start = performance.now();
+      const { data } = await offline({ url: tileUrl(offset, tile) }, new AbortController());
+      warpMs += performance.now() - start;
+      if (data.byteLength === 0) continue;
+      const layers = new VectorTile(new PbfReader(new Uint8Array(data))).layers;
+      for (const name of BUDGET_LAYERS) features[name] += layers[name]?.length ?? 0;
+    }
+    const count = counts.get(z) ?? { bytes: 0, requests: 0 };
+    rows.push({ offset, zoom: `z${z}`, tiles: tiles.length, ...count, warpMs, features });
+  }
+  return rows;
+}
+
+function total(rows: readonly BudgetRow[]): BudgetRow {
+  const sum = (pick: (row: BudgetRow) => number) => rows.reduce((acc, row) => acc + pick(row), 0);
+  return {
+    offset: rows[0]!.offset,
+    zoom: rows.map((row) => row.zoom).join('+'),
+    tiles: sum((row) => row.tiles),
+    bytes: sum((row) => row.bytes),
+    requests: sum((row) => row.requests),
+    warpMs: sum((row) => row.warpMs),
+    features: Object.fromEntries(BUDGET_LAYERS.map((name) => [name, sum((row) => row.features[name])])) as BudgetRow['features'],
+  };
+}
+
+async function budget(): Promise<void> {
+  // A 1280×800 world view: z1 shows the whole world, z2 most of it.
+  const zooms = [1, 2];
+  const table: BudgetRow[] = [];
+  for (const offset of [0, -1]) {
+    const rows = await budgetRun(offset, zooms);
+    table.push(...rows, total(rows));
+  }
+  const header = ['offset', 'zoom', 'tiles', 'upstream kB', 'requests', 'warp ms', ...BUDGET_LAYERS];
+  console.log(`| ${header.join(' | ')} |`);
+  console.log(`|${header.map(() => '---').join('|')}|`);
+  for (const row of table) {
+    const cells = [
+      String(row.offset),
+      row.zoom,
+      String(row.tiles),
+      (row.bytes / 1024).toFixed(0),
+      String(row.requests),
+      row.warpMs.toFixed(0),
+      ...BUDGET_LAYERS.map((name) => String(row.features[name])),
+    ];
+    console.log(`| ${cells.join(' | ')} |`);
+  }
+}
+
+if (process.argv.includes('--budget')) {
+  await budget();
+  console.log('\ndone.');
+  process.exit();
 }
 
 sanityCheckGeometry();

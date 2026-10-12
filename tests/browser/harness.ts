@@ -9,6 +9,8 @@
  * `?geoapi=0` passes `geographicApi: false` (map-space reads while active); `?hash=1` creates the
  * map with `hash: true`. `?geojson=1` adds an inline GeoJSON source `cities` (the fixture's six
  * places) with a blue `circle` layer `cities` (radius 6) on top of the fixture style.
+ * `?persist=0` passes `persistentCache: false`. `?early=1` sets an Equal Earth `projection` right
+ * after creating the map instead of after `load`, so the plain Mercator style never fetches tiles.
  */
 import type { StyleSpecification } from 'maplibre-gl';
 
@@ -33,6 +35,8 @@ const graticule = graticuleParam === null ? undefined : graticuleParam === '1' ?
 const geoApi = params.get('geoapi') !== '0';
 const hash = params.get('hash') === '1';
 const geojson = params.get('geojson') === '1';
+const persist = params.get('persist') !== '0';
+const early = params.get('early') === '1' && (projection === 'equal' || projection === 'equal-earth');
 
 /** The fixture's places (`fixture-tiles.ts`), repeated here so the page does not bundle geojson-vt. */
 const PLACES: [number, number][] = [[8.54, 47.37], [139.69, 35.69], [-122.42, 37.77], [-149.9, 61.22], [103.82, 1.35], [179.5, 0]];
@@ -155,6 +159,7 @@ async function start(): Promise<void> {
       ...(outline ? { outline: true } : {}),
       ...(graticule ? { graticule } : {}),
       ...(geoApi ? {} : { geographicApi: false }),
+      ...(persist ? {} : { persistentCache: false }),
     });
   }
   const map = new maplibregl.Map({
@@ -174,12 +179,13 @@ async function start(): Promise<void> {
     if (mlv === 6) map.addControl(new maplibregl.GlobeControl(), 'top-right');
   }
   if (h.install) h.controller = h.install.controllerFor(map);
+  if (early) map.setProjection({ type: projection });
   map.on('error', (event: { error?: unknown }) => {
     const { error } = event;
     h.errors.push(error instanceof Error ? error.message : String(error));
   });
   await new Promise<void>((resolve) => map.once('load', () => resolve()));
-  if (projection !== 'mercator') map.setProjection({ type: projection });
+  if (projection !== 'mercator' && !early) map.setProjection({ type: projection });
   // The polyfill activates asynchronously: wait until Equal Earth is live before settling.
   const equal = projection === 'equal' || projection === 'equal-earth';
   for (;;) {

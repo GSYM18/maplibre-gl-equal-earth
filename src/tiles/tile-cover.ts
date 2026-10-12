@@ -30,6 +30,14 @@ export interface TileCoverOptions {
    * @defaultValue the output zoom
    */
   sourceZoom?: number;
+  /**
+   * Read source tiles this many zooms from the output zoom: the source zoom is
+   * `clamp(z + sourceZoomOffset, 0, sourceMaxZoom)`. Ignored when `sourceZoom` is set. −1 reads a
+   * quarter of the source tiles, at a quarter of the bytes, for coarser geometry.
+   *
+   * @defaultValue 0
+   */
+  sourceZoomOffset?: number;
   /** Highest zoom the source tileset actually has. OpenFreeMap is 14. @defaultValue 14 */
   sourceMaxZoom?: number;
   /**
@@ -123,7 +131,10 @@ export function sourceTilesFor(output: TileId, options: TileCoverOptions = {}): 
   if (!bbox) return [];
 
   const maxZoom = options.sourceMaxZoom ?? DEFAULT_SOURCE_MAX_ZOOM;
-  const sourceZoom = Math.min(options.sourceZoom ?? output.z, maxZoom);
+  const sourceZoom =
+    options.sourceZoom !== undefined
+      ? Math.min(options.sourceZoom, maxZoom)
+      : clampInt(output.z + (options.sourceZoomOffset ?? 0), 0, maxZoom);
 
   return tilesForBBox(bbox, sourceZoom);
 }

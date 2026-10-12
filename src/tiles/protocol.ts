@@ -19,6 +19,14 @@ import {
   type GeographicLayers,
   type WarpTileOptions,
 } from './mvt.js';
+import {
+  DEFAULT_PERSISTENT_MAX_ZOOM,
+  DEFAULT_PERSISTENT_TTL_DAYS,
+  PersistentTileCache,
+  persistentKey,
+  type CacheStorageLike,
+  type PersistentCacheOptions,
+} from './persistent-cache.js';
 import { sourceTilesFor, type TileId, type TileCoverOptions } from './tile-cover.js';
 
 export const PROTOCOL_SCHEME = 'eqearth';
@@ -35,6 +43,12 @@ const DEFAULT_DECODED_TILES = 32;
 export interface EqualEarthSourceConfig extends TileCoverOptions, WarpTileOptions {
   /** Upstream Mercator tile template, e.g. `https://…/{z}/{x}/{y}.pbf`. */
   url: string;
+  /**
+   * Keep warped output tiles up to `maxZoom` in Cache Storage for `ttlDays` (spec §6); `false`
+   * keeps none. Never applies to blend 1, which passes the upstream bytes through.
+   * @defaultValue `{ maxZoom: 3, ttlDays: 7 }`
+   */
+  persistentCache?: PersistentCacheOptions | false;
 }
 
 /** Build the `tiles` entry for a rewritten source. */
@@ -43,6 +57,10 @@ export function encodeSourceUrl(config: EqualEarthSourceConfig): string {
   const blend: unknown = config.blend;
   if (blend !== undefined && !(typeof blend === 'number' && blend >= 0 && blend <= 1)) {
     throw new TypeError(`Equal Earth: blend ${JSON.stringify(blend)} is not a number in [0, 1].`);
+  }
+  const offset: unknown = config.sourceZoomOffset;
+  if (offset !== undefined && !Number.isInteger(offset)) {
+    throw new TypeError(`Equal Earth: sourceZoomOffset ${typeof offset === 'number' ? String(offset) : JSON.stringify(offset)} is not an integer.`);
   }
   return `${PROTOCOL_SCHEME}://${encodeConfig(config)}/{z}/{x}/{y}`;
 }
@@ -102,6 +120,13 @@ export interface ProtocolOptions {
   decodedTiles?: number;
   /** Injectable for testing. @defaultValue global `fetch` */
   fetchImpl?: typeof fetch;
+  /**
+   * Where the persistent output-tile cache lives. An explicit `undefined` disables it.
+   * @defaultValue `globalThis.caches`, when the context has it
+   */
+  cacheStorage?: CacheStorageLike | undefined;
+  /** Names the persistent cache (`equal-earth-<version>`). @defaultValue this package's version */
+  version?: string;
 }
 
 /**
@@ -120,6 +145,8 @@ export function createEqualEarthProtocol(options: ProtocolOptions = {}): Protoco
   const decoded = new EntryCache<GeographicLayers>(options.decodedTiles ?? DEFAULT_DECODED_TILES);
   const coalescer = new RequestCoalescer<ArrayBuffer | null>();
   const doFetch = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+  const storage = 'cacheStorage' in options ? options.cacheStorage : contextCacheStorage();
+  const persistent = storage ? new PersistentTileCache(storage, options.version ?? __EQE_VERSION__) : undefined;
 
   async function loadSource(
     template: string,
@@ -188,16 +215,44 @@ export function createEqualEarthProtocol(options: ProtocolOptions = {}): Protoco
     const sources = sourceTilesFor(tile, config);
     if (sources.length === 0) return { data: new ArrayBuffer(0) };
 
+    // Spec §6: low-zoom output tiles are kept across page loads. The Mercator pass-through above
+    // is not: its bytes are the upstream's, which the browser's own HTTP cache already keeps.
+    const keep = config.persistentCache === false ? undefined : (config.persistentCache ?? {});
+    const key =
+      persistent && keep && tile.z <= (keep.maxZoom ?? DEFAULT_PERSISTENT_MAX_ZOOM)
+        ? persistentKey(config, tile)
+        : undefined;
+    if (persistent && key !== undefined) {
+      const stored = await persistent.get(key);
+      abortController.signal.throwIfAborted();
+      if (stored !== undefined) return { data: stored };
+    }
+
+    const data = await build(config, tile, sources, abortController.signal);
+    if (persistent && key !== undefined) {
+      // A copy: MapLibre transfers the result, which detaches it before the store reads it.
+      void persistent.put(key, data.slice(0), keep?.ttlDays ?? DEFAULT_PERSISTENT_TTL_DAYS);
+    }
+    return { data };
+  };
+
+  /** Fetch, decode, warp and encode an output tile from its covering source tiles. */
+  async function build(
+    config: EqualEarthSourceConfig,
+    tile: TileId,
+    sources: readonly TileId[],
+    signal: AbortSignal,
+  ): Promise<ArrayBuffer> {
     const fetched = await Promise.all(
       sources.map(async (source) => ({
         tile: source,
-        data: await loadSource(config.url, source, abortController.signal),
+        data: await loadSource(config.url, source, signal),
       })),
     );
 
     // Sources fetched for other tiles can resolve after this one was abandoned; skip the
     // decode and warp rather than compute a result nobody will read.
-    abortController.signal.throwIfAborted();
+    signal.throwIfAborted();
     const layers: GeographicLayers[] = [];
     for (const source of fetched) {
       if (!source.data || source.data.byteLength === 0) continue;
@@ -205,11 +260,19 @@ export function createEqualEarthProtocol(options: ProtocolOptions = {}): Protoco
         decodeSource(expandTemplate(config.url, source.tile), source.data, source.tile, config.layers),
       );
     }
-    if (layers.length === 0) return { data: new ArrayBuffer(0) };
-    const warped = buildTile(mergeLayers(layers), tile, config);
     // MapLibre treats a zero-length ArrayBuffer as a legitimately empty tile.
-    return { data: toArrayBuffer(warped) };
-  };
+    if (layers.length === 0) return new ArrayBuffer(0);
+    return toArrayBuffer(buildTile(mergeLayers(layers), tile, config));
+  }
+}
+
+/** The context's Cache Storage, if it has one: only secure contexts do, and reading it can throw. */
+function contextCacheStorage(): CacheStorageLike | undefined {
+  try {
+    return (globalThis as { caches?: CacheStorageLike }).caches;
+  } catch {
+    return undefined;
+  }
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {

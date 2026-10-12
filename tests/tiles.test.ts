@@ -134,6 +134,25 @@ describe('tile cover', () => {
     for (const tile of tiles) expect(tile.z).toBe(3);
   });
 
+  it('reads source tiles a relative number of zooms away with sourceZoomOffset', () => {
+    const tiles = sourceTilesFor({ z: 3, x: 4, y: 3 }, { sourceZoomOffset: -1 });
+    expect(tiles.length).toBeGreaterThan(0);
+    for (const tile of tiles) expect(tile.z).toBe(2);
+  });
+
+  it('lets an explicit sourceZoom win over sourceZoomOffset', () => {
+    const tiles = sourceTilesFor({ z: 3, x: 4, y: 3 }, { sourceZoom: 5, sourceZoomOffset: -1 });
+    expect(tiles.length).toBeGreaterThan(0);
+    for (const tile of tiles) expect(tile.z).toBe(5);
+  });
+
+  it('clamps an offset source zoom at 0 and at sourceMaxZoom', () => {
+    expect(sourceTilesFor({ z: 1, x: 0, y: 1 }, { sourceZoomOffset: -3 })).toEqual([{ z: 0, x: 0, y: 0 }]);
+    const deep = sourceTilesFor({ z: 13, x: 4096, y: 4096 }, { sourceZoomOffset: 3, sourceMaxZoom: 14 });
+    expect(deep.length).toBeGreaterThan(0);
+    for (const tile of deep) expect(tile.z).toBe(14);
+  });
+
   it('keeps tile indices in range', () => {
     for (const tile of sourceTilesFor({ z: 2, x: 0, y: 1 })) {
       expect(tile.x).toBeGreaterThanOrEqual(0);

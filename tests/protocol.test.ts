@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { VectorTile } from '@mapbox/vector-tile';
 import { PbfReader } from 'pbf';
 import { fromGeojsonVt } from 'vt-pbf';
@@ -5,14 +6,17 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { EntryCache, RequestCoalescer, TileCache } from '../src/tiles/cache.js';
 import * as mvt from '../src/tiles/mvt.js';
-import { sourceTilesFor } from '../src/tiles/tile-cover.js';
+import { persistentKey } from '../src/tiles/persistent-cache.js';
+import { sourceTilesFor, type TileId } from '../src/tiles/tile-cover.js';
 import {
   createEqualEarthProtocol,
   encodeSourceUrl,
   expandTemplate,
   parseTileUrl,
   PROTOCOL_SCHEME,
+  type EqualEarthSourceConfig,
 } from '../src/tiles/protocol.js';
+import { FakeCacheStorage } from './support/fake-cache-storage.js';
 
 const UPSTREAM = 'https://tiles.openfreemap.org/planet/latest/{z}/{x}/{y}.pbf';
 
@@ -68,6 +72,13 @@ describe('tile URL codec', () => {
     for (const blend of [-0.1, 1.5, NaN, Infinity]) {
       expect(() => encodeSourceUrl({ url: UPSTREAM, blend })).toThrow(TypeError);
     }
+  });
+
+  it('rejects a sourceZoomOffset that is not an integer when encoding', () => {
+    for (const sourceZoomOffset of [-0.5, NaN, Infinity]) {
+      expect(() => encodeSourceUrl({ url: UPSTREAM, sourceZoomOffset })).toThrow(TypeError);
+    }
+    expect(() => encodeSourceUrl({ url: UPSTREAM, sourceZoomOffset: -1 })).not.toThrow();
   });
 
   it('expands templates', () => {
@@ -420,6 +431,103 @@ describe('protocol handler', () => {
     expect(layersOf(all.data)).toEqual(['a', 'b']);
     expect(layersOf(filtered.data)).toEqual(['a']);
     expect(fetchImpl).toHaveBeenCalledOnce();
+  });
+
+  describe('persistent output-tile cache', () => {
+    const at = (config: EqualEarthSourceConfig, { z, x, y }: TileId) =>
+      encodeSourceUrl(config).replace('{z}', String(z)).replace('{x}', String(x)).replace('{y}', String(y));
+    const upstream = () => vi.fn(async () => new Response(sourceTileBytes().slice()));
+    const Z2: TileId = { z: 2, x: 1, y: 1 };
+    const Z4: TileId = { z: 4, x: 8, y: 7 };
+    const PKG = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string };
+    /** Lets the handler's fire-and-forget `put` settle. */
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+    it('serves a z2 tile to a new handler from Cache Storage, without fetching upstream', async () => {
+      const storage = new FakeCacheStorage();
+      const config = { url: UPSTREAM, blend: 0 };
+      const first = upstream();
+      const cold = createEqualEarthProtocol({ fetchImpl: first as unknown as typeof fetch, cacheStorage: storage, version: 't' });
+      const built = await cold({ url: at(config, Z2) }, new AbortController());
+      expect(first).toHaveBeenCalled();
+      expect(built.data.byteLength).toBeGreaterThan(0);
+      await vi.waitFor(() => expect(storage.caches.get('equal-earth-t')?.entries.has(persistentKey(config, Z2))).toBe(true));
+
+      const second = upstream();
+      const warm = createEqualEarthProtocol({ fetchImpl: second as unknown as typeof fetch, cacheStorage: storage, version: 't' });
+      const served = await warm({ url: at(config, Z2) }, new AbortController());
+      expect(second).not.toHaveBeenCalled();
+      expect(new Uint8Array(served.data)).toEqual(new Uint8Array(built.data));
+    });
+
+    it('never stores a tile above maxZoom, 3 by default', async () => {
+      const storage = new FakeCacheStorage();
+      const handler = createEqualEarthProtocol({ fetchImpl: upstream() as unknown as typeof fetch, cacheStorage: storage, version: 't' });
+      await handler({ url: at({ url: UPSTREAM, blend: 0 }, Z4) }, new AbortController());
+      await settle();
+      expect(storage.caches.get('equal-earth-t')?.entries.size ?? 0).toBe(0);
+
+      const raised = { url: UPSTREAM, blend: 0, persistentCache: { maxZoom: 4 } };
+      await handler({ url: at(raised, Z4) }, new AbortController());
+      await vi.waitFor(() => expect(storage.caches.get('equal-earth-t')?.entries.has(persistentKey(raised, Z4))).toBe(true));
+    });
+
+    it('bypasses Cache Storage with persistentCache: false', async () => {
+      const storage = new FakeCacheStorage();
+      const handler = createEqualEarthProtocol({ fetchImpl: upstream() as unknown as typeof fetch, cacheStorage: storage, version: 't' });
+      await handler({ url: at({ url: UPSTREAM, blend: 0, persistentCache: false }, Z2) }, new AbortController());
+      await settle();
+      expect(storage.names()).toEqual([]);
+    });
+
+    it('does not store the Mercator pass-through (blend 1)', async () => {
+      const storage = new FakeCacheStorage();
+      const handler = createEqualEarthProtocol({ fetchImpl: upstream() as unknown as typeof fetch, cacheStorage: storage, version: 't' });
+      await handler({ url: at({ url: UPSTREAM, blend: 1 }, Z2) }, new AbortController());
+      await settle();
+      expect(storage.names()).toEqual([]);
+    });
+
+    it('serves the tile when Cache Storage throws on put', async () => {
+      const failing = {
+        match: () => Promise.resolve(undefined),
+        put: () => Promise.reject(new Error('QuotaExceededError')),
+        delete: () => Promise.resolve(false),
+      };
+      const storage = { open: () => Promise.resolve(failing), keys: () => Promise.resolve([]), delete: () => Promise.resolve(false) };
+      const warn = vi.spyOn(console, 'warn');
+      const error = vi.spyOn(console, 'error');
+      try {
+        const handler = createEqualEarthProtocol({ fetchImpl: upstream() as unknown as typeof fetch, cacheStorage: storage, version: 't' });
+        const result = await handler({ url: at({ url: UPSTREAM, blend: 0 }, Z2) }, new AbortController());
+        await settle();
+        expect(result.data.byteLength).toBeGreaterThan(0);
+        expect(warn).not.toHaveBeenCalled();
+        expect(error).not.toHaveBeenCalled();
+      } finally {
+        warn.mockRestore();
+        error.mockRestore();
+      }
+    });
+
+    it('names the cache after the package version by default', async () => {
+      const storage = new FakeCacheStorage();
+      const handler = createEqualEarthProtocol({ fetchImpl: upstream() as unknown as typeof fetch, cacheStorage: storage });
+      await handler({ url: at({ url: UPSTREAM, blend: 0 }, Z2) }, new AbortController());
+      await vi.waitFor(() => expect(storage.names()).toEqual([`equal-earth-${PKG.version}`]));
+    });
+
+    it('stores a copy, so transferring the result leaves the stored tile intact', async () => {
+      const storage = new FakeCacheStorage();
+      const config = { url: UPSTREAM, blend: 0 };
+      const handler = createEqualEarthProtocol({ fetchImpl: upstream() as unknown as typeof fetch, cacheStorage: storage, version: 't' });
+      const result = await handler({ url: at(config, Z2) }, new AbortController());
+      const length = result.data.byteLength;
+      structuredClone(result.data, { transfer: [result.data] });
+      await vi.waitFor(() => expect(storage.caches.get('equal-earth-t')?.entries.has(persistentKey(config, Z2))).toBe(true));
+      const stored = await storage.caches.get('equal-earth-t')!.match(persistentKey(config, Z2));
+      expect((await stored!.arrayBuffer()).byteLength).toBe(length);
+    });
   });
 
   describe('aborts', () => {

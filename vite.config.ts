@@ -1,8 +1,10 @@
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import MagicString from 'magic-string';
 import { defineConfig, type Plugin } from 'vite';
 
 const resolveFromRoot = (path: string) => fileURLToPath(new URL(path, import.meta.url));
+const { version } = JSON.parse(readFileSync(resolveFromRoot('package.json'), 'utf8')) as { version: string };
 
 /**
  * `src/install.ts` marks its worker URLs `new URL(/* @vite-ignore *\/ './worker.mjs',
@@ -29,6 +31,8 @@ function stripWorkerUrlHint(): Plugin {
 
 export default defineConfig({
   plugins: [stripWorkerUrlHint()],
+  // Names the persistent tile cache (src/types/vendor.d.ts); also serves `npm run dev`.
+  define: { __EQE_VERSION__: JSON.stringify(version) },
   optimizeDeps: {
     // maplibre-gl v6 locates its worker as a sibling file via `import.meta.url`. Pre-bundling
     // moves the main module into node_modules/.vite/deps/, where that sibling does not exist,
