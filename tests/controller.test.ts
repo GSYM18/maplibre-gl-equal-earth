@@ -1477,7 +1477,7 @@ describe('live style edits (Task 9)', () => {
     expect(controller.toGeographic([host.center.lng, host.center.lat])[1]).toBeCloseTo(TOKYO[1], 9);
   });
 
-  describe('review fixes (R15–R21)', () => {
+  describe('review fixes (R15–R22)', () => {
     const MINE = { id: 'mine', type: 'circle', source: 'minesrc' };
     const MINE_SOURCE = { type: 'geojson', data: { type: 'FeatureCollection', features: [{ type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: TOKYO } }] } };
     /** The common "replace my layer" `style.load` listener; counts its calls (capped, so a loop ends). */
@@ -1837,6 +1837,116 @@ describe('live style edits (Task 9)', () => {
       await controller.deactivate();
       expect(host.errors).toEqual([]);
       expect(host.styleErrors).toEqual([]);
+    });
+
+    it("deactivating an activation that waits for the application's setStyle(url) leaves that fetch alone (R22)", async () => {
+      const { host, controller } = setup();
+      host.on('error', () => undefined);
+      let loads = 0;
+      host.on('style.load', () => loads++);
+      host.setStyle(BASEMAP_URL);
+      const request = host._diffStyleRequest!;
+      const pending = controller.activate('equal');
+      pending.catch(() => undefined);
+      await tick();
+      await tick();
+      const styles = host.setStyleCalls.length;
+      await controller.deactivate();
+      await expect(pending).rejects.toMatchObject({ name: 'EqualEarthSupersededError' });
+      expect(request.signal.aborted).toBe(false);
+      expect(host.setStyleCalls).toHaveLength(styles); // neither a restore nor a second fetch
+      expect(controller.active).toBe(false);
+      expect(host._camera.transformCameraUpdate).toBeNull();
+      expect(host.constrain).toBeNull();
+      host.resolveStyleRequest(basemap());
+      await tick();
+      expect(ids(host.style!)).toEqual(ids(basemap()));
+      expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeUndefined();
+      expect(loads).toBe(1);
+      expect(controller.active).toBe(false);
+      expect(host._camera.transformCameraUpdate).toBeNull();
+      expect(host.errors).toEqual([]);
+    });
+
+    it("deactivating such an activation after a newer application setStyle(url) asks for no style again (R22)", async () => {
+      const { host, controller } = setup();
+      host.on('error', () => undefined);
+      host.setStyle(BASEMAP_URL);
+      const pending = controller.activate('equal');
+      pending.catch(() => undefined);
+      await tick();
+      host.setStyle('https://styles.example/other.json');
+      const newer = host._diffStyleRequest!;
+      await tick();
+      const styles = host.setStyleCalls.length;
+      await controller.deactivate();
+      expect(newer.signal.aborted).toBe(false);
+      expect(host._diffStyleRequest).toBe(newer);
+      expect(host.setStyleCalls).toHaveLength(styles);
+    });
+
+    it("a setStyle(url) the application made while inactive and then replaced is not asked for again (R22)", async () => {
+      const { host, controller } = setup();
+      host.on('error', () => undefined);
+      host.setStyle(BASEMAP_URL);
+      host.setStyle(liberty(), {}); // replaces it: the fetch is aborted
+      await controller.activate('equal');
+      await controller.deactivate();
+      expect(host._diffStyleRequest).toBeNull();
+      expect(host.setStyleCalls.at(-1)!.layers).toBeGreaterThan(0); // the restore, not the old URL
+    });
+
+    it("a restore that must set a style asks again for a setStyle(url) the application made before activating (R22)", async () => {
+      const { host, controller } = setup();
+      host.on('error', () => undefined);
+      host.setStyle(BASEMAP_URL);
+      const pending = controller.activate('equal');
+      pending.catch(() => undefined);
+      await tick();
+      await tick();
+      // Stands in for anything on the live style the restore must undo (the application's
+      // `setLayerZoomRange`, which is not followed): the restore sets a style, aborting the fetch.
+      host.style!.layers.find((l) => l.id === 'water')!.minzoom = 3;
+      await controller.deactivate();
+      const again = host._diffStyleRequest;
+      expect(again).not.toBeNull();
+      expect(again!.signal.aborted).toBe(false);
+      expect(host.setStyleCalls.at(-1)).toEqual({ layers: -1, diff: undefined });
+      host.resolveStyleRequest(basemap());
+      expect(ids(host.style!)).toEqual(ids(basemap()));
+    });
+
+    it("deactivating after the application's style arrived, before its re-apply, still takes the bands' zoom ranges away (R22)", async () => {
+      const { host, controller, fetchJson } = setup();
+      host.on('error', () => undefined);
+      await controller.activate('equal');
+      const other = basemap();
+      other.sources['openmaptiles']!['url'] = 'https://tiles.example/other';
+      fetchJson.mockImplementation(() => new Promise<never>(() => undefined)); // the new TileJSON never arrives
+      host.setStyle(BASEMAP_URL);
+      host.resolveStyleRequest(other); // diffed over our rewrite; the re-apply now waits for its TileJSON
+      await tick();
+      expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeUndefined();
+      expect(other.layers.some((l) => l.minzoom === undefined && layerOf(host, l.id)!.minzoom !== undefined)).toBe(true);
+      await controller.deactivate();
+      for (const layer of other.layers) expect(layerOf(host, layer.id)!.minzoom ?? 0, layer.id).toBe(layer.minzoom ?? 0);
+    });
+
+    it('an application setStyle nested inside the deactivation restore delivers its style.load (R22)', async () => {
+      const { host, controller } = setup();
+      await controller.activate('equal');
+      let loads = 0;
+      host.on('style.load', () => loads++);
+      const replacement = basemap();
+      // Stands in for a synchronous event inside the restore's diff (`removeSource` fires `data`).
+      host.beforeSetStyle = (style) => {
+        if (style === replacement) return;
+        host.beforeSetStyle = undefined;
+        host.setStyle(replacement, {});
+      };
+      await controller.deactivate();
+      expect(host.beforeSetStyle).toBeUndefined();
+      expect(loads).toBe(1);
     });
   });
 

@@ -85,7 +85,8 @@
  *   and a re-apply (or activation) wait, polling, and the wrappers go on following the original
  *   (the live style is still ours). Its style arrives and is captured, which supersedes them and,
  *   as natively, drops what was edited on the old style; or the fetch fails or changes nothing, and
- *   they go ahead with the edits. A deactivation restores at once and asks for the URL again.
+ *   they go ahead with the edits. A deactivation restores at once and asks for the URL again, or,
+ *   when the live style is not ours (an activation still waiting for the fetch), leaves it alone (R22).
  * - Edits made while an activation fetches its TileJSON are taken before it commits; edits made
  *   while a re-apply is in flight reach the original it rewrites, and an amend follows the apply
  *   once it has finished (R17).
@@ -1186,10 +1187,16 @@ export class EqualEarthController {
    * Put the original back (deactivation, abandon). Our `setStyle` aborts an application
    * `setStyle(url)` still fetching (R20), so ask for that style again: MapLibre then diffs it into
    * the original, as it would have without us, and fires its `style.load`.
+   *
+   * A loaded live style that is not ours (an activation still waiting for such a fetch, or the
+   * application's style not yet re-applied) is left alone (R22), unless it carries zoom bounds
+   * our rewrite left behind when the application's style was diffed over it: setting the original
+   * would only abort that fetch and drop edits made to the live style meanwhile.
    */
   #restoreOriginal(original: StyleLike, live: StyleLike | undefined): void {
     const asked = this.#appRequest;
     const request = this.#diffStyleRequest();
+    if (live && !hasOurMetadata(live) && restorableStyle(original, live) === original) return;
     takeLiveRoot(original, live);
     this.#setStyle(restorableStyle(original, live));
     if (asked && request && asked.request === request) this.#rawStyle.setStyle(asked.url, ...asked.rest);
@@ -1378,12 +1385,17 @@ export class EqualEarthController {
     return this.#rawStyle.getLayer(sentinel) !== undefined;
   }
 
-  /** The application's `setStyle`: bookkeeping until the style it asked for has arrived (R16, R20). */
+  /**
+   * The application's `setStyle`: bookkeeping until the style it asked for has arrived (R16, R20).
+   * A URL is recorded while inactive too (R22): a restore that aborts it asks for it again.
+   */
   #appSetStyle(style: unknown, rest: unknown[]): unknown {
-    if (!this.active) return this.#rawStyle.setStyle(style, ...rest);
-    this.#appStyleCalls++;
-    this.#appStyle = 'call';
-    // Its `style.load` is the application's, even when it sets a style inside one of ours (R21).
+    if (this.active) {
+      this.#appStyleCalls++;
+      this.#appStyle = 'call';
+    }
+    // Its `style.load` is the application's, even when it sets a style inside one of ours (R21),
+    // the deactivation's restore included (R22).
     const own = this.#ownLoads;
     this.#ownLoads = undefined;
     try {
