@@ -10,8 +10,9 @@ npm run verify     # lint + typecheck + test + build + check:exports + test:brow
 npm run dev        # Vite dev server for the demo pages
 npm run build:js   # bundles only, no .d.ts: refreshes dist/worker.mjs, which the demos load
 npm run probe:transition  # headless-Chrome probe of demo/transition.html; not part of verify
+npm run probe:first-paint # the same page's cold/warm first paint at 50 Mbit/s; not part of verify
 npm test           # vitest run
-npm run test:browser  # Playwright on MapLibre 6.6 and 5.24, SwiftShader; ~1–3 min; needs a fresh build
+npm run test:browser  # Playwright on MapLibre 6.6 and 5.24, SwiftShader; ~6.5 min; needs a fresh build
 npm run test:watch # vitest watch mode
 npm run lint       # eslint (type-aware, .ts only)
 npm run typecheck  # tsc --noEmit over src, tests, demo
@@ -52,6 +53,19 @@ for timing. Its empty-cell count is a rough hole detector (opacity-blind; see th
 **Do not edit anything under `src/` or `demo/` while it runs**: Vite reloads the page and the
 probe dies mid-run.
 
+`npm run probe:first-paint` is the same script with `--first-paint` (plus `--style URL`,
+`--zoom-offset=-1`; a value starting with `-` needs the `=`). It loads the demo's world view at
+1280×800 under CDP throttling (50 Mbit/s, 20 ms) three ways in one fresh profile: cold (HTTP
+cache off, Cache Storage cleared), warm (reload), and cold with only the page's code cached.
+It prints `firstPaintMs` against the spec's budgets, the place labels placed and the bytes by
+kind, and exits 0 unless the page errors (2). Read its plain cold number with care: under
+`vite dev`, with the cache off, each worker fetches MapLibre's unminified worker modules
+(~23 MB), which dominates; "cold, code cached" is the one that says something about the
+plugin (spec §6 has the measurement). Worker targets reject `emulateNetworkConditions`; the
+page's throttling governs their fetches, and they are auto-attached only for the cache setting
+and the byte count. A dev server started before `__EQE_VERSION__` was defined breaks the
+main-thread fallback with a `ReferenceError`; restart it, or pass `--url` to your own.
+
 ESLint's type-aware rules are confined to `**/*.ts`. `no-undef` is off there (tsc covers it),
 which is why `scripts/*.mjs` needs an explicit `globals.node` block.
 
@@ -83,10 +97,18 @@ real lng/lat → Equal Earth metres → × GRID_FACTOR → inverse Mercator → 
 The technique is Development Seed's dirty-reprojectors (2016). Three consequences that drive
 most design decisions here:
 
-1. **"Map space" is not geographic.** While Equal Earth is active, `map.getCenter()`,
-   `map.project()`, `getBounds()`, popup anchors and `queryRenderedFeatures()` all return map
-   space, and under `equal` that space is the *shown band's*. Anything crossing that boundary
-   must go through the controller's `toMapSpace` / `toGeographic`; the bare `geographicToMap` /
+1. **"Map space" is not geographic, and it is kept internal.** The renderer, the camera's
+   requested and rendered states, the tiles and every style coordinate are map space, and under
+   `equal` it is the *shown band's*. The application does not see it: while active, the map
+   instance's coordinate methods are wrapped ("data in, geo out", spec §7, `geo-api.ts`), so
+   `getCenter`, `project`, `unproject`, `getBounds`, the camera targets, Marker, Popup and event
+   `lngLat` speak geographic coordinates. Two things still hand the application map space:
+   `queryRenderedFeatures` geometry and `getStyle()` contents (plus `getMaxBounds`,
+   `calculateCameraOptionsFrom*` and deck.gl, documented). Inside the plugin the rule is the
+   reverse: the controller, camera and switcher call the **raw** methods captured before
+   wrapping, because a map-space value that reached a wrapper would be converted twice. Which
+   band a conversion uses matters: reads the shown band, targets the camera's baseline band
+   after a stop, `fitBounds` solves across bands. The bare `geographicToMap` /
    `mapToGeographic` default to blend 0 and are right only for pure `equal-earth`.
 2. **Equal Earth and globe are mutually exclusive.** Globe treats lng/lat as real geodetic
    coordinates, so warped input renders as a distorted sphere. The plugin disengages under globe.
@@ -131,8 +153,35 @@ affects the absolute metre values from `toEqualEarth`.
   judged at the last *rendered* zoom, because `isSourceLoaded` is vacuously true for a source
   no layer used.
 - `src/map/controller.ts` — one map's lifecycle: rewrite, install switcher + camera +
-  constraint, follow the app's `setStyle`, restore. Its module doc records MapLibre's style
-  event ordering, which decides when it may tear down and re-install (C7).
+  constraint, follow the app's `setStyle`, restore; fan the app's style edits and GeoJSON
+  updates out to the band copies. Its module doc records MapLibre's style event ordering, which
+  decides when it may tear down and re-install (C7), and the live-edit rules: the live style,
+  told by a sentinel layer only the rewrite has, decides whether an edit follows the original;
+  the plugin's own `setStyle` is silent, as a native `setProjection` is; an application
+  `setStyle(url)` in flight is never aborted. At ~2200 lines, the live-edit machinery is the
+  part to extract if it grows.
+- `src/map/cartography.ts` — pure: the world polygon, its outline and the graticule at a blend
+  (spec §5); `style-rewrite.ts` turns them into generated `equal-earth:*` sources and layers.
+  The base layers (background copies, world polygon) are held through a band switch rather than
+  cross-faded: two half-transparent bases would let the container show through mid-fade.
+- `src/map/control.ts` — `EqualEarthControl`. It talks only to the polyfilled
+  `getProjection`/`setProjection` and listens for the `projectiontransition` that `install.ts`
+  fires (MapLibre fires none for the mercator→mercator `setProjection` that leaving Equal Earth
+  is underneath), so it also works beside MapLibre's `GlobeControl`.
+- `src/map/instance-wrap.ts` — `wrapMethod`: an own property on one map shadowing the prototype
+  method, restored only while still ours. Per instance, so other maps are untouched; MapLibre
+  captures no method references (audit §0.2), so its internal calls reach the wrapper too.
+- `src/map/geo-api.ts` — the geographic API (spec §7, audit
+  `docs/superpowers/audits/2026-10-11-geo-api-audit.md`). Whether a value needs converting is
+  decided per **value**, never per caller: MapLibre's handlers hand the camera methods its own
+  map-space centre (by identity) or values marked with `markMapSpace`, while application
+  listeners running inside camera calls still pass geographic ones. `fitBounds` and
+  `cameraForBounds` are reimplemented across bands and correct for the camera's compensation
+  (R11). `project` wraps every longitude onto the single world (R8): with world copies off
+  there is nothing else to draw a marker on.
+- `src/map/geojson.ts` — GeoJSON warped whole on the main thread, once per band, densified for
+  the band's highest parse zoom (capped at 12): densifying for the deepest zoom MapLibre could
+  request would multiply vertices for zooms a band is never shown at.
 - `src/install.ts` — `installEqualEarth`: version gate, worker count, worker bundle loading
   with the main-thread fallback (also on a `workerTimeoutMs` timeout), and the
   `setProjection`/`getProjection` polyfill. A second install on the same `Map.prototype`
@@ -148,17 +197,48 @@ affects the absolute metre values from `toEqualEarth`.
   self-contained: v5 cannot parse `import`, and v6 imports non-`.mjs` scripts via a `blob:` URL
   where relative specifiers cannot resolve.
 - `src/tiles/cache.ts` — byte-bounded LRU (raw tiles), count-bounded `EntryCache` (decoded
-  tiles), in-flight request coalescing.
+  tiles), in-flight request coalescing. All per worker, so their memory scales with the pool.
+- `src/tiles/persistent-cache.ts` — warped low-zoom output tiles in Cache Storage, in the
+  worker. Never rejects and never logs: a missing or throwing Cache API is a miss. The cache
+  name carries the build id (`__EQE_VERSION__`), so a change that could alter a tile starts a
+  fresh cache instead of serving stale tiles for a week; the key hashes the source config, API
+  key included, so a rotated key is a new namespace. One background sweep per worker drops
+  expired entries and caps the cache at 2000.
+- `scripts/build-id.ts` — `__EQE_VERSION__` = `<version>+<hash>`: SHA-256 over the worker
+  bundle's relative-import graph from `worker-entry.ts` (CRLF normalised) plus the bundled
+  runtime dependencies' versions. Only the worker graph, so controller or camera edits keep the
+  cache. All four Vite/Vitest configs import it.
 - `vite.worker.config.ts` — builds the two worker bundles (see `worker-entry.ts`).
 - `demo/` + root `index.html` — Vite demo pages, not part of the published package.
-- `demo/transition.html` + `.ts` — the adaptive transition on OpenFreeMap Liberty, public API
-  only. It passes `workerUrl: /dist/worker.mjs?v=<now>`: under `vite dev` the library's own
+- `demo/transition.html` + `.ts` — the adaptive transition on any EPSG:3857 vector style
+  (`?style=`, default OpenFreeMap Liberty; a SmartMaps URL with its `?key=` works the same way,
+  and none may be committed), public API only. Its parameters are listed in its header and the
+  README. It starts on the fitted world view and calls `setProjection` right after `new Map`,
+  as an application wanting a fast first paint would, and detects "Equal Earth live" from the
+  controller at `idle`, not from `style.load`, which the plugin's own `setStyle` does not fire.
+  The marks `eqe:start`, `eqe:installed`, `eqe:active`, `eqe:first-idle` and
+  `__eqe.firstPaintMs` feed the first-paint probe. It passes
+  `workerUrl: /dist/worker.mjs?v=<now>`: under `vite dev` the library's own
   `new URL('./worker.mjs', import.meta.url)` resolves into `/src/`, where no worker exists, so
   it would silently warp on the main thread; and without the query Vite keeps serving its
-  cached transform of an older `dist/worker.mjs`. Exposes `window.__eqe` for the probe.
+  cached transform of an older `dist/worker.mjs` (the price: the worker bundle is never
+  HTTP-cached, ~0.4 MB per warm load). Exposes `window.__eqe` for the probes.
 - `scripts/check-exports.mjs` — build-artifact drift guard.
 - `scripts/check-worker-bundles.mjs` — the two worker bundles load and register `eqearth`.
-- `scripts/probe-transition.mjs` — the headless probe of the transition demo (see Commands).
+- `scripts/probe-transition.mjs` — the headless probes of the transition demo: the wheel
+  transition and `--first-paint` (see Commands).
+- `tests/browser/` — the Playwright matrix (see Commands). `harness.ts` is one map on the
+  fixture tiles, exposed as `window.__h` and configured by query parameters: `mlv=5|6`,
+  `plugin=0`, `dpr=`, `projection=mercator|globe|equal|equal-earth` (set after `load`),
+  `compensation=`, `outside=` (colour), `container=` (the container's CSS background, which a
+  transparent outside shows), `outline=1`, `graticule=<step>|1`, `control=1` (plus MapLibre's
+  `GlobeControl` on v6), `geoapi=0`, `hash=1`, `geojson=1` (an inline `cities` source and
+  circle layer), `persist=0` and `early=1` (`setProjection` right after `new Map`, so the
+  Mercator style never fetches tiles: what makes "no requests after a reload" testable).
+  `helpers.ts` types `__h`, opens the harness with these as options and holds the only
+  geographic conversions specs may use. `fixture-tiles.ts` generates the tiles and counts the
+  requests it answers (`/fixture-tiles/__count`, `__reset`). The v5 globe pixel-identity case
+  in `baseline.spec.ts` flakes now and then despite its three-pair retry; rerun it once.
 - `scripts/probe-openfreemap.ts` — runs the real pipeline against live OpenFreeMap tiles.
   `npx vite-node scripts/probe-openfreemap.ts`. Needs network; not part of `npm run verify`.
 
@@ -321,21 +401,21 @@ edge are snapped to ±90° in `decodeToGeographic`.
 
 ## Planned work
 
-Plan 1 (worker bundles, blended warp, `BandCamera`, constraint, spike) and Plan 2 (smooth
-transition: bands, compensation, style rewrite, gated switcher, controller,
-`installEqualEarth`, throughput, demo + probe;
-`docs/superpowers/plans/2026-10-11-plan-2-smooth-transition.md`) are done. Plan 3 is next and
-not yet written: the cartographic finish (spec §5), `EqualEarthControl` (MapLibre's
-`GlobeControl` reads `equal` as "not Mercator" and turns it off), a geographic API over the
-map-space one with GeoJSON fan-out (§7), a persistent tile cache, a browser test matrix on
-v5.24 and v6, and a SmartMaps demo.
+Plans 1–3 are done (`docs/superpowers/plans/`): the foundation, the smooth transition, and
+the cartography, control, geographic API, GeoJSON, live edits, persistent cache and browser
+matrix. The plugin is complete against its spec; what remains are two product decisions for
+the user, not plan items:
 
-The stepped transition has a ceiling: after compensation, shear still snaps at each step
-(300 px off-centre, six steps: Zürich ≈ 7 px, San Francisco ≈ 16 px), shrinking only as
-1/steps. Only per-vertex interpolation in the renderer removes it. Whether that is good enough
-is an open product decision for the user, not a plan item; do not try to tune it away.
+- **The stepped transition's ceiling.** After compensation, shear still snaps at each step
+  (300 px off-centre, six steps: Zürich ≈ 7 px, San Francisco ≈ 16 px), shrinking only as
+  1/steps. Only per-vertex interpolation in the renderer removes it. Do not try to tune it away.
+- **The first-paint budget.** Spec §6 records the measurement: the default `sourceZoomOffset`
+  stays 0 because −1 places 59 % fewer labels at the world view; the cold budget is met only
+  with the page's code cached, and warm misses on SwiftShader. Measuring a production build on
+  real hardware is the next step if the budget matters.
 
-Upstream is moving on this:
+Next is native support:
 [maplibre-gl-js#8330](https://github.com/maplibre/maplibre-gl-js/issues/8330) tracks a native
-adaptive Equal Earth. The plugin is intentionally shaped as a polyfill so it can be deleted
-when that lands.
+adaptive Equal Earth. The plugin is shaped as a polyfill so that a
+`native: 'auto'` install option (spec §8) can hand over to it once #8330 defines a detectable
+signal, and the plugin can then be deleted.

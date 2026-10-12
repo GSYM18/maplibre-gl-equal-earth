@@ -8,10 +8,13 @@ equal-area pseudocylindrical projection — countries appear at their true relat
 Web Mercator, while still looking like a world map rather than a sinusoid.
 
 > **Status: `1.0.0-alpha.1`.** `installEqualEarth` and `map.setProjection({ type: 'equal' })`
-> work end to end: the style rewrite, the `eqearth://` tile pipeline in the worker pool, the
-> camera, and the [adaptive transition](#adaptive-transition). Not done yet: the cartographic
-> finish, a projection control, a geographic wrapper around the map-space API, and a browser
-> test matrix (see [Roadmap](#roadmap)).
+> work end to end on MapLibre 5.24 and 6.6: the style rewrite, the `eqearth://` tile pipeline
+> in the worker pool, the camera, the [adaptive transition](#adaptive-transition), the
+> [cartographic finish](#cartography), the [projection control](#the-projection-control), a
+> [geographic API](#data-in-geo-out) over the map-space one, [GeoJSON](#geojson) and
+> [live style edits](#editing-the-style-while-equal-earth-is-on), and a
+> [persistent tile cache](#tile-throughput). Open: the first-paint budget
+> ([First paint](#first-paint)) and the stepped transition's ceiling, both product decisions.
 
 ## Install
 
@@ -19,8 +22,8 @@ Web Mercator, while still looking like a world map rather than a sinusoid.
 npm install @yellowmap/maplibre-gl-equal-earth maplibre-gl
 ```
 
-ESM only. The peer range is `maplibre-gl >=5.24 <7`; the demo runs on v6. v5 is checked by type
-tests against its `Map` and by the worker-bundle guard, but not yet in a browser.
+ESM only. The peer range is `maplibre-gl >=5.24 <7`. The demo runs on v6; the browser test
+suite runs every scenario on MapLibre 5.24 and 6.6.
 
 ## How it works, and what that costs you
 
@@ -36,12 +39,13 @@ real lng/lat → Equal Earth metres → × 1.162 → inverse Mercator → "map s
 This is the [dirty-reprojectors](https://github.com/developmentseed/dirty-reprojectors) technique,
 also used by Mapbox for Albers USA election maps.
 
-Three consequences you must design around:
+Three consequences you should know about:
 
-- **Coordinates the map reports are not geographic.** While Equal Earth is active,
-  `map.getCenter()`, `map.project()`, `getBounds()`, popup anchors and `queryRenderedFeatures()`
-  return map space, and under `{ type: 'equal' }` that space changes with the band shown.
-  Convert through the map's controller: `controllerFor(map).toGeographic` / `toMapSpace`.
+- **The renderer works in "map space", not geographic coordinates.** The plugin wraps the map's
+  coordinate API so that you keep speaking geographic coordinates: `getCenter`, `project`,
+  `unproject`, `getBounds`, the camera methods, Marker, Popup and mouse events all convert
+  ([Data in, geo out](#data-in-geo-out)). What still exposes map space is listed there;
+  `queryRenderedFeatures` geometry and `getStyle()` contents are the two you will meet.
 - **Equal Earth and globe cannot be shown at once.** Globe interprets lng/lat as real geodetic
   coordinates, so warped values would render as a distorted sphere.
 - **Labels stay upright.** Because MapLibre still believes it is rendering Mercator, text layout
@@ -53,24 +57,36 @@ Three consequences you must design around:
 
 ```js
 import * as maplibregl from 'maplibre-gl';
-import { installEqualEarth } from '@yellowmap/maplibre-gl-equal-earth';
+import { EqualEarthControl, installEqualEarth } from '@yellowmap/maplibre-gl-equal-earth';
 
 // Once, before creating any map: MapLibre sizes its worker pool with the first map.
 const eqe = await installEqualEarth(maplibregl);
 
-const map = new maplibregl.Map({ container: 'map', style: 'https://tiles.openfreemap.org/styles/liberty' });
-map.on('load', () => map.setProjection({ type: 'equal' }));   // or 'equal-earth'; 'mercator' turns it off
+const map = new maplibregl.Map({
+  container: 'map',
+  style: 'https://tiles.openfreemap.org/styles/liberty',
+  center: [10, 20],
+  zoom: 1.3,
+});
+map.setProjection({ type: 'equal' });   // or 'equal-earth'; 'mercator' turns it off
+map.addControl(new EqualEarthControl());
 
-const controller = eqe.controllerFor(map);
-map.jumpTo({ center: controller.toMapSpace([8.54, 47.37]) });   // geographic → the shown band's map space
-controller.toGeographic(map.getCenter().toArray());             // and back
+map.flyTo({ center: [8.54, 47.37], zoom: 9 });   // geographic, as always
 ```
 
 `{ type: 'equal' }` is the adaptive projection: Equal Earth at world zoom, plain Mercator from
 `transition.to`, stepped in between. `{ type: 'equal-earth' }` is Equal Earth at every zoom.
 The names follow [style-spec#1623](https://github.com/maplibre/maplibre-style-spec/pull/1623).
-`map.getProjection()` reports them from the `setProjection` call on, while the vector sources'
-TileJSON is still being fetched; the map shows Equal Earth once that activation has committed.
+
+`setProjection` may be called right after `new Map(…)`: the plugin waits for the style and
+the vector sources' TileJSON, then rewrites the style. That is faster than waiting for `load`,
+which first loads every tile of the Mercator view. `map.getProjection()` reports the type from
+the `setProjection` call on; the map shows Equal Earth once the activation has committed, which
+it announces with `projectiontransition` (`{ newProjection: 'equal' }`), as MapLibre does for
+its own projections. Leaving Equal Earth fires it as well. A failed activation (a TileJSON or
+GeoJSON URL that cannot be fetched, a TMS source) is reported as an `error` event (on the
+console when nothing listens) and leaves the map as it was.
+
 A second `installEqualEarth` on the same MapLibre module (e.g. a Vite HMR re-run) returns the
 first install, its options included; call `uninstall()` first to change them.
 
@@ -82,33 +98,191 @@ warped on the main thread, 100–450 ms per tile; `eqe.workerPath` says which pa
 A worker bundle that has not loaded after `workerTimeoutMs` (default 10 000; `Infinity` waits
 without a bound) gets the same fallback, so a stalled CDN cannot hold up your first map.
 
-### Converting coordinates
+### The projection control
 
-Anything you place on an Equal Earth map — GeoJSON, marker positions, deck.gl accessors,
-`flyTo` targets — must be converted into map space first, and anything the map reports back
-converted out of it. Use the map's controller, which converts in the space of the band shown
-now:
+`EqualEarthControl` is a button in the style of MapLibre's `GlobeControl` that switches between
+Equal Earth and Mercator (top right by default):
+
+```js
+map.addControl(new EqualEarthControl());                                  // equal ↔ mercator
+map.addControl(new EqualEarthControl({ on: 'equal-earth', off: 'globe' }), 'top-left');
+```
+
+| Option | Default | |
+| --- | --- | --- |
+| `on` | `'equal'` | The projection the button turns on: `'equal'` or `'equal-earth'`. |
+| `off` | `'mercator'` | The projection it turns off to: `'mercator'` or `'globe'`. |
+
+It reads `map.getProjection()` and follows `projectiontransition`, so it stays right whoever
+changes the projection. It can sit next to MapLibre's own `GlobeControl`, with one quirk of
+that control: it treats every projection other than Mercator as "globe on", so pressing it
+while Equal Earth is shown switches to **Mercator**, and pressing it again to globe. The
+Equal Earth button follows either way.
+
+### Cartography
+
+In every band with Equal Earth in it (blend < 1), the world is drawn as a shape:
+
+- The style's first `background` layer is recoloured with `outsideColor` (default
+  `'transparent'`, so the map container's CSS shows through), and a generated **world polygon**
+  in the original background colour is drawn right above it. A style without a background
+  layer gets `outsideColor` as its background.
+- **Polar areas reach ±90°.** Mercator data ends at ±85.05°; polygon vertices on that edge are
+  snapped to the poles, so Antarctica and the Arctic Ocean meet the outline.
+- **Outline and graticule** are opt-in. The outline is drawn in the Equal Earth bands; the
+  graticule in every band, the Mercator one included.
+- **World copies** are off while Equal Earth is shown, and restored afterwards.
+- **Raster, hillshade and color-relief layers** cannot be warped. They are drawn only in the
+  Mercator band, announced once per page with a `console.info`. For OpenFreeMap Liberty this
+  means no `ne2_shaded` relief at world zoom.
+
+```js
+await installEqualEarth(maplibregl, {
+  outsideColor: '#dfe6ec',
+  outline: { color: '#9a9a9a', width: 1 },                        // or true for these defaults
+  graticule: { step: 30, color: 'rgba(0,0,0,0.2)', width: 0.75 },  // or true; step must divide 180
+});
+```
+
+### Data in, geo out
+
+While Equal Earth is shown, the plugin wraps the map's coordinate methods **on the map
+instance** (other maps on the page are untouched, and everything passes through unchanged under
+Mercator and globe), so that values go in and come out geographic:
+
+| Methods | Converted with |
+| --- | --- |
+| `getCenter`, `project`, `unproject`, `getBounds` | the band **shown** now: what is on screen |
+| `jumpTo`, `easeTo`, `flyTo` (`center`, `around`), `setCenter`, `panTo`, and the `around` option of `panBy`, `zoomTo`, `zoomIn`, `zoomOut`, `rotateTo`, `resetNorth`, `resetNorthPitch`, `snapToNorth` | the band the camera request starts from, read after the method's own `stop()` |
+| `fitBounds`, `cameraForBounds` | solved across the bands, for the band the fitted zoom lands in |
+
+Because MapLibre's own components call the same methods, they come out right as well: **Marker**
+and **Popup** positions, `lngLat` of **mouse and touch events**, **`Hash`** (it stores
+geographic values), **`ScaleControl`** (true distances) and **`GeolocateControl`** (centre and
+accuracy circle). `getBounds()` is the geographic bounding box of the view; with the whole
+world in view that is `[-180, -90, 180, 90]`.
+
+A few rules follow from there being only one world:
+
+- `project` maps every longitude onto that world: `project([-181, 0])` is `project([179, 0])`.
+  Camera targets beyond ±180° wrap the same way. World copies are off while Equal Earth is shown.
+- **Zoom and bearing are not converted.** `getZoom()`/`getBearing()` return MapLibre's values,
+  which in the transition carry the camera's compensation offsets (≤ 0.07 zoom, ≤ 3°; see
+  [Adaptive transition](#adaptive-transition)). A `setZoom(getZoom())` round trip is still
+  exact.
+- `fitBounds` and `cameraForBounds` account for that compensation, so the fitted bounds touch
+  the padding as they do in Mercator. A `cameraForBounds` result is valid for the camera state
+  at the time of the call: apply it before the camera moves on.
+
+**Not converted** (map space in and out): `queryRenderedFeatures` geometry and `getStyle()`
+contents (sources' data, layer coordinates), `getMaxBounds`/`setMaxBounds`,
+`calculateCameraOptionsFromTo`/`calculateCameraOptionsFromCameraLngLatAltRotation`, and deck.gl
+overlays. For those, convert by hand:
 
 ```js
 const controller = eqe.controllerFor(map);
 
-controller.toMapSpace([8.54, 47.38]);    // → map-space lng/lat to hand to MapLibre
-controller.toGeographic([9.92, 42.09]);  // → back to real lng/lat
+controller.toGeographic([9.92, 42.09]);  // map space of the band shown now → real lng/lat
+controller.toMapSpace([8.54, 47.38]);    // and back
 ```
 
 Under `{ type: 'equal' }` the shown band changes as the zoom crosses the transition, so a
-position converted earlier belongs to the band that was shown then; re-convert in `onSwitch`.
-While Equal Earth is off, both are the identity.
+position converted earlier belongs to the band shown then; re-convert in `onSwitch`. While
+Equal Earth is off, both are the identity.
 
-The bare functions take the blend explicitly and default to 0, pure Equal Earth. Use them for
-`{ type: 'equal-earth' }`, or with a blend you know:
+The bare functions take the blend explicitly: `geographicUnder(mapLngLat, blend)` and
+`mapSpaceOf(lngLat, blend)` are what the wrappers use (the first clamps to the world's outline,
+so it is always finite with |lat| ≤ 90; the second keeps world copies), and
+`mapToGeographic`/`geographicToMap` are the unclamped pair, with blend 0 (pure Equal Earth) by
+default. `controllerFor(map).blend` is the blend of the band shown.
+
+To keep the map-space API instead, pass `geographicApi: false` to `installEqualEarth`: nothing
+is wrapped, and every method above speaks map space while Equal Earth is shown.
+
+### GeoJSON
+
+A GeoJSON source is drawn in every band: the style rewrite fans it out into one copy per
+Equal Earth band (`<id>__b<k>`), each holding the data clipped at ±180°, densified and warped
+into that band's map space. Inline data and data by URL both work; a URL is fetched with
+`fetchJson` (see [Limitations](#limitations)).
 
 ```js
-import { geographicToMap, mapToGeographic } from '@yellowmap/maplibre-gl-equal-earth';
-
-geographicToMap([8.54, 47.38]);          // blend 0: pure Equal Earth map space
-mapToGeographic([9.92, 42.09], 0.5);     // from the map space of a band at blend 0.5
+map.addSource('cities', { type: 'geojson', data: citiesFeatureCollection });   // geographic
+map.addLayer({ id: 'cities', type: 'circle', source: 'cities' });
+map.getSource('cities').setData(updated);   // every band copy follows
 ```
+
+`setData` and `updateData` on the source keep the copies in step: `setData` warps the new data
+into every copy, `updateData` re-warps the source's full data once MapLibre has applied the
+diff. The warp runs on the main thread, once per band for every `setData` (see Limitations).
+**Clustering** happens in map space, on the warped points: the cluster radius is in pixels, and
+pixels are what the map shows.
+
+### Editing the style while Equal Earth is on
+
+`addSource`, `removeSource`, `addLayer`, `removeLayer`, `setPaintProperty`, `setLayoutProperty`
+and `setFilter` reach every band: address your own ids, and the plugin fans the change out to
+the band copies (`<id>__b<k>`) and keeps it for deactivation. A layer or source you add is drawn
+warped in each band from the next microtask on (several edits in one task cost one style diff; a
+GeoJSON or TileJSON given by URL is fetched first). An opacity the transition gates, or a symbol
+layer's `visibility`, becomes the value its band shows.
+
+Like a native `addLayer`, none of this fires `style.load`, and neither does switching the
+projection on or off, as with a native `setProjection`: a `style.load` listener that re-adds its
+layers runs once for each `setStyle` of yours and for nothing else.
+
+Under pure Equal Earth (and outside the Mercator band's zoom range) only the copies exist.
+`getLayer(id)`, `getPaintProperty`, `getLayoutProperty`, `getFilter` and the `layers` of
+`queryRenderedFeatures` then read your id as the copy the shown band draws, so the usual
+`if (!map.getLayer(id)) map.addLayer(…)` guard and layer-scoped listeners
+(`map.on('click', id, …)`) keep working. The layer `getLayer` returns is that copy: its `id` is
+`<id>__b<k>`.
+
+`setLayerZoomRange` and `moveLayer` are not fanned out: they reach only the layer under your id
+(the Mercator band's), and the next such diff or the deactivation undoes them.
+
+A new style passed to `setStyle` is followed: it becomes the new original and is rewritten.
+
+### Tile throughput
+
+Every Equal Earth tile is built in a worker from the source tiles under it: fetched, decoded,
+densified, warped, clipped and encoded again. Four settings bear on it:
+
+```js
+await installEqualEarth(maplibregl, {
+  workers: 4,                                       // or false to leave MapLibre's pool alone
+  persistentCache: { maxZoom: 3, ttlDays: 7 },      // the default; false keeps none
+  sourceZoomOffset: 0,                              // the default; -1 reads one zoom coarser
+});
+```
+
+- **`workers`.** MapLibre's default pool is one worker, which serialises every warp. While the
+  count is still 1 it is raised to `clamp(hardwareConcurrency / 2, 2, 4)`, or to the number
+  given. Any other count, Safari's default of up to 3 included, is treated as the application's
+  own setting. Each worker keeps its own in-memory caches: up to 64 MB of raw source tiles and
+  32 decoded source tiles (a decoded tile takes about 4.4× its raw size, a few MB at low zoom on
+  OpenMapTiles data), so the memory they can take grows with the pool size.
+- **`persistentCache`.** Warped tiles up to `maxZoom` are kept in the browser's Cache Storage
+  for `ttlDays`, so a reload draws the world view without fetching or warping its source
+  tiles again. The cache is named `equal-earth-<version>+<build id>`; a plugin build that
+  could produce different tiles uses a new name, and the first worker to open it deletes every
+  other `equal-earth-*` cache. Entries are keyed by a hash of the source's configuration,
+  tile URL template and API key included, so a rotated key starts afresh rather than serving
+  tiles fetched with the old one. Expired entries are deleted in the background, and the cache
+  is capped at 2000 tiles. It needs a secure context (`https:` or `localhost`); without Cache
+  Storage it is skipped silently. To clear it:
+
+  ```js
+  for (const name of await caches.keys()) {
+    if (name.startsWith('equal-earth-')) await caches.delete(name);
+  }
+  ```
+
+- **`sourceZoomOffset`.** Reads source tiles this many zooms from the output zoom (clamped to
+  the tileset's zooms). `-1` fetches about a quarter of the bytes and warps faster, at the cost
+  of coarser geometry and far fewer labels: OpenMapTiles tiles carry many fewer places one zoom
+  down. Measured at OpenFreeMap Liberty's world view, `-1` placed 26 place labels instead of 64.
+  The default stays 0 ([First paint](#first-paint)).
 
 ### Raw projection
 
@@ -210,24 +384,20 @@ the Mercator band uses the original source untouched. Four things make the steps
   switch. The camera also absorbs the local rotation and scale of each step, so the rendered
   zoom and bearing follow what a continuous blend would show. What is left is shear.
 - **Cross-fade.** Fills and lines fade between bands over 250 ms; labels fade out over 300 ms
-  before the outgoing band's symbols are hidden. Hillshade does not cross-fade: a hillshade at
-  zero exaggeration still draws a flat highlight, so it is hidden by visibility like a symbol and
-  simply disappears when the hide fires. Because hidden relief is also not parsed, relief pops in
-  once its DEM tiles load when you zoom into the Mercator band.
+  before the outgoing band's symbols are hidden. The world's base (background and world
+  polygon) is not cross-faded: the incoming band's base fades in over the outgoing one, which
+  fades out only after that, so the container never shows through. Hillshade does not cross-fade:
+  a hillshade at zero exaggeration still draws a flat highlight, so it is hidden by visibility
+  like a symbol and simply disappears when the hide fires. Because hidden relief is also not
+  parsed, relief pops in once its DEM tiles load when you zoom into the Mercator band.
 
 ```js
 await installEqualEarth(maplibregl, {
   transition: { from: 4, to: 8, steps: 6 },   // the defaults: steps at z4, 4.8 … 7.2, Mercator from z8
   compensation: 'zoom+bearing',               // the default; or 'zoom', or 'none'
-  workers: 4,                                 // or false to leave MapLibre's pool alone
   onSwitch: (e) => console.log(`b${e.from}→b${e.to} at z${e.requestedZoom}`, e.forced, e.waitedMs),
 });
 ```
-
-`workers`: MapLibre's default pool is one worker, which serialises every warp. While the count
-is still 1 it is raised to `clamp(hardwareConcurrency / 2, 2, 4)`, or to the number given. Any
-other count, Safari's default of up to 3 included, is treated as the application's own setting.
-The pool is created at install time, before any map exists.
 
 Behaviours to expect:
 
@@ -235,7 +405,8 @@ Behaviours to expect:
   the shown band is the zoom's own, they differ from the requested ones by at most half a
   step's offset (≤ 0.07 zoom, ≤ 3° at Anchorage with six steps), and a `jumpTo({ zoom })`
   lands within that of what it asked for. While the gate holds a band `j` steps behind the
-  zoom, the offset grows to about `j + ½` steps' worth.
+  zoom, the offset grows to about `j + ½` steps' worth. `controllerFor(map).requestedZoom` is
+  the zoom without the offset.
 - When a held band becomes ready while the map is idle, the switch runs through an empty
   `jumpTo({})`, which fires `movestart`/`moveend` like any camera change.
 - Labels cross-fade. Zooming out, the outgoing band's labels may win collision against the
@@ -254,69 +425,142 @@ interpolation inside the renderer, as MapLibre's globe transition does: that is
 stepped polyfill is good enough, or a renderer-side transition is needed, is an open product
 decision; judge it on the demo.
 
-### Demo and probe
+## Demo and probes
 
 Run `npm run build:js` (the demo loads the built `dist/worker.mjs`), then `npm run dev` and
-open <http://localhost:5173/demo/transition.html>. URL parameters:
-`?steps=&from=&to=&compensate=none|zoom|zoom+bearing&projection=equal|equal-earth|mercator&workers=`.
-The readout logs every band switch, how long it was held, and the geographic centre.
+open <http://localhost:5173/demo/transition.html>. The page starts on the whole world, with the
+`EqualEarthControl` top right, buttons that jump to five cities, and presets in the panel. Its
+URL parameters:
 
-`npm run probe:transition` is a developer tool, not part of `npm run verify`. It drives the
-demo in headless Chrome with real wheel events, zooming in and out through the transition,
-and fails on a centre drift above 0.001°, any map error or an uncaught page exception. It
-needs Node ≥ 22, local Chrome (`--chrome <path>` or `CHROME_PATH`), the network and the
-running dev server. `--anchor 300,0` wheels at a point 300 px off-centre and reports how far
-the place under the pointer snaps at each step:
+| Parameter | |
+| --- | --- |
+| `style=<url>` | Any EPSG:3857 vector style whose sources are TileJSON (`url`) or `tiles` templates. Default: OpenFreeMap Liberty. |
+| `projection=equal\|equal-earth\|mercator` | The initial projection (default `equal`), set right after the map is created. |
+| `steps=`, `from=`, `to=` | The transition. |
+| `compensate=none\|zoom\|zoom+bearing` | The camera compensation. |
+| `workers=<n>` | The worker pool size. |
+| `control=0` | Leaves out the `EqualEarthControl`. |
+| `outside=<colour>`, `outline=1`, `graticule=<step>\|1` | The cartography options. |
+| `persist=0` | `persistentCache: false`. |
+| `zoomOffset=<n>` | `sourceZoomOffset`. |
 
-```sh
-node scripts/probe-transition.mjs --city "San Francisco"
-node scripts/probe-transition.mjs --city "Zürich" --steps 9
-```
+The readout logs every band switch, how long it was held, the geographic centre, any error
+(a style or TileJSON that cannot be loaded shows there), and `first paint: <ms> ms`: the time
+from the page's module starting to the first `idle` with the initial projection shown,
+recorded as the `performance` marks `eqe:start`, `eqe:installed`, `eqe:active` and
+`eqe:first-idle` and exposed as `window.__eqe.firstPaintMs`.
 
-Headless Chrome renders through SwiftShader, several seconds per band, so the hold times it
-prints say nothing about latency on real hardware.
+**SmartMaps, or your own style.** Paste the style URL, its `?key=` included, into the panel's
+"your style" field, or put it in the address URL-encoded:
+`/demo/transition.html?style=<SmartMaps style URL including ?key=…, URL-encoded>`. The readout
+shows the style URL with the key elided. No style URL or key is part of this repository.
+
+`npm run probe:transition` and `npm run probe:first-paint` are developer tools, not part of
+`npm run verify`. Both drive the demo in headless Chrome and need Node ≥ 22, local Chrome
+(`--chrome <path>` or `CHROME_PATH`), the network and the running dev server (`--url` for
+another port).
+
+- `probe:transition` zooms in and out through the transition with real wheel events and fails
+  on a centre drift above 0.001°, any map error or an uncaught page exception. `--anchor 300,0`
+  wheels at a point 300 px off-centre and reports how far the place under the pointer snaps at
+  each step:
+
+  ```sh
+  node scripts/probe-transition.mjs --city "San Francisco"
+  node scripts/probe-transition.mjs --city "Zürich" --steps 9
+  ```
+
+- `probe:first-paint` measures the demo's first paint at 1280×800 and 50 Mbit/s (20 ms
+  latency) in a fresh profile, cold (HTTP cache disabled, Cache Storage cleared), warm
+  (reloaded with both caches), and cold again with only the page's code cached. It prints each
+  against the budgets (4 s cold, 1.5 s warm) with the place labels placed and the bytes
+  received by kind. `--style <url>` and `--zoom-offset=<n>` pass `style` and `zoomOffset` on.
+
+  ```sh
+  npm run probe:first-paint
+  node scripts/probe-transition.mjs --first-paint --zoom-offset=-1
+  ```
+
+Headless Chrome renders through SwiftShader, on the CPU: the timings are indicative of the
+pipeline, not of a user's GPU, and the switch hold times say nothing about real latency.
+
+### First paint
+
+The spec's budget is the world view at 1280×800 in ≤ 4 s cold at 50 Mbit/s and ≤ 1.5 s warm.
+Measured with `probe:first-paint` against `npm run dev` on OpenFreeMap Liberty (medians of three
+runs, SwiftShader):
+
+| `sourceZoomOffset` | cold | warm | cold, code cached | place labels placed |
+| --- | --- | --- | --- | --- |
+| 0 (default) | 7.9 s | 3.2 s | 3.3 s | 64 |
+| −1 | 7.6 s | 2.9 s | 2.7 s | 26 |
+
+The plain cold run misses at either offset, but mostly on the dev server's account: it serves
+MapLibre's worker modules unminified with inline source maps, once per worker with the cache
+off, about 23 MB that arrive before the plugin is even installed. With that code cached, the
+cold world view is drawn within budget at the default offset. The warm run misses on
+SwiftShader with almost nothing fetched: style parsing, the rewrite and rendering on the CPU
+take most of it. `-1` would cut the tile bytes but more than halves the labels, so the default
+stays 0; whether to revisit the budget is an open product decision.
 
 ## Limitations
 
-- **Map space.** Everything MapLibre reports while Equal Earth is active is in the shown
-  band's map space; convert with `controllerFor(map).toGeographic` / `toMapSpace`, not with
-  the blend-0 defaults of `mapToGeographic` / `geographicToMap`. Positions you converted
-  belong to the band shown at the time; re-convert on `onSwitch`.
-- **`GlobeControl`** treats `{ type: 'equal' }` as "not Mercator", switches to Mercator and so
-  turns Equal Earth off. Use your own control for now.
+- **Map space where the API is not wrapped.** `queryRenderedFeatures` geometry, `getStyle()`
+  contents, `getMaxBounds`/`setMaxBounds`, `calculateCameraOptionsFrom*` and deck.gl overlays
+  are in the shown band's map space ([Data in, geo out](#data-in-geo-out)). Positions you
+  converted belong to the band shown at the time; re-convert on `onSwitch`. With
+  `geographicApi: false` this applies to everything. `GeolocateControl` checks a geographic
+  position against `getMaxBounds()`, which is map space: with `maxBounds` set, its
+  out-of-bounds test is wrong.
+- **`fitBounds` and the gate.** `fitBounds` chooses the band its fitted zoom lands in without
+  the switcher's hysteresis. Arriving from above at a zoom just under a band boundary, the
+  switcher may keep the upper band for that frame, and the fit overshoots the padding by a few
+  pixels.
+- **`cameraForBounds`** returns a camera for the camera state at the time of the call. Applied
+  after the map has moved across a band, it is off by that band's compensation.
+- **`GlobeControl`** treats `{ type: 'equal' }` as "not Mercator": pressing it while Equal Earth
+  is shown switches to Mercator. Use `EqualEarthControl` to switch Equal Earth on and off.
+- **GeoJSON.**
+  - A GeoJSON source given by URL is fetched with `fetchJson` (plain `fetch` unless you pass
+    one), not through MapLibre's `transformRequest`; an activation whose GeoJSON URL cannot be
+    fetched rejects and leaves the map in Mercator.
+  - Each `setData` (and `updateData`) warps the whole source on the main thread once per Equal
+    Earth band: a large GeoJSON stalls the page for that long.
+  - Under `{ type: 'equal' }` your source and layer ids name the Mercator band's copies. The
+    cluster API (`getSource(id).getClusterExpansionZoom`/`getClusterLeaves`) and layer-scoped
+    events on cluster layers (`map.on('click', 'clusters', …)`) therefore only see the Mercator
+    copy. In the Equal Earth bands, query without a layer id and call the cluster API on
+    `map.getSource(feature.source)`, the band copy the feature came from; its leaves are in
+    map space.
 - **Style changes while active.** A new style passed to `setStyle` is followed: it becomes the
   new original and is rewritten. But `getStyle()` → modify → `setStyle()` hands back our
   rewritten style, which still counts as ours: the change is not captured as the original and
   is dropped on deactivation, and layers added against the original source id find no band
-  source. Change such a style before activating, or deactivate first. A `setStyle(url)` is
-  never cancelled by the plugin: while MapLibre fetches it, the plugin's own style updates wait
-  (edits made meanwhile are kept if the fetch fails, and dropped with the old style, as in
-  MapLibre, when it arrives); a deactivation meanwhile leaves the fetch running, or requests the
-  URL again when it has to put your style back. A layer added while such a style is still
-  loading shows unwarped until that style arrives.
-- **Style edits while active.** `addSource`, `removeSource`, `addLayer`, `removeLayer`,
-  `setPaintProperty`, `setLayoutProperty` and `setFilter` reach every band: address your own
-  ids, the plugin fans the change out to the band copies (`<id>__b<k>`) and keeps it for
-  deactivation. A layer or source you add is drawn warped in each band from the next microtask
-  on (several edits in one task cost one style diff; a GeoJSON or TileJSON given by URL is
-  fetched first). An opacity the transition gates, or a symbol layer's `visibility`, becomes the
-  value its band shows. Like a native `addLayer`, none of this fires `style.load`, and neither
-  does switching the projection on or off, as with a native `setProjection`: a `style.load`
-  listener that re-adds its layers runs once for each `setStyle` of yours and for nothing else.
-  Under pure Equal Earth (and outside the Mercator band's
-  zoom range) only the copies exist; `getLayer(id)`, `getPaintProperty`, `getLayoutProperty`,
-  `getFilter` and the `layers` of `queryRenderedFeatures` then read your id as the copy the
-  shown band draws, so the usual `if (!map.getLayer(id)) map.addLayer(…)` guard and
-  layer-scoped listeners (`map.on('click', id, …)`) keep working. The layer `getLayer` returns
-  is that copy (its `id` is `<id>__b<k>`). `setLayerZoomRange` and `moveLayer` are not fanned
-  out: they reach only the layer under your id (the Mercator band's), and the next such diff or
-  the deactivation undoes them.
+  source. Change such a style before activating, or deactivate first, or use the
+  [live edit methods](#editing-the-style-while-equal-earth-is-on).
+- **`setStyle(url)` while active.** The plugin never cancels it. While MapLibre fetches it, the
+  plugin's own style updates wait (edits made meanwhile are kept if the fetch fails, and
+  dropped with the old style, as in MapLibre, when it arrives). A layer added while such a
+  style is still loading shows unwarped until that style arrives. A deactivation meanwhile
+  puts your original style back and requests the URL again, so that MapLibre diffs your style
+  in as it would have without the plugin. Only when the live style is no longer ours (an
+  activation still waiting for your fetch) and nothing of ours is left on it (no zoom bound of
+  the rewrite) does the deactivation leave the live style and the fetch alone.
+- **`minzoom: 0` after deactivation.** MapLibre's style diff cannot take a zoom bound away, so a
+  layer the Mercator band bounded under its own id is restored with an explicit `minzoom: 0`
+  (`maxzoom: 24` likewise). It draws exactly as without the bound, but `getStyle()` then
+  reports `minzoom: 0` on layers that had none.
 - **Sources.** Band sources inherit `attribution`, `minzoom` and `promoteId` from the original
   source, but not `bounds` (geographic bounds would cut off map-space tiles). TMS sources are
   rejected on activation.
 - **TileJSON** given by `url` is fetched with plain `fetch`, without MapLibre's
   `transformRequest`, and relative tile URLs in it are not resolved. Pass
   `fetchJson: (url) => …` for authenticated endpoints or `pmtiles://` sources.
+- **Persistent cache.**
+  - Two tabs running different plugin builds delete each other's cache on first use, because
+    each deletes every `equal-earth-*` cache but its own. They lose cache hits, never get wrong
+    tiles: the build is in the name.
+  - An entry's lifetime is fixed when it is stored; changing `ttlDays` affects only new entries.
 - **Failed switches.** A switch between `equal` and `equal-earth` that fails after the old type
   was torn down leaves Equal Earth off, with the original style restored.
 - **Raster layers** (relief) cannot be warped: they are drawn only in the Mercator band.
@@ -325,33 +569,53 @@ prints say nothing about latency on real hardware.
 
 | Export | Description |
 | --- | --- |
+| `installEqualEarth(maplibregl, opts)` | Checks the version, sizes the worker pool, loads the worker bundle, polyfills `setProjection`/`getProjection`. Resolves to `{ version, workerPath, controllerFor(map), uninstall() }`. Options: `workerUrl`, `workerTimeoutMs`, `workers`, `transition`, `compensation`, `onSwitch`, `fetchJson`, `outsideColor`, `outline`, `graticule`, `geographicApi`, `persistentCache`, `sourceZoomOffset`. |
+| `EqualEarthControl` | The projection toggle button; options `on`, `off`. |
+| `EqualEarthController` | Per map, from `controllerFor(map)`: `active`, `projection`, `pendingProjection`, `blend`, `requestedZoom`, `toMapSpace(lngLat)`, `toGeographic(lngLat)`. |
 | `toEqualEarth(lngLat)` | Geographic degrees → Equal Earth metres (EPSG:8857). |
 | `fromEqualEarth(point)` | Equal Earth metres → geographic degrees. Newton inverse. |
-| `geographicToMap(lngLat, blend = 0)` | Geographic degrees → the map space of a band at `blend` (0 = pure Equal Earth). Prefer `controllerFor(map).toMapSpace`. |
-| `mapToGeographic(lngLat, blend = 0)` | Map space of a band at `blend` → geographic degrees. Prefer `controllerFor(map).toGeographic`. |
-| `installEqualEarth(maplibregl, opts)` | Checks the version, sizes the worker pool, loads the worker bundle, polyfills `setProjection`/`getProjection`. Resolves to `{ version, workerPath, controllerFor(map), uninstall() }`. |
-| `EqualEarthController` | Per map, from `controllerFor(map)`: `active`, `projection`, `blend`, `toMapSpace(lngLat)`, `toGeographic(lngLat)`. |
+| `geographicUnder(mapLngLat, blend)` | Map space of a band at `blend` → geographic, clamped to the world's outline. |
+| `mapSpaceOf(lngLat, blend)` | Geographic → map space of a band at `blend`, world copies kept. |
+| `geographicToMap(lngLat, blend = 0)` | Geographic degrees → the map space of a band at `blend` (0 = pure Equal Earth). |
+| `mapToGeographic(lngLat, blend = 0)` | Map space of a band at `blend` → geographic degrees. |
+| `graticule`, `worldOutline`, `worldPolygon` | The cartography's GeoJSON at a blend, in map space. |
+| `warpGeoJSON(data, blend, zoom)` | Clip, densify and warp GeoJSON into a band's map space. |
 | `BandCamera` | Lower level: the `transformCameraUpdate` hook across zoom bands, with compensation. `installEqualEarth` installs it. |
 | `ThresholdCamera` | Lower level: the two-band form of `BandCamera` (Equal Earth ↔ Mercator). |
 | `installEqualEarthConstrain(map, opts)` | Lower level, installed by `installEqualEarth`: clamps the camera to the Equal Earth world; returns a teardown function. |
 | `createEqualEarthConstrain(opts)` | The bare `TransformConstrainFunction`, if you want to compose it yourself. |
+| `createEqualEarthProtocol(opts)` | The `eqearth://` tile handler, for the main thread or a custom worker. |
+| `CACHE_NAME_PREFIX` | `'equal-earth-'`, the prefix of the persistent cache's name. |
 | `GRID_FACTOR` | ≈1.162, the Equal Earth → Mercator grid scale. |
 | `EQUAL_EARTH_X_MAX` / `EQUAL_EARTH_Y_MAX` | Half-extents in metres, derived from `EARTH_RADIUS`. |
 | `MAP_SPACE_MAX_LATITUDE` | Map-space latitude of the geographic pole (≈65.54°). |
 | `MERCATOR_MAX_LATITUDE` | 85.051128779806589. |
 
-Full TypeScript declarations ship with the package.
+Full TypeScript declarations ship with the package; the lower-level building blocks (bands,
+style rewrite, switcher, tile pipeline) are exported too.
+
+## Contributing
+
+```sh
+npm run verify   # lint, typecheck, unit tests, build, export guards, browser tests
+```
+
+`npm test` runs the unit tests (vitest, no browser). `npm run test:browser` runs the Playwright
+suite in headless Chromium with software WebGL, each spec against MapLibre 6.6 and 5.24 (a few
+are v6 only), on fixture tiles generated in memory: no network. It takes about six and a half minutes and needs
+a fresh build (`verify` builds first). `npm run build:js` refreshes only the bundles the demo and
+the browser tests load.
 
 ## Roadmap
 
-Next: the cartographic finish, a projection control (`EqualEarthControl`), a geographic API
-over the map-space one with GeoJSON fan-out, a persistent tile cache, a browser test matrix on
-MapLibre 5.24 and 6.x, and more demos.
+The plugin is complete against its spec; the open items are product decisions: whether the
+stepped transition is good enough ([the ceiling](#adaptive-transition)) and whether to revisit
+the first-paint budget ([First paint](#first-paint)).
 
 MapLibre is working on a native adaptive Equal Earth
 ([maplibre-gl-js#8330](https://github.com/maplibre/maplibre-gl-js/issues/8330)). This package is
 deliberately shaped as a polyfill of the pending spec so that it can simply be removed once that
-ships.
+ships; until then a `native: 'auto'` option that hands over to it is planned.
 
 ## Credits
 

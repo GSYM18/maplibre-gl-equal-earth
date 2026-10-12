@@ -353,6 +353,49 @@ MapLibre runs **one** tile worker by default (except Safari).
 - If the cold budget is missed even at offset −1, it is recorded as a finding and the budget
   is revisited with the user. It is not silently traded for server-side work.
 
+**Finding (Plan 3, 2026-10-12): the `sourceZoomOffset` default stays 0; the budget is open.**
+
+The world-view budget (`scripts/probe-openfreemap.ts --budget`, live OpenFreeMap, blend 0,
+every output tile at z1 and z2 inside the Equal Earth rows, a fresh handler per offset):
+
+| offset | zoom | tiles | upstream kB (decoded) | requests | warp ms | place | water | boundary |
+|---|---|---|---|---|---|---|---|---|
+| 0 | z1 | 4 | 784 | 4 | 94 | 142 | 39 | 26 |
+| 0 | z2 | 8 | 13990 | 16 | 749 | 1669 | 303 | 50 |
+| −1 | z1 | 4 | 78 | 1 | 36 | 49 | 21 | 8 |
+| −1 | z2 | 8 | 784 | 4 | 200 | 135 | 47 | 36 |
+
+First paint (`npm run probe:first-paint` against `npm run dev`, headless Chrome 154 with
+SwiftShader, 1280×800, 50 Mbit/s and 20 ms latency, OpenFreeMap Liberty, the demo's world view
+at z1.32; three runs per offset, medians, in ms):
+
+| offset | cold | warm | cold, code cached | place labels placed |
+|---|---|---|---|---|
+| 0 | 7851 (7393, 7851, 8355) | 3228 (3140, 3362, 3228) | 3333 (3241, 3333, 3773) | 64 |
+| −1 | 7624 (7624, 7044, 7809) | 2919 (3476, 2919, 2894) | 2710 (3310, 2710, 2561) | 26 |
+
+- **Cold misses 4 s at both offsets, on the dev server's account.** With the HTTP cache off,
+  every worker fetches MapLibre's worker modules as `vite dev` serves them, unminified with
+  inline source maps: 23.3 MB of 28.3 MB received, and the install alone ends 4.3–5.2 s after
+  the module started. The map data is 1.8 MB of z1 tiles (4 tiles fetched once per worker) and
+  0.9 MB of glyphs. With the page's code cached and everything else cold ("cold, code cached":
+  the browser cache holding only what an empty style loads), the world view is drawn in 3.3 s
+  at offset 0, within budget; there the 4 tiles cost 0.44 MB.
+- **Warm misses 1.5 s with almost nothing fetched** (0.4 MB, the cache-busted worker bundle):
+  the install ends at ~0.5 s, Equal Earth is active at ~1.8 s (style, TileJSON, rewrite of
+  111 layers into the banded style, all on SwiftShader's CPU), the first idle follows ~1.3 s
+  later. A real GPU will be faster; how much is not measured.
+- **−1 empties the world view.** It saves ~0.6 s cold with code cached, but MapLibre places
+  26 place labels instead of 64 (−59 %, beyond Ruling R24's 20 %), matching the budget table's
+  `place` drop at z1 (142 → 49). So the default stays 0.
+- **To decide with the user:** whether the budget holds for a production build on real
+  hardware (measure the demo built and served compressed, and on a mid-range laptop GPU), or
+  is revisited; and whether −1 is worth offering as a "fast world view" for styles that label
+  little at world zoom. A small side finding: an Equal Earth `setProjection` right after
+  `new Map` races MapLibre's own Mercator tile loading for the first view; in some warm
+  reloads at −1 the Mercator z1 tiles (0.44 MB) and their glyphs were fetched although never
+  shown.
+
 ## 7. Geo API and GeoJSON ("data in, geo out")
 
 - **Wrapped per instance** by `installEqualEarth` (pass-through while inactive): `getCenter`,
