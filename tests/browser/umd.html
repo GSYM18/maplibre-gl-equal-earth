@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Equal Earth UMD harness</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: #fff;
+      }
+      #map {
+        width: 512px;
+        height: 384px;
+      }
+    </style>
+    <!--
+      The built UMD bundle as a page without a bundler loads it: a classic script defining the
+      `maplibreglEqualEarth` global, with no `workerUrl`, so the worker bundles must be found next
+      to this script (vite.umd.config.ts). `?mlv=5|6` (default 6). v5 is MapLibre's own classic
+      script; v6 ships no global build, so it comes from `import()` and is handed to the global.
+      Exposes `window.__umd` for umd.spec.ts, and the part of `window.__h` that helpers.ts's
+      geographic conversions read.
+    -->
+    <script src="/dist/maplibre-gl-equal-earth.umd.js"></script>
+  </head>
+  <body>
+    <div id="map"></div>
+    <script type="module">
+      const mlv = new URLSearchParams(location.search).get('mlv') === '5' ? 5 : 6;
+      const state = { errors: [], workerUrls: [] };
+      window.__umd = state;
+
+      const load = (element) =>
+        new Promise((resolve, reject) => {
+          element.addEventListener('load', () => resolve());
+          element.addEventListener('error', () => reject(new Error(`failed to load ${element.src ?? element.href}`)));
+          document.head.append(element);
+        });
+      const css = (href) => load(Object.assign(document.createElement('link'), { rel: 'stylesheet', href }));
+
+      async function loadMapLibre() {
+        if (mlv === 6) {
+          await css('/node_modules/maplibre-gl/dist/maplibre-gl.css');
+          return import('maplibre-gl');
+        }
+        await css('/node_modules/maplibre-gl-v5/dist/maplibre-gl.css');
+        await load(Object.assign(document.createElement('script'), { src: '/node_modules/maplibre-gl-v5/dist/maplibre-gl.js' }));
+        return window.maplibregl;
+      }
+
+      async function start() {
+        const loaded = await loadMapLibre();
+        // Records the worker URL install picks. A copy: v6's module namespace is read-only.
+        const maplibregl = {
+          ...loaded,
+          importScriptInWorkers: (url) => {
+            state.workerUrls.push(String(url));
+            return loaded.importScriptInWorkers(url);
+          },
+        };
+        const warn = console.warn.bind(console);
+        console.warn = (...args) => {
+          if (typeof args[0] === 'string' && args[0].startsWith('[equal-earth]')) state.errors.push(args[0]);
+          warn(...args);
+        };
+
+        const install = await maplibreglEqualEarth.installEqualEarth(maplibregl, { workerTimeoutMs: 15000 });
+        state.workerPath = install.workerPath;
+        const map = new maplibregl.Map({
+          container: 'map',
+          style: {
+            version: 8,
+            sources: {
+              fixture: { type: 'vector', tiles: [`${location.origin}/fixture-tiles/{z}/{x}/{y}.pbf`], maxzoom: 14 },
+            },
+            layers: [
+              { id: 'background', type: 'background', paint: { 'background-color': '#f8f4f0' } },
+              { id: 'land', type: 'fill', source: 'fixture', 'source-layer': 'land', paint: { 'fill-color': '#9fd39f' } },
+            ],
+          },
+          center: [0, 20],
+          zoom: 1,
+          fadeDuration: 0,
+          canvasContextAttributes: { preserveDrawingBuffer: true },
+          attributionControl: false,
+        });
+        state.controller = install.controllerFor(map);
+        // What helpers.ts's geographic conversions (`colourAt`) read.
+        window.__h = { map, controller: state.controller, geoApi: true };
+        map.on('error', (event) => state.errors.push(String(event.error?.message ?? event.error)));
+        map.setProjection({ type: 'equal-earth' });
+        for (;;) {
+          await new Promise((resolve) => map.once('idle', resolve));
+          if (state.controller.active && state.controller.pendingProjection === undefined && map.loaded()) break;
+          map.triggerRepaint();
+        }
+      }
+
+      state.ready = start().catch((error) => {
+        state.errors.push(error instanceof Error ? error.message : String(error));
+      });
+    </script>
+  </body>
+</html>

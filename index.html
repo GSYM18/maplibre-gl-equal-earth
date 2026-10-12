@@ -41,6 +41,18 @@
       <button id="mode" type="button">Showing: Equal Earth</button>
       <pre id="readout">move the cursor over the map</pre>
     </div>
-    <script type="module" src="demo/graticule.ts"></script>
+    <!-- A plain static server sends `.ts` as video/mp2t and the browser refuses it: say so on the page. -->
+    <script
+      type="module"
+      src="demo/graticule.ts"
+      onerror="document.getElementById('readout').textContent = [
+        'This demo is TypeScript, compiled on the fly by the Vite dev server;',
+        'a plain static server cannot run it. In the repository run:',
+        '',
+        '  npm run dev',
+        '',
+        'and open http://localhost:5173/',
+      ].join('\n')"
+    ></script>
   </body>
 </html>
