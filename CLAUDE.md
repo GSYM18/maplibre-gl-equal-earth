@@ -105,12 +105,12 @@ most design decisions here:
    instance's coordinate methods are wrapped ("data in, geo out", spec §7, `geo-api.ts`), so
    `getCenter`, `project`, `unproject`, `getBounds`, the camera targets, Marker, Popup and event
    `lngLat` speak geographic coordinates. Two things still hand the application map space:
-   `queryRenderedFeatures` geometry and `getStyle()` contents (plus `getMaxBounds`,
-   `calculateCameraOptionsFrom*` and deck.gl, documented). Inside the plugin the rule is the
-   reverse: the controller, camera and switcher call the **raw** methods captured before
-   wrapping, because a map-space value that reached a wrapper would be converted twice. Which
-   band a conversion uses matters: reads the shown band, targets the camera's baseline band
-   after a stop, `fitBounds` solves across bands. The bare `geographicToMap` /
+   `queryRenderedFeatures` (and `querySourceFeatures`) geometry and `getStyle()` contents
+   (plus `getMaxBounds`, `calculateCameraOptionsFrom*` and deck.gl, documented). Inside the
+   plugin the rule is the reverse: the controller, camera and switcher call the **raw** methods
+   captured before wrapping, because a map-space value that reached a wrapper would be converted
+   twice. Which band a conversion uses matters: reads the shown band, targets the camera's
+   baseline band after a stop, `fitBounds` solves across bands. The bare `geographicToMap` /
    `mapToGeographic` default to blend 0 and are right only for pure `equal-earth`.
 2. **Equal Earth and globe are mutually exclusive.** Globe treats lng/lat as real geodetic
    coordinates, so warped input renders as a distorted sphere. The plugin disengages under globe.
@@ -127,7 +127,12 @@ affects the absolute metre values from `toEqualEarth`.
 - `src/math/equal-earth.ts` — forward/inverse Equal Earth, implemented directly from
   Šavrič/Patterson/Jenny. Deliberately **not** proj4: it runs per-vertex per tile in a worker,
   and `proj4.defs` mutates a shared singleton that a host app may also be using. Dropping it
-  took the bundle from ~128 kB to 3.4 kB.
+  took the projection maths from ~128 kB (proj4) to 3.4 kB. Measured after the Plan 3 fix wave
+  (Vite's report): `dist/index.js` 142.7 kB (39.8 kB gzip), `dist/worker.mjs` 62.3 kB (16.2 kB),
+  `dist/worker.iife.js` 46.4 kB (14.1 kB). Most of the main entry is the tile pipeline (decode,
+  densify, warp, clip, encode), which `index.ts` exports and `install.ts` needs for the
+  main-thread fallback; a dynamic `import()` in that fallback alone would not shrink it while the
+  entry re-exports the pipeline.
 - `src/math/backproject.ts` — the warp, `GRID_FACTOR`, and Web Mercator helpers.
 - `src/math/subdivide.ts` — adaptive densification, and `geographicToMapWorld`'s tolerance
   helper.
@@ -164,8 +169,14 @@ affects the absolute metre values from `toEqualEarth`.
   `setStyle(url)` in flight is never aborted. The `layers` of `queryRenderedFeatures` expand an
   application id to every live layer drawing it (R26): under `equal` the id alone is the
   Mercator band's layer, out of range in every Equal Earth band, and MapLibre's layer-scoped
-  listeners query exactly those ids, so they would fall silent at world zoom. At ~2200 lines, the live-edit machinery is the
-  part to extract if it grows.
+  listeners query exactly those ids, so they would fall silent at world zoom. Feature state fans
+  out the same way (I2): `setFeatureState`/`removeFeatureState` on an original source (or a
+  copy's id, a rendered feature's `source`) reach it and every live band copy, `getFeatureState`
+  and `querySourceFeatures(originalId)` read the band shown, and band sources a later apply or
+  amend creates anew are seeded from the original source's own state (MapLibre empties it when
+  the application's style replaces that source). An amend MapLibre refuses rolls the original
+  back to what the live style last took (M1). At ~2500 lines, the live-edit machinery is the
+  part to extract next (`live-edits.ts`, deferred after merge).
 - `src/map/cartography.ts` — pure: the world polygon, its outline and the graticule at a blend
   (spec §5); `style-rewrite.ts` turns them into generated `equal-earth:*` sources and layers.
   The base layers (background copies, world polygon) are held through a band switch rather than

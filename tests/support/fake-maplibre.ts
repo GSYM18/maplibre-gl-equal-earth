@@ -616,6 +616,13 @@ function setOrDelete(target: Record<string, unknown>, key: string, value: unknow
   else target[key] = structuredClone(value);
 }
 
+/** MapLibre's `FeatureIdentifier`, as the feature-state methods take it. */
+export interface FeatureTarget {
+  source: string;
+  sourceLayer?: string;
+  id?: string | number;
+}
+
 /** What `jumpTo` accepts on a controller host: a `LngLat`-like centre as well as a tuple. */
 export type ControllerJump = Omit<Frame, 'center'> & { center?: readonly [number, number] | LngLat };
 
@@ -928,6 +935,87 @@ export class FakeControllerHost extends FakeV6Map {
     const layer = this.#layerFor(layerId);
     if (layer && !this.#invalid(layerId, filter)) setOrDelete(layer, 'filter', filter ?? undefined);
     return this;
+  }
+
+  /**
+   * Feature state by source object (`TileManager._state`): a source the diff replaces or removes
+   * loses it, one it keeps unchanged keeps it. Keyed `<sourceLayer>/<id>`, `''` for no layer.
+   */
+  readonly #featureStates = new WeakMap<object, Map<string, Record<string, unknown>>>();
+  /** Every `querySourceFeatures` call's source id, in order. */
+  readonly queriedSources: string[] = [];
+
+  #styleError(message: string): void {
+    this.styleErrors.push(message);
+    this.fire({ type: 'error', error: new Error(message) });
+  }
+
+  /** `Style.setFeatureState`/`removeFeatureState`/`getFeatureState`'s checks (`style/style.ts:1374`). */
+  #featureStore(target: FeatureTarget, kind: 'set' | 'remove' | 'get'): { store: Map<string, Record<string, unknown>>; layer: string } | undefined {
+    if (!this.style) throw new Error('Style is not done loading.');
+    const source = this.getSource(target.source);
+    if (!source) {
+      this.#styleError(`The source '${target.source}' does not exist in the map's style.`);
+      return undefined;
+    }
+    if (kind === 'set' && source.type === 'geojson' && target.sourceLayer) {
+      this.#styleError('GeoJSON sources cannot have a sourceLayer parameter.');
+      return undefined;
+    }
+    if (source.type === 'vector' && !target.sourceLayer) {
+      this.#styleError('The sourceLayer parameter must be provided for vector source types.');
+      return undefined;
+    }
+    if (kind !== 'remove' && target.id === undefined) {
+      this.#styleError('The feature id parameter must be provided.');
+      return undefined;
+    }
+    let store = this.#featureStates.get(source);
+    if (!store) {
+      store = new Map();
+      this.#featureStates.set(source, store);
+    }
+    const layer = kind === 'remove' && source.type !== 'vector' ? '' : (target.sourceLayer ?? '');
+    return { store, layer };
+  }
+
+  setFeatureState(target: FeatureTarget, state: Record<string, unknown>): this {
+    this.edits.push({ method: 'setFeatureState', args: [structuredClone(target), structuredClone(state)] });
+    const found = this.#featureStore(target, 'set');
+    if (!found) return this;
+    const key = `${found.layer}/${String(target.id)}`;
+    found.store.set(key, { ...found.store.get(key), ...state });
+    return this;
+  }
+
+  removeFeatureState(target: FeatureTarget, key?: string): this {
+    this.edits.push({ method: 'removeFeatureState', args: [structuredClone(target), key] });
+    const found = this.#featureStore(target, 'remove');
+    if (!found) return this;
+    if (key && typeof target.id !== 'string' && typeof target.id !== 'number') {
+      this.#styleError('A feature id is required to remove its specific state property.');
+      return this;
+    }
+    const { store, layer } = found;
+    if (target.id === undefined) {
+      for (const stored of [...store.keys()]) if (stored.startsWith(`${layer}/`)) store.delete(stored);
+    } else if (key) {
+      delete store.get(`${layer}/${String(target.id)}`)?.[key];
+    } else {
+      store.delete(`${layer}/${String(target.id)}`);
+    }
+    return this;
+  }
+
+  getFeatureState(target: FeatureTarget): Record<string, unknown> | undefined {
+    const found = this.#featureStore(target, 'get');
+    return found ? { ...found.store.get(`${found.layer}/${String(target.id)}`) } : undefined;
+  }
+
+  /** `Style.querySourceFeatures`: no features for a source the style lacks; here one stand-in feature otherwise. */
+  querySourceFeatures(sourceId: string, parameters?: { sourceLayer?: string }): { source: string; sourceLayer?: string }[] {
+    this.queriedSources.push(sourceId);
+    return this.getSource(sourceId) ? [{ source: sourceId, ...(parameters?.sourceLayer ? { sourceLayer: parameters.sourceLayer } : {}) }] : [];
   }
 
   /** `Style.setLayerZoomRange`: an absent (`null` or `undefined`) bound is left as it is. */
