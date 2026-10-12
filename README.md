@@ -231,12 +231,27 @@ Like a native `addLayer`, none of this fires `style.load`, and neither does swit
 projection on or off, as with a native `setProjection`: a `style.load` listener that re-adds its
 layers runs once for each `setStyle` of yours and for nothing else.
 
-Under pure Equal Earth (and outside the Mercator band's zoom range) only the copies exist.
-`getLayer(id)`, `getPaintProperty`, `getLayoutProperty`, `getFilter` and the `layers` of
-`queryRenderedFeatures` then read your id as the copy the shown band draws, so the usual
-`if (!map.getLayer(id)) map.addLayer(…)` guard and layer-scoped listeners
-(`map.on('click', id, …)`) keep working. The layer `getLayer` returns is that copy: its `id` is
-`<id>__b<k>`.
+**Layer ids work in every band.** Id-scoped queries and events reach every layer that draws
+your id, under `equal` and `equal-earth` alike: the `layers` of `queryRenderedFeatures`, and
+with them layer-scoped listeners (`map.on('click', id, …)`, `mouseenter`, `mouseleave`). The
+features they return carry the id of the layer that drew them, which in an Equal Earth band is
+the copy, `feature.layer.id === '<id>__b<k>'` (and `feature.source` is `<source>__b<k>`).
+Compare through `originalLayerId`, which strips the copy suffix and is the identity for any
+other id, rather than relying on the naming:
+
+```js
+import { originalLayerId } from '@yellowmap/maplibre-gl-equal-earth';
+
+map.on('click', (e) => {
+  const hit = map.queryRenderedFeatures(e.point).find((f) => originalLayerId(f.layer.id) === 'poi');
+});
+```
+
+Under pure Equal Earth only the copies exist; `getLayer(id)`, `getPaintProperty`,
+`getLayoutProperty` and `getFilter` then read your id as the copy the shown band draws, so the
+usual `if (!map.getLayer(id)) map.addLayer(…)` guard keeps working. The layer `getLayer`
+returns is that copy: its `id` is `<id>__b<k>`. Under `equal` your id itself is the Mercator
+band's layer (when that band draws it), which `getLayer` returns.
 
 `setLayerZoomRange` and `moveLayer` are not fanned out: they reach only the layer under your id
 (the Mercator band's), and the next such diff or the deactivation undoes them.
@@ -445,15 +460,17 @@ URL parameters:
 | `zoomOffset=<n>` | `sourceZoomOffset`. |
 
 The readout logs every band switch, how long it was held, the geographic centre, any error
-(a style or TileJSON that cannot be loaded shows there), and `first paint: <ms> ms`: the time
-from the page's module starting to the first `idle` with the initial projection shown,
-recorded as the `performance` marks `eqe:start`, `eqe:installed`, `eqe:active` and
-`eqe:first-idle` and exposed as `window.__eqe.firstPaintMs`.
+(a style or TileJSON that cannot be loaded shows there, key elided), and
+`first paint: <ms> ms`: the time from the page's module starting to the first `idle` with the
+initial projection shown, recorded as the `performance` marks `eqe:start`, `eqe:installed`,
+`eqe:active` and `eqe:first-idle` and exposed as `window.__eqe.firstPaintMs`. It starts at the
+module, not at navigation: loading the HTML and the page's own code comes before it.
 
 **SmartMaps, or your own style.** Paste the style URL, its `?key=` included, into the panel's
 "your style" field, or put it in the address URL-encoded:
 `/demo/transition.html?style=<SmartMaps style URL including ?key=…, URL-encoded>`. The readout
-shows the style URL with the key elided. No style URL or key is part of this repository.
+and its error lines show URLs with the key elided, and so does the probes' output. No style
+URL or key is part of this repository.
 
 `npm run probe:transition` and `npm run probe:first-paint` are developer tools, not part of
 `npm run verify`. Both drive the demo in headless Chrome and need Node ≥ 22, local Chrome
@@ -473,8 +490,9 @@ another port).
 - `probe:first-paint` measures the demo's first paint at 1280×800 and 50 Mbit/s (20 ms
   latency) in a fresh profile, cold (HTTP cache disabled, Cache Storage cleared), warm
   (reloaded with both caches), and cold again with only the page's code cached. It prints each
-  against the budgets (4 s cold, 1.5 s warm) with the place labels placed and the bytes
-  received by kind. `--style <url>` and `--zoom-offset=<n>` pass `style` and `zoomOffset` on.
+  against the budgets (4 s cold, 1.5 s warm), with the marks' times, the first idle's time
+  after navigation start, the place labels placed and the bytes received by kind. `--style
+  <url>` and `--zoom-offset=<n>` pass `style` and `zoomOffset` on.
 
   ```sh
   npm run probe:first-paint
@@ -488,7 +506,7 @@ pipeline, not of a user's GPU, and the switch hold times say nothing about real 
 
 The spec's budget is the world view at 1280×800 in ≤ 4 s cold at 50 Mbit/s and ≤ 1.5 s warm.
 Measured with `probe:first-paint` against `npm run dev` on OpenFreeMap Liberty (medians of three
-runs, SwiftShader):
+runs, SwiftShader; `firstPaintMs`, from the module's start):
 
 | `sourceZoomOffset` | cold | warm | cold, code cached | place labels placed |
 | --- | --- | --- | --- | --- |
@@ -498,7 +516,10 @@ runs, SwiftShader):
 The plain cold run misses at either offset, but mostly on the dev server's account: it serves
 MapLibre's worker modules unminified with inline source maps, once per worker with the cache
 off, about 23 MB that arrive before the plugin is even installed. With that code cached, the
-cold world view is drawn within budget at the default offset. The warm run misses on
+cold world view is drawn within budget at the default offset: 3.3 s from the module's start,
+and in a later run 2.8 s from it and 3.2 s from navigation start (the HTML and the page's code
+took 0.4 s from the cache). From navigation start the plain cold run took 11 s, 3.6 s of it
+before the module started. The warm run misses on
 SwiftShader with almost nothing fetched: style parsing, the rewrite and rendering on the CPU
 take most of it. `-1` would cut the tile bytes but more than halves the labels, so the default
 stays 0; whether to revisit the budget is an open product decision.
@@ -526,11 +547,10 @@ stays 0; whether to revisit the budget is an open product decision.
     fetched rejects and leaves the map in Mercator.
   - Each `setData` (and `updateData`) warps the whole source on the main thread once per Equal
     Earth band: a large GeoJSON stalls the page for that long.
-  - Under `{ type: 'equal' }` your source and layer ids name the Mercator band's copies. The
-    cluster API (`getSource(id).getClusterExpansionZoom`/`getClusterLeaves`) and layer-scoped
-    events on cluster layers (`map.on('click', 'clusters', …)`) therefore only see the Mercator
-    copy. In the Equal Earth bands, query without a layer id and call the cluster API on
-    `map.getSource(feature.source)`, the band copy the feature came from; its leaves are in
+  - Each band copy of a clustered source clusters on its own. The cluster API
+    (`getClusterExpansionZoom`, `getClusterLeaves`) must therefore be called on the copy the
+    clicked cluster came from, `map.getSource(feature.source)`, not on `getSource(id)` (under
+    `equal` that is the Mercator band's source, whose cluster ids differ). Its leaves are in
     map space.
 - **Style changes while active.** A new style passed to `setStyle` is followed: it becomes the
   new original and is rewritten. But `getStyle()` → modify → `setStyle()` hands back our
@@ -547,9 +567,9 @@ stays 0; whether to revisit the budget is an open product decision.
   activation still waiting for your fetch) and nothing of ours is left on it (no zoom bound of
   the rewrite) does the deactivation leave the live style and the fetch alone.
 - **`minzoom: 0` after deactivation.** MapLibre's style diff cannot take a zoom bound away, so a
-  layer the Mercator band bounded under its own id is restored with an explicit `minzoom: 0`
-  (`maxzoom: 24` likewise). It draws exactly as without the bound, but `getStyle()` then
-  reports `minzoom: 0` on layers that had none.
+  layer the Mercator band bounded under its own id is restored with an explicit `minzoom: 0`.
+  It draws exactly as without the bound, but `getStyle()` then reports `minzoom: 0` on layers
+  that had none.
 - **Sources.** Band sources inherit `attribution`, `minzoom` and `promoteId` from the original
   source, but not `bounds` (geographic bounds would cut off map-space tiles). TMS sources are
   rejected on activation.
@@ -578,6 +598,7 @@ stays 0; whether to revisit the budget is an open product decision.
 | `mapSpaceOf(lngLat, blend)` | Geographic → map space of a band at `blend`, world copies kept. |
 | `geographicToMap(lngLat, blend = 0)` | Geographic degrees → the map space of a band at `blend` (0 = pure Equal Earth). |
 | `mapToGeographic(lngLat, blend = 0)` | Map space of a band at `blend` → geographic degrees. |
+| `originalLayerId(id)` | The application's layer id behind a rendered one: `water__b2` → `water`. |
 | `graticule`, `worldOutline`, `worldPolygon` | The cartography's GeoJSON at a blend, in map space. |
 | `warpGeoJSON(data, blend, zoom)` | Clip, densify and warp GeoJSON into a band's map space. |
 | `BandCamera` | Lower level: the `transformCameraUpdate` hook across zoom bands, with compensation. `installEqualEarth` installs it. |
@@ -602,9 +623,9 @@ npm run verify   # lint, typecheck, unit tests, build, export guards, browser te
 
 `npm test` runs the unit tests (vitest, no browser). `npm run test:browser` runs the Playwright
 suite in headless Chromium with software WebGL, each spec against MapLibre 6.6 and 5.24 (a few
-are v6 only), on fixture tiles generated in memory: no network. It takes about six and a half minutes and needs
-a fresh build (`verify` builds first). `npm run build:js` refreshes only the bundles the demo and
-the browser tests load.
+are v6 only), on fixture tiles generated in memory: no network. It takes about six and a half
+minutes and needs a fresh build (`verify` builds first). `npm run build:js` refreshes only the
+bundles the demo and the browser tests load.
 
 ## Roadmap
 

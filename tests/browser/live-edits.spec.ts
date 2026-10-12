@@ -8,7 +8,7 @@
  */
 import type { Page } from '@playwright/test';
 
-import { centreOn, colourAt, expect, idle, openHarness, test } from './helpers.ts';
+import { centreOn, colourAt, expect, idle, openHarness, pixelOf, test } from './helpers.ts';
 
 const TOKYO: [number, number] = [139.69, 35.69]; // a fixture place
 
@@ -144,4 +144,24 @@ test("edits while the application's setStyle(url) fetches do not cancel it; the 
   await idle(page);
   expect(await page.evaluate(() => (window as unknown as { __loads: number }).__loads)).toBe(1);
   expect(await page.evaluate(() => window.__h.map.getStyle().layers.map((layer) => layer.id))).toEqual(['background', 'land', 'lines']);
+});
+
+test('under equal at z2, a layer-scoped click listener on a fixture layer fires, with the band copy as feature layer (R26)', async ({ page, mlv }) => {
+  await openHarness(page, { mlv, projection: 'equal' });
+  await centreOn(page, TOKYO, 2);
+  expect(await page.evaluate(() => window.__h.controller!.blend)).toBe(0); // an Equal Earth band, not Mercator
+  await page.evaluate(() => {
+    const kept = window as unknown as { __hits: string[] };
+    kept.__hits = [];
+    window.__h.map.on('click', 'places', (e) => {
+      kept.__hits.push(...(e.features ?? []).map((feature) => feature.layer.id));
+    });
+  });
+  const [x, y] = await pixelOf(page, TOKYO);
+  const box = (await page.locator('#map canvas').boundingBox())!;
+  await page.mouse.click(box.x + Math.round(x), box.y + Math.round(y));
+  await page.waitForFunction(() => (window as unknown as { __hits: string[] }).__hits.length > 0, undefined, { timeout: 5000 });
+  const hits = await page.evaluate(() => (window as unknown as { __hits: string[] }).__hits);
+  expect(hits.every((id) => /^places__b\d+$/.test(id)), hits.join()).toBe(true);
+  expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
 });

@@ -144,6 +144,15 @@ export function bandIndexWithHysteresis(
   return target;
 }
 
+/**
+ * The application's layer id behind a rendered layer id: a band copy `<id>__b<k>` names `<id>`,
+ * any other id names itself. For comparing `feature.layer.id` from `queryRenderedFeatures` or a
+ * layer listener against your own ids without depending on the copies' naming.
+ */
+export function originalLayerId(id: string): string {
+  return id.replace(/__b\d+$/, '');
+}
+
 /** Source id for band `band` of source `sourceId`: the original for Mercator, a suffix otherwise. */
 export function bandSourceId(sourceId: string, bands: readonly Band[], band: number): string {
   return bands[band]!.blend === 1 ? sourceId : `${sourceId}__b${band}`;

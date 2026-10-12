@@ -1620,6 +1620,31 @@ describe('live style edits (Task 9)', () => {
       expect(host.queriedLayers).toEqual([['water__b0'], ['water__b0']]);
     });
 
+    it("under equal, queryRenderedFeatures's layers reach every live copy of an original id, so a layer listener fires in every band (R26)", async () => {
+      const { host, controller } = setup(2);
+      await controller.activate('equal');
+      expect(controller.blend).toBe(0); // shown: b0, not the Mercator band
+      // The Mercator band keeps the original id, live but out of range here: alone it finds nothing.
+      expect(host.getLayer('water')).toBeDefined();
+      const live = ['water', ...[0, 1, 2, 3, 4, 5].map((k) => `water__b${k}`)].filter((id) => host.getLayer(id) !== undefined);
+      expect(live).toContain('water__b0');
+      const existing = ['water', 'nowhere'].filter((id) => host.getLayer(id));
+      host.queryRenderedFeatures([0, 0], { layers: existing });
+      host.queryRenderedFeatures({ layers: new Set(['water', 'water__b1', 'equal-earth:world__b0', 'nowhere']) });
+      expect(host.queriedLayers[0]!.slice().sort()).toEqual(live.slice().sort());
+      // A copy id, a plugin id and an unknown id pass unchanged; no id is queried twice.
+      expect(host.queriedLayers[1]!.slice().sort()).toEqual([...new Set([...live, 'water__b1', 'equal-earth:world__b0', 'nowhere'])].sort());
+    });
+
+    it('passes queryRenderedFeatures through untouched while inactive (R26)', async () => {
+      const { host, controller } = setup(2);
+      await controller.activate('equal');
+      await controller.deactivate();
+      const options = { layers: ['water'] };
+      host.queryRenderedFeatures([0, 0], options);
+      expect(host.queriedLayers.at(-1)).toEqual(['water']);
+    });
+
     it("refuses a layer id a plugin layer holds, without keeping it (R18)", async () => {
       const { host, controller } = setup();
       host.on('error', () => undefined);

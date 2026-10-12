@@ -6,6 +6,7 @@ import {
   bandIndexWithHysteresis,
   bandSourceId,
   continuousBlend,
+  originalLayerId,
   parseRange,
   resolveTransition,
 } from '../src/map/bands.js';
@@ -90,6 +91,17 @@ describe('bandIndexWithHysteresis', () => {
   it('is plain bandIndexForZoom when the zoom is more than one band away', () => {
     expect(bandIndexWithHysteresis(bands, 2, 4, 0.1)).toBe(bandIndexForZoom(bands, 2));
     expect(bandIndexWithHysteresis(bands, 9, 1, 0.1)).toBe(6);
+  });
+});
+
+describe('originalLayerId', () => {
+  it('names the application layer a band copy draws, and leaves other ids alone', () => {
+    expect(originalLayerId('water__b0')).toBe('water');
+    expect(originalLayerId('label_city__b12')).toBe('label_city');
+    expect(originalLayerId('water')).toBe('water');
+    expect(originalLayerId('a__b0__b3')).toBe('a__b0');
+    expect(originalLayerId('water__b')).toBe('water__b');
+    expect(originalLayerId('water__bx')).toBe('water__bx');
   });
 });
 
