@@ -283,8 +283,8 @@ await installEqualEarth(maplibregl, {
   could produce different tiles uses a new name, and the first worker to open it deletes every
   other `equal-earth-*` cache. Entries are keyed by a hash of the source's configuration,
   tile URL template and API key included, so a rotated key starts afresh rather than serving
-  tiles fetched with the old one. Expired entries are deleted in the background, and the cache
-  is capped at 2000 tiles. It needs a secure context (`https:` or `localhost`); without Cache
+  tiles fetched with the old one. Expired entries are deleted in the background, at most once a
+  day, and the cache is capped at 2000 tiles. It needs a secure context (`https:` or `localhost`); without Cache
   Storage it is skipped silently. To clear it:
 
   ```js

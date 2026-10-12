@@ -11,7 +11,9 @@ import {
   geographicCentreOffsetPx,
   idle,
   openHarness,
+  pixelDiff,
   test,
+  type PixelDiff,
 } from './helpers.ts';
 
 test('tiles are warped in the worker, not on the main thread', async ({ page, mlv }) => {
@@ -21,20 +23,40 @@ test('tiles are warped in the worker, not on the main thread', async ({ page, ml
   expect(state.errors).toEqual([]);
 });
 
+/** At most this many pixels may differ, by one level per channel, for MapLibre 5's globe only. */
+const V5_GLOBE_JITTER_PIXELS = 8;
+
 for (const projection of ['mercator', 'globe'] as const) {
   test(`${projection} renders pixel-identically with and without the plugin`, async ({ page, mlv }) => {
     // MapLibre 5's globe is not deterministic itself under SwiftShader: about one render in 20
     // differs by one level in one pixel, with or without the plugin (40 renders each measured).
-    // A difference the plugin causes is systematic and fails every attempt.
-    let without = '';
-    let withPlugin = '';
-    for (let attempt = 0; attempt < 3 && (attempt === 0 || withPlugin !== without); attempt++) {
+    // Each render with the plugin is compared against every render without it so far, and any
+    // exact match passes. A difference the plugin causes is systematic and matches none.
+    const plain: string[] = [];
+    const withPlugin: string[] = [];
+    for (let attempt = 0; attempt < 3; attempt++) {
       await openHarness(page, { mlv, plugin: false, projection });
-      without = await canvasDataUrl(page);
+      plain.push(await canvasDataUrl(page));
       await openHarness(page, { mlv, plugin: true, projection });
-      withPlugin = await canvasDataUrl(page);
+      withPlugin.push(await canvasDataUrl(page));
+      if (withPlugin.some((render) => plain.includes(render))) return;
     }
-    expect(withPlugin).toBe(without);
+    if (projection === 'globe' && mlv === 5) {
+      // Only there: the closest pair may differ by one level per channel on a handful of pixels.
+      let closest: PixelDiff = { pixels: Infinity, maxDelta: 255 };
+      for (const a of withPlugin) {
+        for (const b of plain) {
+          const diff = await pixelDiff(page, a, b);
+          if (diff.maxDelta < closest.maxDelta || (diff.maxDelta === closest.maxDelta && diff.pixels < closest.pixels)) closest = diff;
+        }
+      }
+      console.log(`v5 globe: no identical pair in 3 attempts; closest differs in ${closest.pixels} px by at most ${closest.maxDelta} level(s)`);
+      test.info().annotations.push({ type: 'v5-globe-jitter', description: `${closest.pixels} px, max ${closest.maxDelta} level(s)` });
+      expect(closest.maxDelta).toBeLessThanOrEqual(1);
+      expect(closest.pixels).toBeLessThanOrEqual(V5_GLOBE_JITTER_PIXELS);
+      return;
+    }
+    expect(withPlugin[0]).toBe(plain[0]);
   });
 }
 
