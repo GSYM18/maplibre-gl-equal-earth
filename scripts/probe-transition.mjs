@@ -30,7 +30,9 @@
  * the cold run filled now serves the world), then **cold, code cached**: the browser cache
  * cleared, primed with the page's code alone (an empty style), Cache Storage cleared, loaded
  * again (see the comment at that run for why). It prints `window.__eqe.firstPaintMs` of each
- * against the spec's budgets (4000 ms cold, 1500 ms warm), the place labels MapLibre
+ * against the spec's budgets (4000 ms cold, 1500 ms warm); that measure starts at the demo
+ * module (`eqe:start`), so the first idle's time after navigation start, which includes the HTML
+ * and the page's own code, is printed beside it. Also printed: the place labels MapLibre
  * placed (`queryRenderedFeatures` on the shown band's symbol layers whose `source-layer` is
  * `place`, after collision) and the bytes the page and its workers received. The page's
  * throttling also governs its workers' fetches (the install, which waits for the workers'
@@ -62,6 +64,9 @@ const { values: args } = parseArgs({
 const MAX_DRIFT_DEG = 1e-3;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 class ProbeFailure extends Error {}
+/** A URL as echoed: decoded, with the values of key-like query parameters elided (a `--style` key). */
+const shown = (href) => decodeURIComponent(href)
+  .replace(/([?&](?:key|apikey|api_key|access_token|token)=)[^&#\s'"()]*/gi, '$1…');
 const fail = (message) => {
   throw new ProbeFailure(message);
 };
@@ -205,7 +210,7 @@ async function transitionProbe({ send, evaluate, exceptions }) {
       await sleep(2000); // until the new document has replaced the failed one
       continue;
     }
-    if (Date.now() - loadStart > 180_000) fail(`${url.href} not ready after 180 s`);
+    if (Date.now() - loadStart > 180_000) fail(`${shown(url.href)} not ready after 180 s`);
     await sleep(250);
   }
   console.log(`page ready after ${((Date.now() - loadStart) / 1000).toFixed(1)} s`);
@@ -274,7 +279,7 @@ async function transitionProbe({ send, evaluate, exceptions }) {
   await idle();
   // The readout grows with every switch line and would end up under the wheel.
   await evaluate(`document.querySelector('.panel').style.visibility = 'hidden'`);
-  console.log(`${args.city} [${city.join(', ')}], ${url.search || '(defaults)'}, anchor ` +
+  console.log(`${args.city} [${city.join(', ')}], ${shown(url.search) || '(defaults)'}, anchor ` +
     `${anchor.join(',')} px: 12 wheel steps in, 12 out`);
 
   let maxDrift = 0;
@@ -455,7 +460,9 @@ async function firstPaintProbe({ send, evaluate, on, exceptions }) {
     const at = (name) => (result.marks[name] === undefined ? '–'
       : `${(result.marks[name] - result.marks.start).toFixed(0)} ms`);
     console.log(`  installed ${at('installed')}, active ${at('active')}, first idle ` +
-      `${at('first-idle')} after the module started`);
+      `${at('first-idle')} after the module started; the module started ` +
+      `${result.marks.start.toFixed(0)} ms and the first idle came ` +
+      `${result.marks['first-idle'].toFixed(0)} ms after navigation start`);
     console.log(`  z${result.zoom.toFixed(2)} b${result.band}, warped on: ${result.workerPath}; ` +
       `place labels placed ${result.place} ` +
       `(${result.distinct} distinct names), all symbols ${result.symbols}`);
@@ -483,7 +490,7 @@ async function firstPaintProbe({ send, evaluate, on, exceptions }) {
     return measure(label);
   };
 
-  console.log(`first paint: ${url.href}, 1280×800, 50 Mbit/s down, 20 ms latency`);
+  console.log(`first paint: ${shown(url.href)}, 1280×800, 50 Mbit/s down, 20 ms latency`);
   report('cold', await load('cold', url.href, { disableCache: true, clearStorage: true }));
   report('warm', await load('warm', undefined, { disableCache: false, clearStorage: false }));
 

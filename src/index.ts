@@ -62,6 +62,7 @@ export {
   bandIndexWithHysteresis,
   bandSourceId,
   continuousBlend,
+  originalLayerId,
   parseRange,
   resolveTransition,
   validateBands,

@@ -367,7 +367,9 @@ every output tile at z1 and z2 inside the Equal Earth rows, a fresh handler per 
 
 First paint (`npm run probe:first-paint` against `npm run dev`, headless Chrome 154 with
 SwiftShader, 1280×800, 50 Mbit/s and 20 ms latency, OpenFreeMap Liberty, the demo's world view
-at z1.32; three runs per offset, medians, in ms):
+at z1.32; three runs per offset, medians, in ms). The measure is the demo's `firstPaintMs`, from
+the module's start (`eqe:start`) to the first `idle`: it leaves out the HTML and the page's own
+code, which the spec's "performance.mark in the demo" cannot see either.
 
 | offset | cold | warm | cold, code cached | place labels placed |
 |---|---|---|---|---|
@@ -380,7 +382,11 @@ at z1.32; three runs per offset, medians, in ms):
   the module started. The map data is 1.8 MB of z1 tiles (4 tiles fetched once per worker) and
   0.9 MB of glyphs. With the page's code cached and everything else cold ("cold, code cached":
   the browser cache holding only what an empty style loads), the world view is drawn in 3.3 s
-  at offset 0, within budget; there the 4 tiles cost 0.44 MB.
+  from the module's start at offset 0, within budget; there the 4 tiles cost 0.44 MB. A later
+  single run printed the navigation-relative time too: 2.8 s from the module, 3.2 s from
+  navigation start (HTML and code from the cache took 0.4 s), still within budget. The plain
+  cold run, by contrast, took 11.0 s from navigation start, 3.6 s of it before the module
+  started.
 - **Warm misses 1.5 s with almost nothing fetched** (0.4 MB, the cache-busted worker bundle):
   the install ends at ~0.5 s, Equal Earth is active at ~1.8 s (style, TileJSON, rewrite of
   111 layers into the banded style, all on SwiftShader's CPU), the first idle follows ~1.3 s

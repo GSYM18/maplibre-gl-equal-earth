@@ -65,9 +65,12 @@ const oneOf = <T extends string>(name: string, values: readonly T[]): T | undefi
   const raw = params.get(name);
   return values.find((value) => value === raw);
 };
-/** A URL as shown on screen: the values of key-like query parameters are elided. */
-const redact = (url: string): string =>
-  url.replace(/([?&](?:key|apikey|api_key|access_token|token)=)[^&#]*/gi, '$1…');
+/**
+ * Text as shown on screen or handed to the probe: the values of key-like query parameters in any
+ * URL it contains are elided, so a screenshot or a probe log does not leak a style's API key.
+ */
+const redact = (text: string): string =>
+  text.replace(/([?&](?:key|apikey|api_key|access_token|token)=)[^&#\s'"()]*/gi, '$1…');
 
 const readout = document.getElementById('readout')!;
 const header: string[] = [];
@@ -91,7 +94,7 @@ const log = (line: string): void => {
 /** Show a fatal setup error where the user looks, then stop. */
 const fatal = (what: string, error: unknown): never => {
   console.error(error);
-  note(`FAILED to ${what}: ${error instanceof Error ? error.message : String(error)}`);
+  note(`FAILED to ${what}: ${redact(error instanceof Error ? error.message : String(error))}`);
   throw error;
 };
 
@@ -225,8 +228,8 @@ map.on('error', (event: { error?: unknown }) => {
   console.error(event.error);
   const error = event.error;
   const message = error instanceof Error ? error.message : String(error);
-  errors.push(message);
-  log(`ERROR ${message}`);
+  errors.push(redact(message));
+  log(`ERROR ${redact(message)}`);
 });
 
 // Exposed at once, so a probe sees errors (an unreachable style, say) before `ready`.

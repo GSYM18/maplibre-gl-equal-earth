@@ -63,7 +63,9 @@ kind, and exits 0 unless the page errors (2). Read its plain cold number with ca
 (~23 MB), which dominates; "cold, code cached" is the one that says something about the
 plugin (spec §6 has the measurement). Worker targets reject `emulateNetworkConditions`; the
 page's throttling governs their fetches, and they are auto-attached only for the cache setting
-and the byte count. A dev server started before `__EQE_VERSION__` was defined breaks the
+and the byte count. `firstPaintMs` starts at the module (`eqe:start`), so it leaves out the HTML
+and the page's own code; the probe also prints the first idle's time after navigation start. A
+dev server started before `__EQE_VERSION__` was defined breaks the
 main-thread fallback with a `ReferenceError`; restart it, or pass `--url` to your own.
 
 ESLint's type-aware rules are confined to `**/*.ts`. `no-undef` is off there (tsc covers it),
@@ -142,10 +144,11 @@ affects the absolute metre values from `toEqualEarth`.
   set through `setPaintProperty`, never `global-state`: MapLibre re-evaluates a transition's
   prior expression against the live state, so a `global-state` flip can never cross-fade.
   Symbol, hillshade and color-relief copies are also hidden by `visibility: "none"`
-  (`LayerGate.hideByVisibility`): transparent labels still collide, and a `basic` hillshade still tints
-  at exaggeration 0. `restorableStyle` prepares the original for the diffed restore: MapLibre's
-  `setLayerZoomRange` skips an absent bound, so a layer the Mercator band bounded under its own
-  id is restored with an explicit `minzoom: 0` (it would otherwise keep the band's minzoom).
+  (`LayerGate.hideByVisibility`): transparent labels still collide, and a `basic` hillshade
+  still tints at exaggeration 0. `restorableStyle` prepares the original for the diffed
+  restore: MapLibre's `setLayerZoomRange` skips an absent bound, so a layer the Mercator band
+  bounded under its own id is restored with an explicit `minzoom: 0` (it would otherwise keep
+  the band's minzoom).
   For the same reason the application's own `setStyle` while active inherits those bounds;
   `withoutRewriteBounds` drops them when the controller captures that style as the new original.
 - `src/map/switcher.ts` — `BandSwitcher`, the band selector: which band is *shown* is runtime
@@ -158,7 +161,10 @@ affects the absolute metre values from `toEqualEarth`.
   decides when it may tear down and re-install (C7), and the live-edit rules: the live style,
   told by a sentinel layer only the rewrite has, decides whether an edit follows the original;
   the plugin's own `setStyle` is silent, as a native `setProjection` is; an application
-  `setStyle(url)` in flight is never aborted. At ~2200 lines, the live-edit machinery is the
+  `setStyle(url)` in flight is never aborted. The `layers` of `queryRenderedFeatures` expand an
+  application id to every live layer drawing it (R26): under `equal` the id alone is the
+  Mercator band's layer, out of range in every Equal Earth band, and MapLibre's layer-scoped
+  listeners query exactly those ids, so they would fall silent at world zoom. At ~2200 lines, the live-edit machinery is the
   part to extract if it grows.
 - `src/map/cartography.ts` — pure: the world polygon, its outline and the graticule at a blend
   (spec §5); `style-rewrite.ts` turns them into generated `equal-earth:*` sources and layers.
@@ -359,11 +365,12 @@ mind before "optimising" anything here.
   against the old decode + geojson-vt path.
 - **The direct clip (`clip.ts`) replaced geojson-vt.** It matches geojson-vt per layer
   (feature counts, line lengths, ring areas) in a synthetic comparison in `tests/clip.test.ts`,
-  plus a one-off scratch check on real OpenFreeMap tiles; a committed real-tile fixture is
-  deferred to Plan 3 (Ruling P19). Ring areas differ only by buffer slivers, because vertices
-  are rounded before clipping. It does not wrap world copies into the buffer, which geojson-vt
-  did at z0–1. Build alone measured only 1.4–1.8× faster; the 2.5–5.5× end-to-end gain above
-  is the decode cache. The profile is dominated by the warp's projection maths (~40%:
+  plus a one-off scratch check on real OpenFreeMap tiles. A committed real-tile fixture (Ruling
+  P19) was not taken in Plan 3: OpenFreeMap tiles are ODbL, needing attribution in the repo, and
+  about 1 MB each; the browser seam scan on fixture tiles covers the visible risk. Ring areas
+  differ only by buffer slivers, because vertices are rounded before clipping. It does not wrap
+  world copies into the buffer, which geojson-vt did at z0–1. Build alone measured only
+  1.4–1.8× faster; the 2.5–5.5× end-to-end gain above is the decode cache. The profile is dominated by the warp's projection maths (~40%:
   `toEqualEarth` runs twice per vertex, and map-space lng/lat makes a Mercator round trip),
   then vt-pbf's property encoding (~17%; OpenFreeMap features carry ~80 `name:*` tags),
   densify (~10%) and the clip itself (~10%).
@@ -396,8 +403,8 @@ lat 0 of fixture land box 1) reads every device pixel of a rectangle inside the 
 outline (6 px margin, 126k to 744k pixels per case) at z2/z3/z4, dpr 1 and 2, MapLibre 5.24 and
 6.6, and counts each pixel that is not the land colour within 8/255, so antialiased blends count
 too. Result: 0 everywhere, and a self-test that paints a 1 px background row into the scanned
-copy proves the scan sees such a seam. So `fill-antialias: false` is not applied. Polygon vertices on Mercator's
-edge are snapped to ±90° in `decodeToGeographic`.
+copy proves the scan sees such a seam. So `fill-antialias: false` is not applied. Polygon
+vertices on Mercator's edge are snapped to ±90° in `decodeToGeographic`.
 
 ## Planned work
 

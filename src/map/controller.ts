@@ -100,10 +100,13 @@
  *   re-apply is found by the re-apply's second look at the live style, made again after every wait
  *   (a TileJSON, a GeoJSON URL). The application's `setStyle` is still tracked (R16, R20), and a
  *   rewrite without a sentinel decides by it.
- * - `getLayer`, `getPaintProperty`, `getLayoutProperty`, `getFilter` and the `layers` of
- *   `queryRenderedFeatures` read an original id that is not live (pure Equal Earth, or outside
- *   the Mercator band's range) as its copy in the band shown, else its first live copy (R18): the
- *   application's guards agree with what the wrappers accept and refuse.
+ * - `getLayer`, `getPaintProperty`, `getLayoutProperty` and `getFilter` read an original id that
+ *   is not live (pure Equal Earth, or a layer whose zoom range ends below the Mercator band) as
+ *   its copy in the band shown, else its first live copy (R18): the application's guards agree
+ *   with what the wrappers accept and refuse. The `layers` of `queryRenderedFeatures` expand an
+ *   original id to every live layer drawing it (R26): under `equal` the id itself is the Mercator
+ *   band's layer, out of range in every Equal Earth band, so it alone would find nothing there and
+ *   layer-scoped listeners would stay silent. Their features carry the copy's id (`<id>__b<k>`).
  *
  * The plugin's own writes and reads never pass through these wrappers (rule 4): the switcher's
  * gates and every call the controller makes use MapLibre's methods as found before wrapping.
@@ -1342,7 +1345,8 @@ export class EqualEarthController {
     // R16: the application's own `setStyle`; the plugin's calls use the raw one.
     restores.push(wrapMethod<Edit>(host, 'setStyle', () => (style, ...rest) => this.#appSetStyle(style, rest)));
     // R18: an original id that is not live reads as the copy shown, so that `getLayer` agrees
-    // with what the wrappers accept and refuse; `queryRenderedFeatures`'s `layers` alike.
+    // with what the wrappers accept and refuse; `queryRenderedFeatures`'s `layers` reach every
+    // live layer of an original id (R26).
     for (const name of LAYER_READS) {
       restores.push(wrapMethod<Edit>(host, name, () => (id, ...rest) => raw[name](this.#resolveId(id), ...rest)));
     }
@@ -1430,13 +1434,28 @@ export class EqualEarthController {
     return copies.find((copy) => shown !== undefined && copy === `${id}__b${shown}`) ?? copies[0] ?? id;
   }
 
-  /** `queryRenderedFeatures` arguments with the ids of `options.layers` resolved ({@link #resolveId}). */
+  /**
+   * `queryRenderedFeatures` arguments with each original id of `options.layers` expanded to every
+   * live layer drawing it: its band copies and, under `equal`, the Mercator band's layer under the
+   * id itself (R26). The id alone would find nothing below the Mercator band, where that layer is
+   * out of range, and a layer-scoped listener (MapLibre's delegated `on('click', id, …)` queries
+   * exactly these ids) would stay silent. Only rendered features come back, so the copies of bands
+   * not shown add nothing but a fading band's. Copy ids, plugin ids and unknown ids pass unchanged;
+   * an original id with no live layer stays as it was, so MapLibre reports it as natively.
+   */
   #resolveQuery(args: unknown[]): unknown[] {
     const at = args.findIndex((arg) => isRecord(arg) && 'layers' in arg);
     const options = args[at] as Record<string, unknown> | undefined;
     const layers = options?.['layers'];
-    if (!options || !(Array.isArray(layers) || layers instanceof Set) || !this.#following()) return args;
-    const resolved = [...(layers as Iterable<unknown>)].map((id) => this.#resolveId(id));
+    const original = this.#following();
+    if (!options || !(Array.isArray(layers) || layers instanceof Set) || !original) return args;
+    const originals = new Set(original.layers.map((layer) => layer.id));
+    const expanded = [...(layers as Iterable<unknown>)].flatMap((id) => {
+      if (typeof id !== 'string' || !originals.has(id)) return [id];
+      const live = this.#liveCopies(id);
+      return live.length > 0 ? live : [id];
+    });
+    const resolved = [...new Set(expanded)];
     const copy = [...args];
     copy[at] = { ...options, layers: layers instanceof Set ? new Set(resolved) : resolved };
     return copy;
