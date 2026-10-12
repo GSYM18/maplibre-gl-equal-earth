@@ -15,6 +15,14 @@
  * config, the upstream template and any API key in it included, so rotating a key starts a fresh
  * namespace and the key itself is never stored in plain text. Each entry carries its expiry in an
  * `x-eqe-expires` header; an expired entry is a miss and is deleted.
+ *
+ * The version is a build id (Ruling R25, `scripts/build-id.ts`): `<package version>+<hash of the
+ * worker's sources>`, so a code change that alters the tiles never meets the old ones.
+ *
+ * Namespaces nothing reads again (a rotated or per-session API key) would never be looked up, so
+ * their entries would never expire by lookup. So once per instance, after opening, a background
+ * sweep deletes every expired entry and caps the cache at {@link MAX_ENTRIES}, evicting the
+ * earliest-expiring first (Ruling R25). It never delays `get` or `put`, never rejects, never logs.
  */
 
 import type { EqualEarthSourceConfig } from './protocol.js';
@@ -39,12 +47,17 @@ export interface CacheLike {
   match(key: string): Promise<Response | undefined>;
   put(key: string, response: Response): Promise<void>;
   delete(key: string): Promise<boolean>;
+  /** The stored requests, as `Cache.keys()` returns them (a URL string is accepted too). */
+  keys(): Promise<readonly (string | { readonly url: string })[]>;
 }
 
 export const CACHE_NAME_PREFIX = 'equal-earth-';
 
 export const DEFAULT_PERSISTENT_MAX_ZOOM = 3;
 export const DEFAULT_PERSISTENT_TTL_DAYS = 7;
+
+/** The sweep's cap per cache: ~2000 low-zoom tiles is several world views' worth at z0–3. */
+export const MAX_ENTRIES = 2000;
 
 const EXPIRES_HEADER = 'x-eqe-expires';
 const DAY_MS = 86_400_000;
@@ -82,7 +95,7 @@ export class PersistentTileCache {
       const cache = await this.#open();
       const response = await cache?.match(key);
       if (!cache || !response) return undefined;
-      const expires = Number(response.headers.get(EXPIRES_HEADER));
+      const expires = expiresOf(response);
       // A missing or unreadable expiry is treated as expired.
       if (!(this.#now() <= expires)) {
         await cache.delete(key);
@@ -94,8 +107,9 @@ export class PersistentTileCache {
     }
   }
 
-  /** Never rejects; stores with an `x-eqe-expires` header. */
+  /** Never rejects; stores with an `x-eqe-expires` header. A `ttlDays` of 0 or less stores nothing. */
   async put(key: string, data: ArrayBuffer, ttlDays: number): Promise<void> {
+    if (!(ttlDays > 0)) return;
     try {
       const cache = await this.#open();
       if (!cache) return;
@@ -125,12 +139,40 @@ export class PersistentTileCache {
     } catch {
       // Leftovers of an old version only cost storage; this version's cache still works.
     }
+    let cache: CacheLike;
     try {
-      return await storage.open(this.#name);
+      cache = await storage.open(this.#name);
     } catch {
       return undefined;
     }
+    void this.#sweep(cache);
+    return cache;
   }
+
+  /** Delete expired entries, then evict the earliest-expiring beyond {@link MAX_ENTRIES}. */
+  async #sweep(cache: CacheLike): Promise<void> {
+    try {
+      const now = this.#now();
+      const live: { key: string; expires: number }[] = [];
+      for (const request of await cache.keys()) {
+        const key = typeof request === 'string' ? request : request.url;
+        const expires = expiresOf(await cache.match(key));
+        if (now <= expires) live.push({ key, expires });
+        else await cache.delete(key);
+      }
+      if (live.length <= MAX_ENTRIES) return;
+      live.sort((a, b) => a.expires - b.expires);
+      for (const { key } of live.slice(0, live.length - MAX_ENTRIES)) await cache.delete(key);
+    } catch {
+      // Storage that fails here fails for get and put too, which treat it as a miss.
+    }
+  }
+}
+
+/** An entry's expiry; `NaN` (expired by every comparison) when it has none or it is unreadable. */
+function expiresOf(response: Response | undefined): number {
+  const header = response?.headers.get(EXPIRES_HEADER);
+  return header === null || header === undefined || header === '' ? NaN : Number(header);
 }
 
 /** JSON with object keys sorted at every level, and `undefined` members dropped as `JSON.stringify` does. */

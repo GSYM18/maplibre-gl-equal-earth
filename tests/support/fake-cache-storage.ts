@@ -19,6 +19,11 @@ export class FakeCache implements CacheLike {
   delete(key: string): Promise<boolean> {
     return Promise.resolve(this.entries.delete(key));
   }
+
+  /** As `Cache.keys()`, which resolves to `Request`s: objects with a `url`. */
+  keys(): Promise<readonly { url: string }[]> {
+    return Promise.resolve([...this.entries.keys()].map((url) => ({ url })));
+  }
 }
 
 export class FakeCacheStorage implements CacheStorageLike {

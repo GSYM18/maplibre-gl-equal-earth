@@ -13,16 +13,16 @@
  * entry of the library build. `scripts/check-worker-bundles.mjs` guards both outputs.
  */
 
-import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 
+import { eqeVersion } from './scripts/build-id.ts';
+
 const resolveFromRoot = (path: string) => fileURLToPath(new URL(path, import.meta.url));
-const { version } = JSON.parse(readFileSync(resolveFromRoot('package.json'), 'utf8')) as { version: string };
 
 export default defineConfig({
-  // Names the persistent tile cache the worker keeps (src/types/vendor.d.ts).
-  define: { __EQE_VERSION__: JSON.stringify(version) },
+  // Names the persistent tile cache the worker keeps (src/types/vendor.d.ts, Ruling R25).
+  define: { __EQE_VERSION__: JSON.stringify(eqeVersion()) },
   build: {
     target: 'es2022',
     sourcemap: true,
