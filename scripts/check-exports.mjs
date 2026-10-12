@@ -4,7 +4,7 @@
  * existed while omitting two that did. Nothing detected it for two years.
  *
  * Compares the runtime exports of both built bundles against the value exports declared in
- * `src/index.ts`: the ESM `dist/index.js`, and the UMD `dist/maplibre-gl-equal-earth.umd.js`
+ * `src/index.ts`: the ESM `dist/index.js`, and the UMD `dist/maplibre-gl-equal-earth.umd.min.js`
  * evaluated as a classic `<script>` would, through the `maplibreglEqualEarth` global it
  * defines. For the UMD it also checks the default worker URL resolves next to the loading
  * script (vite.umd.config.ts). Run after `npm run build`.
@@ -80,7 +80,7 @@ const esmExports = new Set(Object.keys(bundle).filter((key) => key !== 'default'
  * is what the bundle's `import.meta.url` stands in for (the worker URL's base).
  */
 async function umdExports() {
-  const umdUrl = new URL('dist/maplibre-gl-equal-earth.umd.js', repoRoot);
+  const umdUrl = new URL('dist/maplibre-gl-equal-earth.umd.min.js', repoRoot);
   let source;
   try {
     source = readFileSync(umdUrl, 'utf8');
@@ -88,7 +88,7 @@ async function umdExports() {
     console.error(`check-exports: missing ${fileURLToPath(umdUrl)}. Run \`npm run build\` first.`);
     return null;
   }
-  const script = { tagName: 'SCRIPT', src: 'https://cdn.example/eqe/maplibre-gl-equal-earth.umd.js' };
+  const script = { tagName: 'SCRIPT', src: 'https://cdn.example/eqe/maplibre-gl-equal-earth.umd.min.js' };
   const context = vm.createContext({
     document: { currentScript: script, baseURI: 'https://app.example/' },
     console,
@@ -98,7 +98,7 @@ async function umdExports() {
   context.self = context;
   context.window = context;
   try {
-    vm.runInContext(source, context, { filename: 'maplibre-gl-equal-earth.umd.js' });
+    vm.runInContext(source, context, { filename: 'maplibre-gl-equal-earth.umd.min.js' });
   } catch (error) {
     console.error('check-exports: the UMD bundle threw when evaluated as a classic script.');
     console.error(error);
@@ -164,7 +164,7 @@ async function umdWorkerUrlsResolve(global, scriptDir) {
 
 const umd = await umdExports();
 const esmOk = compare('dist/index.js', esmExports);
-const umdOk = umd !== null && compare('dist/maplibre-gl-equal-earth.umd.js', umd);
+const umdOk = umd !== null && compare('dist/maplibre-gl-equal-earth.umd.min.js', umd);
 if (!esmOk || !umdOk) process.exit(1);
 
 console.log(`check-exports: ${esmExports.size} exports of the ESM and UMD bundles match src/index.ts.`);

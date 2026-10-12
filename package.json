@@ -28,7 +28,7 @@
   "sideEffects": [
     "./dist/worker.mjs",
     "./dist/worker.iife.js",
-    "./dist/maplibre-gl-equal-earth.umd.js"
+    "./dist/maplibre-gl-equal-earth.umd.min.js"
   ],
   "types": "./dist/index.d.ts",
   "main": "./dist/index.js",
@@ -45,7 +45,7 @@
       "default": "./dist/worker.mjs"
     },
     "./worker.iife.js": "./dist/worker.iife.js",
-    "./umd": "./dist/maplibre-gl-equal-earth.umd.js",
+    "./umd": "./dist/maplibre-gl-equal-earth.umd.min.js",
     "./package.json": "./package.json"
   },
   "files": [

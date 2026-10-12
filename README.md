@@ -23,7 +23,7 @@ npm install @yellowmap/maplibre-gl-equal-earth maplibre-gl
 ```
 
 ESM (`dist/index.js`) for bundlers and `<script type="module">`, and UMD
-(`dist/maplibre-gl-equal-earth.umd.js`) for a classic `<script>` tag. The peer range is
+(`dist/maplibre-gl-equal-earth.umd.min.js`) for a classic `<script>` tag. The peer range is
 `maplibre-gl >=5.24 <7`. The demo runs on v6; the browser test suite runs every scenario on
 MapLibre 5.24 and 6.6.
 
@@ -34,7 +34,7 @@ Load MapLibre first, then the UMD file, which defines the global `maplibreglEqua
 ```html
 <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" />
 <script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
-<script src="https://unpkg.com/@yellowmap/maplibre-gl-equal-earth@1.0.0-alpha.1/dist/maplibre-gl-equal-earth.umd.js"></script>
+<script src="https://unpkg.com/@yellowmap/maplibre-gl-equal-earth@1.0.0-alpha.1/dist/maplibre-gl-equal-earth.umd.min.js"></script>
 <script>
   maplibreglEqualEarth.installEqualEarth(maplibregl).then(() => {
     const map = new maplibregl.Map({ container: 'map', style: '…', center: [10, 20], zoom: 1.3 });
@@ -487,7 +487,14 @@ Run `npm run demo`: it builds the bundles (the demo loads the built `dist/worker
 opens <http://localhost:5173/demo/transition.html> on Vite's dev server; `npm run build:js`
 then `npm run dev` does the same by hand. The demo pages are TypeScript compiled by Vite on the
 fly, so another static server (VS Code Live Server, `npx serve`) cannot run them: it sends `.ts`
-as `video/mp2t`, which the browser refuses, and the page says so. The page starts on the whole world, with the
+as `video/mp2t`, which the browser refuses, and the page says so.
+
+`demo/umd.html` is the exception: plain HTML using the [UMD bundle](#without-a-bundler) as a
+page without a bundler would, MapLibre from unpkg and the plugin from the local
+`dist/maplibre-gl-equal-earth.umd.min.js`. After `npm run build:js` any static server rooted at
+the repository runs it (<http://localhost:5173/demo/umd.html> under `npm run dev`). `?mlv=6`
+switches to MapLibre 6, `?style=` and `?projection=` work as above; the readout says whether
+the tiles are warped in the worker. The page starts on the whole world, with the
 `EqualEarthControl` top right, buttons that jump to five cities, and presets in the panel. Its
 URL parameters:
 
