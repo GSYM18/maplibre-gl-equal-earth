@@ -1921,22 +1921,24 @@ describe('live style edits (Task 9)', () => {
       expect(host.setStyleCalls.at(-1)!.layers).toBeGreaterThan(0); // the restore, not the old URL
     });
 
-    it("a restore that must set a style asks again for a setStyle(url) the application made before activating (R22)", async () => {
+    it("a restore over a live style that is not ours lifts zoom bounds in place, leaving the application's setStyle(url) running (R22, 4c)", async () => {
       const { host, controller } = setup();
       host.on('error', () => undefined);
       host.setStyle(BASEMAP_URL);
+      const request = host._diffStyleRequest!;
       const pending = controller.activate('equal');
       pending.catch(() => undefined);
       await tick();
       await tick();
-      // Stands in for anything on the live style the restore must undo (the application's
-      // `setLayerZoomRange`, which is not followed): the restore sets a style, aborting the fetch.
+      const styles = host.setStyleCalls.length;
+      // Stands in for a zoom bound on the live style the original lacks (one our rewrite left
+      // behind, here set by hand): taken away with `setLayerZoomRange`, not with a `setStyle`.
       host.style!.layers.find((l) => l.id === 'water')!.minzoom = 3;
       await controller.deactivate();
-      const again = host._diffStyleRequest;
-      expect(again).not.toBeNull();
-      expect(again!.signal.aborted).toBe(false);
-      expect(host.setStyleCalls.at(-1)).toEqual({ layers: -1, diff: undefined });
+      expect(host.setStyleCalls).toHaveLength(styles);
+      expect(host._diffStyleRequest).toBe(request);
+      expect(request.signal.aborted).toBe(false);
+      expect(layerOf(host, 'water')!.minzoom ?? 0).toBe(0);
       host.resolveStyleRequest(basemap());
       expect(ids(host.style!)).toEqual(ids(basemap()));
     });
@@ -1972,6 +1974,158 @@ describe('live style edits (Task 9)', () => {
       await controller.deactivate();
       expect(host.beforeSetStyle).toBeUndefined();
       expect(loads).toBe(1);
+    });
+
+    describe('final review fixes (R27)', () => {
+      /** A map without `_diffStyleRequest`: the controller's bookkeeping alone tells a URL's fetch. */
+      class NoRequestHost extends FakeControllerHost {
+        constructor(center: readonly [number, number], zoom: number) {
+          super(center, zoom);
+          this.#drop();
+        }
+        #drop(): void {
+          delete (this as { _diffStyleRequest?: unknown })._diffStyleRequest;
+        }
+        override setStyle(style: StyleLike | string, options?: { diff?: boolean }): this {
+          super.setStyle(style, options);
+          this.#drop();
+          return this;
+        }
+      }
+
+      it("an error event of a tile or a source does not end the wait for the application's style (M2)", async () => {
+        const host = new NoRequestHost(TOKYO, 4.6);
+        host.style = liberty();
+        const controller = new EqualEarthController(host, { lngLatFactory, lngLatBoundsFactory, fetchJson: async () => TILEJSON });
+        host.on('error', () => undefined);
+        await controller.activate('equal');
+        expect('_diffStyleRequest' in host).toBe(false);
+        host.setStyle(BASEMAP_URL);
+        host.addLayer(extra('extra'));
+        await tick();
+        const styles = host.setStyleCalls.length;
+        // A tile of some source failed to load while the application's style is out (MapLibre's
+        // tile errors carry `sourceId` and `tile`): it says nothing about that style.
+        const tileError = { type: 'error', error: new Error('tile failed'), sourceId: 'openmaptiles', tile: {} };
+        host.fire(tileError);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        expect(host.setStyleCalls).toHaveLength(styles); // no amend: it would have aborted the fetch
+        expect(layerOf(host, 'extra__b1')).toBeUndefined();
+        host.fire({ type: 'error', error: new Error('style fetch failed') }); // the style's own failure
+        await vi.waitFor(() => expect(layerOf(host, 'extra__b1')).toBeDefined());
+      });
+
+      it('an invalid background value under pure Equal Earth is refused as natively and poisons nothing (M1)', async () => {
+        const { host, controller } = setup(2);
+        host.on('error', () => undefined);
+        await controller.activate('equal-earth');
+        const colour = liberty().layers.find((l) => l.id === 'background')!.paint!['background-color'];
+        host.setPaintProperty('background', 'background-color', 'invalid');
+        await tick();
+        expect(host.styleErrors).toHaveLength(1); // one refusal, as without the plugin
+        expect(layerOf(host, 'equal-earth:world__b0')!.paint!['fill-color']).toBe(colour);
+        host.addLayer(extra('extra'));
+        await tick();
+        expect(layerOf(host, 'extra__b0')).toBeDefined(); // later amends are not refused
+        await controller.deactivate();
+        expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeUndefined(); // restored
+        expect(layerOf(host, 'background')!.paint!['background-color']).toBe(colour);
+        expect(host.styleErrors).toHaveLength(1);
+      });
+
+      it('an invalid gated value on a layer the band shown does not draw is refused as natively (M1)', async () => {
+        const style = liberty();
+        style.layers.push({ id: 'late', type: 'fill', source: 'openmaptiles', 'source-layer': 'landcover', minzoom: 12 });
+        const { host, controller } = setup(4.6, style);
+        host.on('error', () => undefined);
+        await controller.activate('equal');
+        expect(copiesOf(host, 'late')).toEqual(['late']); // the Mercator band's alone, not shown at z4.6
+        host.setPaintProperty('late', 'fill-opacity', 'invalid');
+        expect(host.styleErrors).toHaveLength(1);
+        expect(layerOf(host, 'late')!.paint?.['fill-opacity']).toBe(0); // still its gate's
+        host.addLayer(extra('extra'));
+        await tick();
+        expect(layerOf(host, 'extra__b1')).toBeDefined();
+        await controller.deactivate();
+        expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeUndefined();
+        expect(layerOf(host, 'late')!.paint?.['fill-opacity']).toBeUndefined();
+      });
+
+      it('an amend MapLibre refuses rolls the original back, so later amends and the restore apply (M1)', async () => {
+        const { host, controller } = setup();
+        host.on('error', () => undefined);
+        await controller.activate('equal');
+        // Stands in for content MapLibre refuses only in a whole style, whichever id draws it.
+        host.beforeSetStyle = (style) => {
+          if (!style.layers.some((l) => l.id.startsWith('bad'))) return;
+          host.fire({ type: 'error', error: new Error('layers.bad: invalid') });
+          return true;
+        };
+        host.addLayer(extra('bad'));
+        await tick();
+        expect(layerOf(host, 'bad__b1')).toBeUndefined();
+        expect(host.errors.some((error) => /did not accept the amended style/.test(String(error)))).toBe(true);
+        host.addLayer(extra('good'));
+        await tick();
+        expect(layerOf(host, 'good__b1')).toBeDefined();
+        await controller.deactivate();
+        expect(host.style!.metadata?.[REWRITTEN_METADATA_KEY]).toBeUndefined();
+        expect(layerOf(host, 'good')).toBeDefined();
+      });
+
+      it("a second deactivation still asks for the application's setStyle(url) that a skipped restore left alone (4a)", async () => {
+        const { host, controller } = setup();
+        host.on('error', () => undefined);
+        host.setStyle(BASEMAP_URL);
+        const first = controller.activate('equal');
+        first.catch(() => undefined);
+        await tick();
+        await tick();
+        await controller.deactivate(); // the live style is not ours: it and the fetch are left alone
+        const second = controller.activate('equal');
+        second.catch(() => undefined);
+        await tick();
+        await tick();
+        // Stands in for something on the live style the second restore must undo.
+        host.style!.layers.find((l) => l.id === 'water')!.minzoom = 3;
+        await controller.deactivate();
+        const request = host._diffStyleRequest;
+        expect(request).not.toBeNull();
+        expect(request!.signal.aborted).toBe(false);
+        host.resolveStyleRequest(basemap());
+        expect(ids(host.style!)).toEqual(ids(basemap()));
+      });
+
+      it("abandoning a failed re-apply over the application's style takes the bands' zoom ranges away (4c)", async () => {
+        const { host, controller, fetchJson } = setup();
+        host.on('error', () => undefined);
+        await controller.activate('equal');
+        const other = basemap();
+        other.sources['openmaptiles']!['url'] = 'https://tiles.example/other';
+        fetchJson.mockRejectedValue(new Error('offline'));
+        host.setStyle(other, {}); // diffed over our rewrite; its re-apply cannot resolve the TileJSON
+        await vi.waitFor(() => expect(controller.active).toBe(false));
+        expect(ids(host.style!)).toEqual(ids(other));
+        for (const layer of other.layers) expect(layerOf(host, layer.id)!.minzoom ?? 0, layer.id).toBe(layer.minzoom ?? 0);
+      });
+
+      it('the restore asks for no URL again when the application set another style inside it (4d)', async () => {
+        const { host, controller } = setup();
+        host.on('error', () => undefined);
+        await controller.activate('equal');
+        host.setStyle(BASEMAP_URL);
+        const replacement = basemap();
+        // Stands in for a synchronous event inside the restore's diff (`removeSource` fires `data`).
+        host.beforeSetStyle = (style) => {
+          if (style === replacement) return;
+          host.beforeSetStyle = undefined;
+          host.setStyle(replacement, {});
+        };
+        await controller.deactivate();
+        expect(host.beforeSetStyle).toBeUndefined();
+        expect(host._diffStyleRequest).toBeNull(); // the application's newer style is not overridden
+        expect(host.setStyleCalls.at(-1)!.layers).toBeGreaterThan(0);
+      });
     });
   });
 

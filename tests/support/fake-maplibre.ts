@@ -702,6 +702,7 @@ export class FakeControllerHost extends FakeV6Map {
     }
     this.setStyleCalls.push({ layers: style.layers.length, diff: options?.diff });
     if (this.beforeSetStyle?.(style, options) === true) return this;
+    if (this.#refuses(style)) return this;
     this._diffStyleRequest?.abort();
     this._diffStyleRequest = null;
     if (this.deferStyleData || options?.diff === false || !this.style) {
@@ -713,6 +714,21 @@ export class FakeControllerHost extends FakeV6Map {
     }
     this.#diffIn(style);
     return this;
+  }
+
+  /**
+   * `Style.setState`'s validation (`emitValidationErrors(this, validateStyle(nextState))`,
+   * `style/style.ts:845`): a style with a value in {@link invalid} anywhere in a layer's paint,
+   * layout or filter is refused whole, with an `error` event, and nothing changes.
+   */
+  #refuses(style: StyleLike): boolean {
+    const bad = style.layers.find((layer) =>
+      [...Object.values(layer.paint ?? {}), ...Object.values(layer.layout ?? {}), layer['filter']].some((value) => this.invalid.has(value)),
+    );
+    if (!bad) return false;
+    this.styleErrors.push(`layers.${bad.id}: invalid value`);
+    this.fire({ type: 'error', error: new Error(`layers.${bad.id}: invalid value`) });
+    return true;
   }
 
   /** The style a `setStyle(url)` fetched arrives: the request is cleared, then it diffs in. */
@@ -911,6 +927,16 @@ export class FakeControllerHost extends FakeV6Map {
     this.edits.push({ method: 'setFilter', args: [layerId, filter] });
     const layer = this.#layerFor(layerId);
     if (layer && !this.#invalid(layerId, filter)) setOrDelete(layer, 'filter', filter ?? undefined);
+    return this;
+  }
+
+  /** `Style.setLayerZoomRange`: an absent (`null` or `undefined`) bound is left as it is. */
+  setLayerZoomRange(layerId: string, minzoom?: number | null, maxzoom?: number | null): this {
+    this.edits.push({ method: 'setLayerZoomRange', args: [layerId, minzoom, maxzoom] });
+    const layer = this.#layerFor(layerId);
+    if (!layer) return this;
+    if (minzoom !== null && minzoom !== undefined) layer.minzoom = minzoom;
+    if (maxzoom !== null && maxzoom !== undefined) layer.maxzoom = maxzoom;
     return this;
   }
 

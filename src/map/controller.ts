@@ -86,8 +86,9 @@
  *   (the live style is still ours). Its style arrives and is captured, which supersedes them and,
  *   as natively, drops what was edited on the old style; or the fetch fails or changes nothing, and
  *   they go ahead with the edits. A deactivation restores at once and asks for the URL again, or,
- *   when the live style is not ours (an activation still waiting for the fetch) and carries no zoom
- *   bound our rewrite left behind, leaves it alone (R22, R23; {@link #restoreOriginal}).
+ *   when the live style is not ours (an activation still waiting for the fetch), leaves it and the
+ *   fetch alone, taking away only zoom bounds our rewrite left on it, in place (R22, R23, R27;
+ *   {@link #restoreOriginal}).
  * - Edits made while an activation fetches its TileJSON are taken before it commits; edits made
  *   while a re-apply is in flight reach the original it rewrites, and an amend follows the apply
  *   once it has finished (R17).
@@ -212,6 +213,8 @@ export interface ControllerHost extends CameraHost, ConstrainHost, SwitcherHost,
   addLayer(layer: unknown, beforeId?: string): unknown;
   removeLayer(id: string): unknown;
   setFilter(layerId: string, filter: unknown, options?: unknown): unknown;
+  /** Lifts the zoom bounds our rewrite left on a live style that is not ours; never wrapped. */
+  setLayerZoomRange(layerId: string, minzoom: number, maxzoom: number): unknown;
   /** The live layer, `undefined` when the style has none by that id. */
   getLayer(id: string): unknown;
   /** Read back after a write, to see whether MapLibre accepted the value (both majors). */
@@ -230,6 +233,7 @@ interface RawStyle {
   setLayoutProperty(layerId: unknown, name: unknown, value: unknown, ...rest: unknown[]): unknown;
   setFilter(layerId: unknown, filter: unknown, ...rest: unknown[]): unknown;
   setStyle(style: unknown, ...rest: unknown[]): unknown;
+  setLayerZoomRange(layerId: unknown, minzoom: unknown, maxzoom: unknown): unknown;
   getLayer(...args: unknown[]): unknown;
   /** These three throw on a map without them; `#accepted` then assumes acceptance. */
   getPaintProperty(...args: unknown[]): unknown;
@@ -250,6 +254,7 @@ const RAW_METHODS = [
   'setLayoutProperty',
   'setFilter',
   'setStyle',
+  'setLayerZoomRange',
   ...LAYER_READS,
   'queryRenderedFeatures',
 ] as const satisfies readonly (keyof RawStyle)[];
@@ -504,6 +509,14 @@ export class EqualEarthController {
   #amendDeferred = false;
   /** Set around the plugin's own `setStyle`: the `style.load` events it fires, swallowed (R15, R21). */
   #ownLoads: { count: number } | undefined;
+  /** Set by {@link #countErrors}: the `error` events fired meanwhile. */
+  #errorCount: { count: number } | undefined;
+  /**
+   * A copy of the original as the live style last took its rewrite (activation, re-apply, amend):
+   * what an amend MapLibre refuses rolls {@link #original} back to (M1), so that the refused
+   * content cannot fail every later amend, re-apply and the restore.
+   */
+  #lastAccepted: StyleLike | undefined;
   /**
    * An application `setStyle` while active (R16): `call` during the call; `fetch` while a URL is
    * fetched, until MapLibre's `_diffStyleRequest` is gone (or, on a map without it, until the
@@ -511,7 +524,10 @@ export class EqualEarthController {
    * `style.load` or an `error`; `none` otherwise. See {@link #appStyleInFlight}.
    */
   #appStyle: 'none' | 'call' | 'fetch' | 'rebuild' = 'none';
-  /** The application's `setStyle` calls while active: an amend tells one made inside its own. */
+  /**
+   * The application's `setStyle` calls, active or not: an amend tells one made inside its own, and
+   * a restore one made inside the restore (4d).
+   */
   #appStyleCalls = 0;
   /** The application's last `setStyle(url)` while active, and MapLibre's request for it (R20). */
   #appRequest: { url: string; rest: unknown[]; request: object | null | undefined } | undefined;
@@ -730,6 +746,7 @@ export class EqualEarthController {
     this.#destroyed = true;
     this.#original = undefined;
     this.#rewritten = undefined;
+    this.#lastAccepted = undefined;
     this.#tileJson.clear();
     this.#geojson.clear();
   }
@@ -1028,6 +1045,7 @@ export class EqualEarthController {
     const transition = this.#transition;
     const initialBand = bandIndexForZoom(bands, view.zoom);
     const rewritten = this.#rewrite(original, resolved, view.zoom);
+    const accepted = snapshotOf(original);
 
     // C7: install only once the rewritten style has loaded. On the diff path `style.load` fires
     // inside `setStyle`, where it is counted and swallowed (R21); on a full rebuild it fires a
@@ -1035,7 +1053,7 @@ export class EqualEarthController {
     // generation has moved on (M2). Listen first.
     const styleLoad = this.#nextEvent('style.load');
     this.#rewritten = rewritten;
-    if (this.#setStyle(rewritten.style) > 0) {
+    if (this.#setStyle(rewritten.style).loads > 0) {
       styleLoad.cancel();
     } else if (!styleLoad.fired()) {
       const current = this.#readStyle();
@@ -1062,6 +1080,7 @@ export class EqualEarthController {
       this.#original = this.#capture(live);
       return this.#applyNow(generation);
     }
+    this.#lastAccepted = accepted;
 
     const host = this.#host;
     const { lngLatFactory, onSwitch } = this.#options;
@@ -1183,18 +1202,37 @@ export class EqualEarthController {
    * stylesheet's camera while the camera is unmodified, which our geographic centre in a map-space
    * style must not do anyway, and resizes the transform of a map created with a globe style, once.
    */
-  #setStyle(style: StyleLike): number {
+  #setStyle(style: StyleLike): { loads: number; errors: number } {
     const loads = { count: 0 };
     const outer = this.#ownLoads;
     this.#ownLoads = loads;
     this.#applying = true;
+    let errors: number;
     try {
-      this.#rawStyle.setStyle(style, { diff: true });
+      errors = this.#countErrors(() => this.#rawStyle.setStyle(style, { diff: true }));
     } finally {
       this.#applying = false;
       this.#ownLoads = outer;
     }
-    return loads.count;
+    return { loads: loads.count, errors };
+  }
+
+  /**
+   * The `error` events the map fires while `run` runs (the fire wrapper counts them; they still
+   * reach the application). MapLibre refuses a style with validation errors (`Style.setState`) or
+   * a property value (`setPaintProperty` …) with `error` events, synchronously, changing nothing.
+   */
+  #countErrors(run: () => unknown): number {
+    const counter = { count: 0 };
+    const outer = this.#errorCount;
+    this.#errorCount = counter;
+    try {
+      run();
+    } finally {
+      this.#errorCount = outer;
+      if (outer) outer.count += counter.count;
+    }
+    return counter.count;
   }
 
   /**
@@ -1203,17 +1241,40 @@ export class EqualEarthController {
    * the original, as it would have without us, and fires its `style.load`.
    *
    * A loaded live style that is not ours (an activation still waiting for such a fetch, or the
-   * application's style not yet re-applied) is left alone (R22), unless it carries zoom bounds
-   * our rewrite left behind when the application's style was diffed over it: setting the original
-   * would only abort that fetch and drop edits made to the live style meanwhile.
+   * application's style not yet re-applied) is left alone (R22): setting the original would only
+   * abort that fetch and drop edits made to the live style meanwhile. Only the zoom bounds our
+   * rewrite left on it, when the application's style was diffed over ours, are taken away
+   * ({@link #liftRewriteBounds}).
    */
   #restoreOriginal(original: StyleLike, live: StyleLike | undefined): void {
+    if (live && !hasOurMetadata(live)) {
+      this.#liftRewriteBounds(original, live);
+      return;
+    }
     const asked = this.#appRequest;
     const request = this.#diffStyleRequest();
-    if (live && !hasOurMetadata(live) && restorableStyle(original, live) === original) return;
+    const calls = this.#appStyleCalls;
     takeLiveRoot(original, live);
     this.#setStyle(restorableStyle(original, live));
-    if (asked && request && asked.request === request) this.#rawStyle.setStyle(asked.url, ...asked.rest);
+    // Not when the application set a style of its own inside ours (an event listener), by URL or
+    // not: asking for the old URL again would override it (4d).
+    if (asked && request && asked.request === request && this.#appRequest === asked && this.#appStyleCalls === calls) {
+      this.#rawStyle.setStyle(asked.url, ...asked.rest);
+      asked.request = this.#diffStyleRequest();
+    }
+  }
+
+  /**
+   * On a live style that is not ours, take away only the zoom bounds our rewrite left on it (the
+   * application's style diffed over ours before its re-apply), in place with MapLibre's own
+   * `setLayerZoomRange` (4c, R23): no fetch is aborted and the live style's edits stay.
+   */
+  #liftRewriteBounds(original: StyleLike, live: StyleLike): void {
+    const restorable = restorableStyle(original, live);
+    if (restorable === original) return;
+    restorable.layers.forEach((layer, i) => {
+      if (layer !== original.layers[i]) this.#rawStyle.setLayerZoomRange(layer.id, layer.minzoom, layer.maxzoom);
+    });
   }
 
   /** MapLibre's `_diffStyleRequest` (both majors): `null` while no URL is fetched, `undefined` on a map without it. */
@@ -1276,7 +1337,8 @@ export class EqualEarthController {
   #finishDeactivate(view: View): void {
     this.#view = undefined;
     this.#appStyle = 'none';
-    this.#appRequest = undefined;
+    // `#appRequest` stays (4a): a restore skipped here left its fetch running, and a later one that
+    // must set a style asks for it again; once MapLibre's request has moved on, the record is inert.
     this.#geojson.clear(); // the next activation fetches afresh
 
     if (this.#worldCopies !== undefined) {
@@ -1301,8 +1363,11 @@ export class EqualEarthController {
     const view = this.#detach();
     this.#projection = undefined;
     this.#unsubscribe();
+    // The same guard as a deactivation's (4c): a live style that is not ours (the application's,
+    // diffed over ours before this re-apply failed) only loses our zoom bounds. A style still
+    // loading is a rebuild, the application's to finish.
     const live = this.#readStyle();
-    if (this.#original && hasOurMetadata(live)) this.#restoreOriginal(this.#original, live);
+    if (this.#original && live) this.#restoreOriginal(this.#original, live);
     this.#rewritten = undefined;
     this.#finishDeactivate(view);
   }
@@ -1364,9 +1429,16 @@ export class EqualEarthController {
           loads.count++;
           return host;
         }
+        if (type === 'error' && this.#errorCount) this.#errorCount.count++;
         // A style the application asked for that failed to load (R16 bookkeeping); where MapLibre
-        // has `_diffStyleRequest`, a URL's fetch is told by that instead (any `error` may come meanwhile).
-        if (type === 'error' && (this.#appStyle === 'rebuild' || (this.#appStyle === 'fetch' && this.#diffStyleRequest() === undefined))) {
+        // has `_diffStyleRequest`, a URL's fetch is told by that instead (any `error` may come
+        // meanwhile). A source's error (a tile that failed to load, a TileJSON or GeoJSON that
+        // could not be fetched) says nothing about the style (M2).
+        if (
+          type === 'error' &&
+          !isSourceError(event) &&
+          (this.#appStyle === 'rebuild' || (this.#appStyle === 'fetch' && this.#diffStyleRequest() === undefined))
+        ) {
           this.#appStyle = 'none';
         }
         return original(event, ...rest);
@@ -1405,10 +1477,8 @@ export class EqualEarthController {
    * A URL is recorded while inactive too (R22): a restore that aborts it asks for it again.
    */
   #appSetStyle(style: unknown, rest: unknown[]): unknown {
-    if (this.active) {
-      this.#appStyleCalls++;
-      this.#appStyle = 'call';
-    }
+    this.#appStyleCalls++;
+    if (this.active) this.#appStyle = 'call';
     // Its `style.load` is the application's, even when it sets a style inside one of ours (R21),
     // the deactivation's restore included (R22).
     const own = this.#ownLoads;
@@ -1556,17 +1626,17 @@ export class EqualEarthController {
    */
   #setProperty(kind: PropertyKind, layerId: unknown, name: unknown, value: unknown, rest: unknown[]): unknown {
     const raw = this.#rawStyle;
-    const write = (id: unknown): unknown =>
+    const write = (id: unknown, to: unknown): unknown =>
       kind === 'paint'
-        ? raw.setPaintProperty(id, name, value, ...rest)
+        ? raw.setPaintProperty(id, name, to, ...rest)
         : kind === 'layout'
-          ? raw.setLayoutProperty(id, name, value, ...rest)
-          : raw.setFilter(id, value, ...rest);
+          ? raw.setLayoutProperty(id, name, to, ...rest)
+          : raw.setFilter(id, to, ...rest);
     const original = this.#following();
     const layer = original && typeof layerId === 'string' ? original.layers.find((l) => l.id === layerId) : undefined;
     const property = typeof name === 'string' ? name : undefined;
     if (!original || !layer || (kind !== 'filter' && property === undefined)) {
-      const result = write(layerId);
+      const result = write(layerId, value);
       this.#edits++;
       return result;
     }
@@ -1589,12 +1659,17 @@ export class EqualEarthController {
       const gate = gateOf(id);
       // A gated value is the gate's own: written only where the gate shows it.
       if (gated(gate) && gate.band !== shown && !(gate.holdWhileFading && fading.has(gate.band))) continue;
-      write(id);
+      write(id, value);
       if (!checked) {
         checked = true;
         if (!this.#accepted(kind, id, property, value)) return this.#host;
       }
     }
+    // Nothing written (a gated value on a layer no band shown draws, the first background under
+    // pure Equal Earth): try the value on one live layer drawing it and put the old one back, so
+    // that a value MapLibre refuses goes no further, as natively, rather than into the original,
+    // where it would fail every later amend and the restore (M1).
+    if (!checked && !this.#tryValue(kind, this.#liveCopies(layer.id)[0], property, value, write)) return this.#host;
     if (plain) {
       for (const id of copies) {
         const gate = gateOf(id);
@@ -1615,17 +1690,41 @@ export class EqualEarthController {
    * Without the getter, assumed.
    */
   #accepted(kind: PropertyKind, id: string, property: string | undefined, value: unknown): boolean {
+    const read = this.#read(kind, id, property);
+    // A map without the getter: assumed accepted.
+    return !read || JSON.stringify(read.value ?? null) === JSON.stringify(value ?? null);
+  }
+
+  /** Live layer `id`'s value of the property, through MapLibre's getter; `undefined` on a map without it. */
+  #read(kind: PropertyKind, id: string, property: string | undefined): { value: unknown } | undefined {
     const raw = this.#rawStyle;
-    let read: unknown;
     try {
-      // A map without the getter throws here (`rawStyle`): assumed accepted.
-      if (kind === 'paint') read = raw.getPaintProperty(id, property);
-      else if (kind === 'layout') read = raw.getLayoutProperty(id, property);
-      else read = raw.getFilter(id);
+      // A map without the getter throws here (`rawStyle`).
+      if (kind === 'paint') return { value: raw.getPaintProperty(id, property) };
+      if (kind === 'layout') return { value: raw.getLayoutProperty(id, property) };
+      return { value: raw.getFilter(id) };
     } catch {
-      return true;
+      return undefined;
     }
-    return JSON.stringify(read ?? null) === JSON.stringify(value ?? null);
+  }
+
+  /**
+   * Whether MapLibre takes `value` on live layer `id` (none, or no getter: assumed). The value is
+   * written, read back, and the old one written again at once, before any frame draws it.
+   */
+  #tryValue(
+    kind: PropertyKind,
+    id: string | undefined,
+    property: string | undefined,
+    value: unknown,
+    write: (id: string, to: unknown) => unknown,
+  ): boolean {
+    const before = id === undefined ? undefined : this.#read(kind, id, property);
+    if (id === undefined || !before) return true;
+    write(id, value);
+    if (!this.#accepted(kind, id, property, value)) return false;
+    write(id, before.value);
+    return true;
   }
 
   /** The live layers drawn for the original's layer `id`, in style order: its band copies, then itself. */
@@ -1786,11 +1885,12 @@ export class EqualEarthController {
         rebuilt = true;
       };
       const calls = this.#appStyleCalls;
+      const accepted = snapshotOf(original);
       host.on('styledataloading', onLoading);
       this.#rewritten = rewritten;
-      let loads: number;
+      let outcome: { loads: number; errors: number };
       try {
-        loads = this.#setStyle(rewritten.style); // its `style.load` is swallowed (R15)
+        outcome = this.#setStyle(rewritten.style); // its `style.load` is swallowed (R15)
       } finally {
         host.off('styledataloading', onLoading);
       }
@@ -1803,13 +1903,21 @@ export class EqualEarthController {
         else if (!hasOurMetadata(after)) this.#onStyleLoad();
         return;
       }
-      // No `style.load`: nothing changed, or MapLibre refused the style (its validation errors
-      // are `error` events). A refused style left the previous rewrite live.
+      // No `style.load`: nothing changed, or MapLibre refused the style (`Style.setState` reports
+      // its validation errors as `error` events and changes nothing). A refused style left the
+      // previous rewrite live. Its content would be refused again by every later amend, re-apply
+      // and the restore, so the original goes back to what the live style last took (M1): the
+      // edits since then stay where MapLibre applied them, under the application's ids, until the
+      // next diff.
       const added = rewritten.style.layers.find((layer) => !existed.has(layer.id));
-      if (loads === 0 && added && this.#rawStyle.getLayer(added.id) === undefined) {
+      if (outcome.loads === 0 && (outcome.errors > 0 || (added && this.#rawStyle.getLayer(added.id) === undefined))) {
         this.#rewritten = previous;
-        throw new Error('Equal Earth: the map did not accept the amended style; the edit reaches the Mercator band only.');
+        if (this.#lastAccepted) this.#original = snapshotOf(this.#lastAccepted);
+        throw new Error(
+          'Equal Earth: the map did not accept the amended style; the style edits since the last accepted one were rolled back and reach the Mercator band only.',
+        );
       }
+      this.#lastAccepted = accepted;
       this.#wrapGeoJSONSources(installed, rewritten.geojsonSources);
     } catch (error) {
       reportError(this.#host, error);
@@ -2108,6 +2216,15 @@ function rawStyle(host: ControllerHost): RawStyle {
   return raw as RawStyle;
 }
 
+/**
+ * Whether an `error` event comes from a source rather than the style: MapLibre's tile errors carry
+ * the `tile`, and every event a source fires reaches the Map with its `sourceId` (the `Style` is
+ * each source's evented parent, with `{ sourceId }` as data).
+ */
+function isSourceError(event: unknown): boolean {
+  return isRecord(event) && (event['sourceId'] !== undefined || event['tile'] !== undefined);
+}
+
 /** An event's type, as `Evented.fire` takes it: an event object or a type string. */
 function eventType(event: unknown): unknown {
   return typeof event === 'string' ? event : (event as { type?: unknown } | null)?.type;
@@ -2165,6 +2282,15 @@ function ownValue(value: unknown): unknown {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A copy of an original to roll back to ({@link EqualEarthController}'s `#lastAccepted`, M1): its
+ * layers cloned (property edits change them in place), its sources map copied but the source
+ * specs shared, so the GeoJSON data the application sets later (written into the spec) is kept.
+ */
+function snapshotOf(style: StyleLike): StyleLike {
+  return { ...style, sources: { ...style.sources }, layers: style.layers.map((layer) => cloneSpec(layer) as StyleLayerLike) };
 }
 
 /** A copy of an application's source or layer spec to keep; shallow if it holds what cannot be cloned. */
