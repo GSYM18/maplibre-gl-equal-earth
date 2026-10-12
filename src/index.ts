@@ -133,6 +133,16 @@ export {
 } from './tiles/protocol.js';
 
 export {
+  CACHE_NAME_PREFIX,
+  PersistentTileCache,
+  hashSourceConfig,
+  persistentKey,
+  type CacheLike,
+  type CacheStorageLike,
+  type PersistentCacheOptions,
+} from './tiles/persistent-cache.js';
+
+export {
   EntryCache,
   RequestCoalescer,
   TileCache,

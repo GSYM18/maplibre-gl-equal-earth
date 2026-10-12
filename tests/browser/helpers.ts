@@ -67,6 +67,10 @@ export interface HarnessOptions {
   hash?: boolean;
   /** `?geojson=1`: the inline GeoJSON source `cities` with a blue circle layer. */
   geojson?: boolean;
+  /** `persistentCache: false` when `false`. @defaultValue true */
+  persist?: boolean;
+  /** `?early=1`: set an Equal Earth `projection` before `load`, so no Mercator tile is fetched. */
+  early?: boolean;
 }
 
 /** `test` with the per-project `mlv` option (`playwright.config.ts` sets it). */
@@ -94,6 +98,8 @@ export async function openHarness(page: Page, options: HarnessOptions): Promise<
   if (options.geoapi === false) params.set('geoapi', '0');
   if (options.hash) params.set('hash', '1');
   if (options.geojson) params.set('geojson', '1');
+  if (options.persist === false) params.set('persist', '0');
+  if (options.early) params.set('early', '1');
   await page.goto(`/tests/browser/harness.html?${params.toString()}`);
   await page.waitForFunction(() => window.__h !== undefined);
   let timer: ReturnType<typeof setTimeout> | undefined;

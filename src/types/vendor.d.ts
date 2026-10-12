@@ -1,4 +1,11 @@
 /**
+ * The package version, inlined by every build that compiles `src/` (`define` in vite.config.ts,
+ * vite.worker.config.ts, vitest.config.ts and tests/browser/vite.config.ts). It names the
+ * persistent tile cache (`src/tiles/persistent-cache.ts`).
+ */
+declare const __EQE_VERSION__: string;
+
+/**
  * Minimal ambient declarations for the two tile libraries that ship no types.
  *
  * `@types/geojson-vt` exists but describes the v3 namespace-style export, which does not

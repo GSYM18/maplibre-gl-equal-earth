@@ -44,6 +44,7 @@
 
 import { bandIndexForZoom, bandSourceId, parseRange, type Band, type ResolvedTransition } from './bands.js';
 import { encodeSourceUrl } from '../tiles/protocol.js';
+import type { PersistentCacheOptions } from '../tiles/persistent-cache.js';
 import { geojsonZoomForBand, warpGeoJSON } from './geojson.js';
 import {
   CARTOGRAPHY_PREFIX,
@@ -120,6 +121,13 @@ export interface RewriteOptions {
    * unchanged data again.
    */
   warp?: (data: GeoJSON.GeoJSON, blend: number, densifyZoom: number) => GeoJSON.GeoJSON;
+  /**
+   * The persistent output-tile cache of every band source (spec §6), written into its tile URL.
+   * Left out of the URL when unset: the handler's default applies.
+   */
+  persistentCache?: PersistentCacheOptions | false;
+  /** Every band source's `sourceZoomOffset` (`TileCoverOptions`), written into its tile URL when set. */
+  sourceZoomOffset?: number;
 }
 
 export interface LayerGate {
@@ -512,6 +520,8 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
             url: template.tiles[0]!,
             blend,
             ...(template.maxzoom === undefined ? {} : { sourceMaxZoom: template.maxzoom }),
+            ...(options.persistentCache === undefined ? {} : { persistentCache: options.persistentCache }),
+            ...(options.sourceZoomOffset === undefined ? {} : { sourceZoomOffset: options.sourceZoomOffset }),
           }),
         ],
         ...(template.maxzoom === undefined ? {} : { maxzoom: template.maxzoom }),

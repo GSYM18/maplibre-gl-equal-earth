@@ -83,6 +83,25 @@ describe('rewriteStyle', () => {
     expect(result.sourceIdsForBand(2)).toEqual(['openmaptiles__b2']);
   });
 
+  it('writes persistentCache and sourceZoomOffset into every band source URL, and nothing when unset', () => {
+    const urlConfig = (style: StyleLike, k: number) =>
+      parseTileUrl((style.sources[`openmaptiles__b${k}`]!['tiles'] as string[])[0]!.replace('{z}/{x}/{y}', '3/4/2')).config;
+    const { style } = rewriteStyle(liberty(), {
+      bands: SIX.bands, transition: SIX, templates: TEMPLATES, initialZoom: 4.6,
+      persistentCache: { maxZoom: 2, ttlDays: 1 }, sourceZoomOffset: -1,
+    });
+    for (let k = 0; k < 6; k++) {
+      expect(urlConfig(style, k)).toMatchObject({ persistentCache: { maxZoom: 2, ttlDays: 1 }, sourceZoomOffset: -1 });
+    }
+    const off = rewriteStyle(liberty(), {
+      bands: SIX.bands, transition: SIX, templates: TEMPLATES, initialZoom: 4.6, persistentCache: false,
+    }).style;
+    expect(urlConfig(off, 0).persistentCache).toBe(false);
+    const plain = urlConfig(rewrite().style, 0);
+    expect('persistentCache' in plain).toBe(false);
+    expect('sourceZoomOffset' in plain).toBe(false);
+  });
+
   it('copies attribution, minzoom and promoteId onto every band source, but not bounds (P14)', () => {
     const template = { ...TEMPLATES.openmaptiles, minzoom: 2, attribution: '© OSM', promoteId: { water: 'id' } };
     const { style } = rewriteStyle(liberty(), {

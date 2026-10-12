@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { installEqualEarth, parseVersion } from '../src/install.js';
 import type { StyleLike } from '../src/map/style-rewrite.js';
+import { parseTileUrl } from '../src/tiles/protocol.js';
 import { FakeControllerHost } from './support/fake-maplibre.js';
 
 function fakeModule(version = '6.6.0', importResult: Promise<unknown> = Promise.resolve()) {
@@ -359,6 +360,23 @@ describe('installEqualEarth', () => {
       }
       install.uninstall();
     }
+  });
+
+  it('passes persistentCache and sourceZoomOffset through to every band source URL', async () => {
+    const fetchJson = async () => ({ tiles: ['https://tiles.example/{z}/{x}/{y}.pbf'] });
+    const { module } = fakeModule();
+    const install = await installEqualEarth(module, { fetchJson, persistentCache: { ttlDays: 2 }, sourceZoomOffset: -1 });
+    const host = new FakeControllerHost([8.54, 47.37], 2);
+    host.style = structuredClone(liberty());
+    await install.controllerFor(host).activate('equal');
+    const banded = Object.entries(host.style.sources).filter(([id]) => /__b\d+$/.test(id));
+    expect(banded.length).toBeGreaterThan(0);
+    for (const [, source] of banded) {
+      if (source['type'] !== 'vector') continue;
+      const url = (source['tiles'] as string[])[0]!.replace('{z}/{x}/{y}', '1/0/0');
+      expect(parseTileUrl(url).config).toMatchObject({ persistentCache: { ttlDays: 2 }, sourceZoomOffset: -1 });
+    }
+    install.uninstall();
   });
 
   it('forgets a removed map: uninstall does not restore its style (I5)', async () => {

@@ -157,6 +157,7 @@ import {
   type StyleLike,
 } from './style-rewrite.js';
 import { BandSwitcher, type SwitchEvent, type SwitcherHost } from './switcher.js';
+import type { PersistentCacheOptions } from '../tiles/persistent-cache.js';
 
 /** The projection types the plugin adds: adaptive (`equal`) and pure Equal Earth. */
 export type EqualEarthProjection = 'equal' | 'equal-earth';
@@ -309,6 +310,13 @@ export interface ControllerBaseOptions extends CartographyOptions {
   fetchJson?: (url: string) => Promise<unknown>;
   /** Called on every band switch. */
   onSwitch?: (event: SwitchEvent) => void;
+  /**
+   * Keep warped output tiles in Cache Storage (spec §6); `false` keeps none.
+   * @defaultValue `{ maxZoom: 3, ttlDays: 7 }`
+   */
+  persistentCache?: PersistentCacheOptions | false;
+  /** Read source tiles this many zooms from the output zoom (`TileCoverOptions`). @defaultValue 0 */
+  sourceZoomOffset?: number;
 }
 
 /** Builds the bounds the geographic `getBounds()` returns. */
@@ -932,6 +940,8 @@ export class EqualEarthController {
       ...(initialBand === undefined ? {} : { initialBand }),
       cartography: this.#cartography(),
       warp: this.#warp,
+      ...(this.#options.persistentCache === undefined ? {} : { persistentCache: this.#options.persistentCache }),
+      ...(this.#options.sourceZoomOffset === undefined ? {} : { sourceZoomOffset: this.#options.sourceZoomOffset }),
     };
   }
 

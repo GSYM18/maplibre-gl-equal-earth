@@ -63,14 +63,33 @@ export function fixtureTile(z: number, x: number, y: number): Uint8Array | null 
  * Serves `/fixture-tiles/{z}/{x}/{y}.pbf` (204 when empty, as tile servers do). Every answer is
  * `Cache-Control: no-store` (Ruling R1): the browser's HTTP cache must never hide an upstream
  * request from a test that counts them.
+ *
+ * It counts the tile requests it answers: `GET /fixture-tiles/__count` returns `{ count }`,
+ * `POST /fixture-tiles/__reset` sets it to 0. The count is per server, and the browser tests run
+ * one spec at a time (`workers: 1`).
  */
 export function fixtureTilesPlugin(): Plugin {
+  let count = 0;
   return {
     name: 'equal-earth:fixture-tiles',
     configureServer(server) {
       server.middlewares.use((req, res, next) => {
+        if (req.url === '/fixture-tiles/__count' && req.method === 'GET') {
+          res.setHeader('Cache-Control', 'no-store');
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ count }));
+          return;
+        }
+        if (req.url === '/fixture-tiles/__reset' && req.method === 'POST') {
+          count = 0;
+          res.setHeader('Cache-Control', 'no-store');
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
         const match = /^\/fixture-tiles\/(\d+)\/(\d+)\/(\d+)\.pbf$/.exec(req.url ?? '');
         if (!match) return next();
+        count++;
         const bytes = fixtureTile(Number(match[1]), Number(match[2]), Number(match[3]));
         res.setHeader('Access-Control-Allow-Origin', '*');
         res.setHeader('Cache-Control', 'no-store');

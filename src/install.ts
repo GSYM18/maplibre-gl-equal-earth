@@ -75,6 +75,18 @@ export interface InstallOptions {
    * @defaultValue true
    */
   geographicApi?: boolean;
+  /**
+   * Keep warped output tiles up to `maxZoom` in Cache Storage for `ttlDays`, so a reload draws the
+   * world view without refetching its source tiles (spec §6). Needs a secure context; skipped
+   * silently without one. `false` keeps none.
+   * @defaultValue `{ maxZoom: 3, ttlDays: 7 }`
+   */
+  persistentCache?: ControllerOptions['persistentCache'];
+  /**
+   * Read source tiles this many zooms from the output zoom (clamped to the tileset's zooms); −1
+   * fetches about a quarter of the bytes for coarser geometry. @defaultValue 0
+   */
+  sourceZoomOffset?: number;
 }
 
 export interface EqualEarthInstall {
@@ -201,6 +213,8 @@ async function install(
     ...(options.outsideColor === undefined ? {} : { outsideColor: options.outsideColor }),
     ...(options.outline === undefined ? {} : { outline: options.outline }),
     ...(options.graticule === undefined ? {} : { graticule: options.graticule }),
+    ...(options.persistentCache === undefined ? {} : { persistentCache: options.persistentCache }),
+    ...(options.sourceZoomOffset === undefined ? {} : { sourceZoomOffset: options.sourceZoomOffset }),
   };
   const controllers = new WeakMap<object, EqualEarthController>();
   const live = new Set<EqualEarthController>();
