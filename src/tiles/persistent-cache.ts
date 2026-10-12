@@ -20,9 +20,11 @@
  * worker's sources>`, so a code change that alters the tiles never meets the old ones.
  *
  * Namespaces nothing reads again (a rotated or per-session API key) would never be looked up, so
- * their entries would never expire by lookup. So once per instance, after opening, a background
- * sweep deletes every expired entry and caps the cache at {@link MAX_ENTRIES}, evicting the
- * earliest-expiring first (Ruling R25). It never delays `get` or `put`, never rejects, never logs.
+ * their entries would never expire by lookup. So after opening, a background sweep deletes every
+ * expired entry and caps the cache at {@link MAX_ENTRIES}, evicting the earliest-expiring first
+ * (Ruling R25). It never delays `get` or `put`, never rejects, never logs. Every worker of every
+ * page load opens the cache, and a sweep reads every entry, so it runs at most once a day per
+ * cache: a marker entry ({@link SWEEP_MARKER_KEY}) records when the last one started.
  */
 
 import type { EqualEarthSourceConfig } from './protocol.js';
@@ -60,8 +62,12 @@ export const DEFAULT_PERSISTENT_TTL_DAYS = 7;
 export const MAX_ENTRIES = 2000;
 
 const EXPIRES_HEADER = 'x-eqe-expires';
+const SWEPT_HEADER = 'x-eqe-swept';
 const DAY_MS = 86_400_000;
 const KEY_ORIGIN = 'https://equal-earth.invalid';
+
+/** The entry whose `x-eqe-swept` header holds when the last sweep of its cache started; never a tile's key. */
+export const SWEEP_MARKER_KEY = `${KEY_ORIGIN}/__sweep`;
 
 /** FNV-1a 64-bit over the config's stable JSON (sorted keys), `persistentCache` excluded; 16 hex digits. */
 export function hashSourceConfig(config: EqualEarthSourceConfig): string {
@@ -149,13 +155,22 @@ export class PersistentTileCache {
     return cache;
   }
 
-  /** Delete expired entries, then evict the earliest-expiring beyond {@link MAX_ENTRIES}. */
+  /**
+   * Unless the marker says a sweep started less than a day ago: delete expired entries, then evict
+   * the earliest-expiring beyond {@link MAX_ENTRIES}. The marker is written first, so workers that
+   * open the cache a moment later skip.
+   */
   async #sweep(cache: CacheLike): Promise<void> {
     try {
       const now = this.#now();
+      const swept = Number((await cache.match(SWEEP_MARKER_KEY))?.headers.get(SWEPT_HEADER) ?? NaN);
+      // A marker from the future (the clock was set back) does not hold the sweep off.
+      if (now - swept >= 0 && now - swept < DAY_MS) return;
+      await cache.put(SWEEP_MARKER_KEY, new Response(null, { headers: { [SWEPT_HEADER]: String(now) } }));
       const live: { key: string; expires: number }[] = [];
       for (const request of await cache.keys()) {
         const key = typeof request === 'string' ? request : request.url;
+        if (key === SWEEP_MARKER_KEY) continue;
         const expires = expiresOf(await cache.match(key));
         if (now <= expires) live.push({ key, expires });
         else await cache.delete(key);

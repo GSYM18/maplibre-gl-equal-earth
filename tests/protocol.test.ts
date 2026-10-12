@@ -6,7 +6,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { EntryCache, RequestCoalescer, TileCache } from '../src/tiles/cache.js';
 import * as mvt from '../src/tiles/mvt.js';
-import { persistentKey } from '../src/tiles/persistent-cache.js';
+import { SWEEP_MARKER_KEY, persistentKey } from '../src/tiles/persistent-cache.js';
 import { sourceTilesFor, type TileId } from '../src/tiles/tile-cover.js';
 import {
   createEqualEarthProtocol,
@@ -455,6 +455,9 @@ describe('protocol handler', () => {
     const PKG = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string };
     /** Lets the handler's fire-and-forget `put` settle. */
     const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+    /** The tiles stored in a fake cache: its entries but the sweep's marker. */
+    const tilesIn = (cache: { entries: Map<string, Response> } | undefined) =>
+      [...(cache?.entries.keys() ?? [])].filter((key) => key !== SWEEP_MARKER_KEY).length;
 
     it('serves a z2 tile to a new handler from Cache Storage, without fetching upstream', async () => {
       const storage = new FakeCacheStorage();
@@ -478,7 +481,7 @@ describe('protocol handler', () => {
       const handler = createEqualEarthProtocol({ fetchImpl: upstream() as unknown as typeof fetch, cacheStorage: storage, version: 't' });
       await handler({ url: at({ url: UPSTREAM, blend: 0 }, Z4) }, new AbortController());
       await settle();
-      expect(storage.caches.get('equal-earth-t')?.entries.size ?? 0).toBe(0);
+      expect(tilesIn(storage.caches.get('equal-earth-t'))).toBe(0);
 
       const raised = { url: UPSTREAM, blend: 0, persistentCache: { maxZoom: 4 } };
       await handler({ url: at(raised, Z4) }, new AbortController());
@@ -538,7 +541,7 @@ describe('protocol handler', () => {
       const handler = createEqualEarthProtocol({ fetchImpl: failing as unknown as typeof fetch, cacheStorage: storage, version: 't' });
       await expect(handler({ url: at({ url: UPSTREAM, blend: 0 }, Z2) }, new AbortController())).rejects.toThrow(/returned 503/);
       await settle();
-      expect(storage.caches.get('equal-earth-t')?.entries.size ?? 0).toBe(0);
+      expect(tilesIn(storage.caches.get('equal-earth-t'))).toBe(0);
     });
 
     it('rejects a tile aborted during the persistent lookup, without fetching or storing', async () => {
@@ -556,7 +559,7 @@ describe('protocol handler', () => {
       await expect(result).rejects.toMatchObject({ name: 'AbortError' });
       await settle();
       expect(fetchImpl).not.toHaveBeenCalled();
-      expect(stored.entries.size).toBe(0);
+      expect(tilesIn(stored)).toBe(0);
     });
 
     it('round-trips a zero-length tile (every source absent) through the cache', async () => {

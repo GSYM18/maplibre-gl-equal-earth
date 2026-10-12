@@ -122,6 +122,40 @@ export async function canvasDataUrl(page: Page): Promise<string> {
   return page.evaluate(() => window.__h.map.getCanvas().toDataURL('image/png'));
 }
 
+/** How two PNG data URLs differ: the pixels that differ at all, and the largest difference of one channel. */
+export interface PixelDiff {
+  pixels: number;
+  maxDelta: number;
+}
+
+/** Decode two canvas renders ({@link canvasDataUrl}) in the page and compare them pixel by pixel. */
+export async function pixelDiff(page: Page, a: string, b: string): Promise<PixelDiff> {
+  return page.evaluate(async ([a, b]) => {
+    const decode = async (src: string): Promise<ImageData> => {
+      const image = new Image();
+      image.src = src;
+      await image.decode();
+      const canvas = document.createElement('canvas');
+      canvas.width = image.width;
+      canvas.height = image.height;
+      const context = canvas.getContext('2d')!;
+      context.drawImage(image, 0, 0);
+      return context.getImageData(0, 0, canvas.width, canvas.height);
+    };
+    const [x, y] = await Promise.all([decode(a), decode(b)]);
+    if (x.width !== y.width || x.height !== y.height) return { pixels: Infinity, maxDelta: 255 };
+    let pixels = 0;
+    let maxDelta = 0;
+    for (let i = 0; i < x.data.length; i += 4) {
+      let delta = 0;
+      for (let c = 0; c < 4; c++) delta = Math.max(delta, Math.abs(x.data[i + c]! - y.data[i + c]!));
+      if (delta > 0) pixels++;
+      maxDelta = Math.max(maxDelta, delta);
+    }
+    return { pixels, maxDelta };
+  }, [a, b] as const);
+}
+
 /**
  * The canvas pixel (CSS pixels, from the top left) of a geographic position: `map.project`,
  * geographic active or not, unless the page turned the geographic API off.

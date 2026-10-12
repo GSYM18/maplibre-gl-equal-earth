@@ -506,6 +506,24 @@ describe('withoutRewriteBounds', () => {
     expect(rewrite(captured).style.layers.some((l) => l.id === 'water__b0')).toBe(false);
   });
 
+  it("drops our bound where the original had a lower bound of its own that the new style leaves out", () => {
+    // The previous original bounds `water` at 3; the Mercator band's layer under the same id is
+    // bounded at max(3, its parse range's lower end).
+    const original = tiny(vec('water', 'fill', { minzoom: 3 }), vec('road', 'line', { minzoom: 3, maxzoom: 20 }));
+    const rewritten = rewrite(original).style;
+    const band = rewritten.layers.find((l) => l.id === 'water')!.minzoom!;
+    expect(band).toBeGreaterThan(3);
+    const next = tiny(vec('water', 'fill'), vec('road', 'line', { minzoom: 3 }));
+    const captured = diffed(rewritten, next);
+    expect(captured.layers[0]!.minzoom).toBe(band); // what MapLibre's diff left behind
+    const cleaned = withoutRewriteBounds(captured, rewritten, original);
+    expect(cleaned.layers[0]!.minzoom).toBeUndefined();
+    expect(cleaned.layers[1]!.minzoom).toBe(3); // set explicitly by the new style: diffed in, kept
+    expect(cleaned.layers[1]!.maxzoom).toBe(20); // the original's own, which a native diff keeps too
+    // Every band of the rewritten capture has its copy of `water` again.
+    expect(rewrite(cleaned).style.layers.filter((l) => l.id.startsWith('water'))).toHaveLength(SIX.bands.length);
+  });
+
   it('keeps bounds the original had, bounds that differ from ours, and replaced layers', () => {
     const original = tiny(vec('water', 'fill'), vec('road', 'line'), vec('rail', 'line'));
     const rewritten = rewrite(original).style;

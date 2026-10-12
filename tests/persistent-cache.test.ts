@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   CACHE_NAME_PREFIX,
   PersistentTileCache,
+  SWEEP_MARKER_KEY,
   hashSourceConfig,
   persistentKey,
 } from '../src/tiles/persistent-cache.js';
@@ -97,7 +98,7 @@ describe('the sweep after open (Ruling R25)', () => {
     await stored.put('live', entry(5000));
     const cache = new PersistentTileCache(storage, '1', () => 2000);
     expect(await cache.get('something-else')).toBeUndefined();
-    await vi.waitFor(() => expect([...stored.entries.keys()]).toEqual(['live']));
+    await vi.waitFor(() => expect([...stored.entries.keys()].sort()).toEqual(['live', SWEEP_MARKER_KEY].sort()));
   });
 
   it('caps the cache at 2000 entries, evicting the earliest-expiring first', async () => {
@@ -107,10 +108,37 @@ describe('the sweep after open (Ruling R25)', () => {
     for (let i = 2004; i >= 1; i--) await stored.put(`k${i}`, entry(10_000 + i));
     const cache = new PersistentTileCache(storage, '1', () => 0);
     await cache.get('k2004');
-    await vi.waitFor(() => expect(stored.entries.size).toBe(2000));
+    // The sweep's marker entry is not a tile and does not count.
+    await vi.waitFor(() => expect(stored.entries.size).toBe(2000 + 1));
+    expect(stored.entries.has(SWEEP_MARKER_KEY)).toBe(true);
     for (const gone of ['k1', 'k2', 'k3', 'k4']) expect(stored.entries.has(gone)).toBe(false);
     expect(stored.entries.has('k5')).toBe(true);
     expect(stored.entries.has('k2004')).toBe(true);
+  });
+
+  it('sweeps at most once a day per cache, whatever the number of page loads and workers', async () => {
+    const DAY = 86_400_000;
+    let now = 10 * DAY;
+    const storage = new FakeCacheStorage();
+    const stored = await storage.open('equal-earth-1');
+    await stored.put('expired', entry(now - 1));
+    const tiles = () => [...stored.entries.keys()].filter((key) => key !== SWEEP_MARKER_KEY);
+    const first = new PersistentTileCache(storage, '1', () => now);
+    await first.get('x');
+    await vi.waitFor(() => expect(tiles()).toEqual([]));
+    // Another worker, or the next page load, within the day: no second walk over the cache.
+    await stored.put('expired-later', entry(now - 1));
+    const keys = vi.spyOn(stored, 'keys');
+    now += DAY - 1;
+    await new PersistentTileCache(storage, '1', () => now).get('x');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(keys).not.toHaveBeenCalled();
+    expect(tiles()).toEqual(['expired-later']);
+    // A day after the last sweep, the next one sweeps again.
+    now += 2;
+    await new PersistentTileCache(storage, '1', () => now).get('x');
+    await vi.waitFor(() => expect(tiles()).toEqual([]));
+    expect(keys).toHaveBeenCalledTimes(1);
   });
 
   it('stays silent when keys() throws, and does not hold up get or put', async () => {

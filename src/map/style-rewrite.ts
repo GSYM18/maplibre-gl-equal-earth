@@ -300,10 +300,11 @@ export function restorableStyle(original: StyleLike, live: StyleLike | undefined
  * kept under its own id keeps the band's `minzoom` when the application's new style leaves the
  * bound out. Captured as the new original, that bound would be intersected into every band copy
  * and empty all the bands below it. So a bound is dropped when `rewritten` put it on that id,
- * `original` (the application's style kept until now) had none there, and `captured` carries
- * exactly that value: its presence is our artefact. A bound the new style sets to the same value
- * on purpose is dropped too; it cannot be told apart. Works from what MapLibre serialised, so
- * URL styles are covered. Returns `captured` itself when nothing is dropped.
+ * `original` (the application's style kept until now) had another value there or none (an
+ * original `minzoom: 3` becomes the band's 7.2), and `captured` carries exactly the rewrite's
+ * value: its presence is our artefact. A bound the new style sets to the same value on purpose is
+ * dropped too; it cannot be told apart. Works from what MapLibre serialised, so URL styles are
+ * covered. Returns `captured` itself when nothing is dropped.
  */
 export function withoutRewriteBounds(
   captured: StyleLike,
@@ -324,8 +325,8 @@ export function withoutRewriteBounds(
       band.source === layer.source &&
       band['source-layer'] === layer['source-layer'];
     return {
-      min: diffed && before.minzoom === undefined && band.minzoom !== undefined && layer.minzoom === band.minzoom,
-      max: diffed && before.maxzoom === undefined && band.maxzoom !== undefined && layer.maxzoom === band.maxzoom,
+      min: diffed && band.minzoom !== undefined && band.minzoom !== before.minzoom && layer.minzoom === band.minzoom,
+      max: diffed && band.maxzoom !== undefined && band.maxzoom !== before.maxzoom && layer.maxzoom === band.maxzoom,
     };
   };
   if (!captured.layers.some((layer) => Object.values(artefacts(layer)).some(Boolean))) return captured;

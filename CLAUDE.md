@@ -208,8 +208,9 @@ affects the absolute metre values from `toEqualEarth`.
   worker. Never rejects and never logs: a missing or throwing Cache API is a miss. The cache
   name carries the build id (`__EQE_VERSION__`), so a change that could alter a tile starts a
   fresh cache instead of serving stale tiles for a week; the key hashes the source config, API
-  key included, so a rotated key is a new namespace. One background sweep per worker drops
-  expired entries and caps the cache at 2000.
+  key included, so a rotated key is a new namespace. A background sweep drops expired entries
+  and caps the cache at 2000, at most once a day per cache (a marker entry,
+  `https://equal-earth.invalid/__sweep`, holds the last sweep's start), not once per worker.
 - `scripts/build-id.ts` — `__EQE_VERSION__` = `<version>+<hash>`: SHA-256 over the worker
   bundle's relative-import graph from `worker-entry.ts` (CRLF normalised) plus the bundled
   runtime dependencies' versions. Only the worker graph, so controller or camera edits keep the
