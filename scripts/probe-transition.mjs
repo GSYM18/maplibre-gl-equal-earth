@@ -19,6 +19,25 @@
  * SwiftShader renders a band in seconds, so `waited` values say nothing about real latency.
  * Exit 1: centre drift above 0.001° (centre anchor only), a map `error`, or an uncaught page
  * exception after the page was ready. Exit 2: the probe could not run (setup, timeout, bug).
+ *
+ * **First paint** (spec §1 criterion 4, `npm run probe:first-paint`):
+ *
+ *   node scripts/probe-transition.mjs --first-paint [--style URL] [--zoom-offset=-1] [--url URL]
+ *
+ * loads the demo at its default world view (1280×800) at 50 Mbit/s with 20 ms latency in one
+ * fresh profile: **cold** with the HTTP cache disabled and the origin's Cache Storage cleared,
+ * then **warm**, the HTTP cache enabled again and the page reloaded (the persistent tile cache
+ * the cold run filled now serves the world), then **cold, code cached**: the browser cache
+ * cleared, primed with the page's code alone (an empty style), Cache Storage cleared, loaded
+ * again (see the comment at that run for why). It prints `window.__eqe.firstPaintMs` of each
+ * against the spec's budgets (4000 ms cold, 1500 ms warm), the place labels MapLibre
+ * placed (`queryRenderedFeatures` on the shown band's symbol layers whose `source-layer` is
+ * `place`, after collision) and the bytes the page and its workers received. The page's
+ * throttling also governs its workers' fetches (the install, which waits for the workers'
+ * scripts, takes as long as their bytes at 50 Mbit/s); the workers are auto-attached for the
+ * cache setting and their byte count.
+ * Exit 0 whatever the budgets say: SwiftShader is no user's GPU, the numbers are indicative.
+ * Exit 2 on a map `error`, a page exception or a timeout.
  */
 import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, mkdtempSync, rmSync } from 'node:fs';
@@ -35,6 +54,9 @@ const { values: args } = parseArgs({
     chrome: { type: 'string' },
     port: { type: 'string', default: '9339' },
     timeout: { type: 'string', default: '900' },
+    'first-paint': { type: 'boolean', default: false },
+    style: { type: 'string' },
+    'zoom-offset': { type: 'string' },
   },
 });
 const MAX_DRIFT_DEG = 1e-3;
@@ -76,17 +98,15 @@ function findChrome() {
   return fail('no Chrome found; pass --chrome <path> or set CHROME_PATH.');
 }
 
-async function main() {
+/**
+ * Chrome on a fresh profile, and a DevTools connection to its page. `send` takes an optional
+ * `sessionId` for a target attached in flat mode (the page's workers); `on` registers a handler
+ * for every event of that name, whichever session sent it.
+ */
+async function connect() {
   if (typeof WebSocket !== 'function') {
     fail(`Node >= 22 required (global WebSocket); found ${process.version}.`);
   }
-  const anchor = args.anchor.split(',').map(Number);
-  if (anchor.length !== 2 || !anchor.every(Number.isFinite)) {
-    fail(`--anchor wants dx,dy; got "${args.anchor}"`);
-  }
-  const centred = anchor[0] === 0 && anchor[1] === 0;
-  const url = new URL(args.url);
-  if (args.steps) url.searchParams.set('steps', args.steps);
   const port = Number(args.port);
   const chromePath = findChrome();
   profile = mkdtempSync(join(tmpdir(), 'eqe-probe-'));
@@ -114,6 +134,10 @@ async function main() {
   let nextId = 0;
   const pending = new Map();
   const exceptions = [];
+  const handlers = new Map();
+  const on = (method, handler) => {
+    handlers.set(method, [...(handlers.get(method) ?? []), handler]);
+  };
   ws.addEventListener('message', (event) => {
     const msg = JSON.parse(event.data);
     const call = msg.id && pending.get(msg.id);
@@ -122,19 +146,22 @@ async function main() {
       if (msg.error) call.reject(new Error(`${call.method}: ${msg.error.message}`));
       else call.resolve(msg.result);
     }
-    if (msg.method === 'Runtime.exceptionThrown') {
+    if (msg.method === 'Runtime.exceptionThrown' && !msg.sessionId) {
       const details = msg.params.exceptionDetails;
       exceptions.push((details.exception?.description ?? details.text).slice(0, 400));
+    }
+    for (const handler of (msg.method && handlers.get(msg.method)) || []) {
+      handler(msg.params, msg.sessionId);
     }
   });
   ws.addEventListener('close', () => {
     for (const call of pending.values()) call.reject(new Error('DevTools connection closed'));
     pending.clear();
   });
-  const send = (method, params = {}) => new Promise((resolve, reject) => {
+  const send = (method, params = {}, sessionId = undefined) => new Promise((resolve, reject) => {
     const id = ++nextId;
     pending.set(id, { method, resolve, reject });
-    ws.send(JSON.stringify({ id, method, params }));
+    ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
   });
   const evaluate = async (expression) => {
     const result = await send('Runtime.evaluate', {
@@ -151,6 +178,17 @@ async function main() {
   await send('Emulation.setDeviceMetricsOverride', {
     width: 1280, height: 800, deviceScaleFactor: 1, mobile: false,
   });
+  return { send, evaluate, on, exceptions };
+}
+
+async function transitionProbe({ send, evaluate, exceptions }) {
+  const anchor = args.anchor.split(',').map(Number);
+  if (anchor.length !== 2 || !anchor.every(Number.isFinite)) {
+    fail(`--anchor wants dx,dy; got "${args.anchor}"`);
+  }
+  const centred = anchor[0] === 0 && anchor[1] === 0;
+  const url = new URL(args.url);
+  if (args.steps) url.searchParams.set('steps', args.steps);
   await send('Page.navigate', { url: url.href });
   const loadStart = Date.now();
   // A failure before `ready` is mostly the network (a style or TileJSON fetch): reload twice.
@@ -295,6 +333,179 @@ async function main() {
     : `max pointer snap ${maxOffset.toFixed(1)} px at ${anchor.join(',')} px, `) +
     `${errors.length} map errors, ${late.length} page exceptions`);
   return ok ? 0 : 1;
+}
+
+/** Spec §1 criterion 4: the world view at 1280×800 and 50 Mbit/s. */
+const BUDGET_MS = { cold: 4000, warm: 1500 };
+const THROTTLE = {
+  offline: false, latency: 20, downloadThroughput: 6_250_000, uploadThroughput: 1_250_000,
+};
+
+async function firstPaintProbe({ send, evaluate, on, exceptions }) {
+  const url = new URL(args.url);
+  if (args.style) url.searchParams.set('style', args.style);
+  if (args['zoom-offset'] !== undefined) {
+    const offset = Number(args['zoom-offset']);
+    if (!Number.isInteger(offset)) fail(`--zoom-offset wants an integer; got "${args['zoom-offset']}"`);
+    url.searchParams.set('zoomOffset', String(offset));
+  }
+
+  // The page's network conditions also govern its dedicated workers' fetches (a worker target
+  // answers `emulateNetworkConditions` with "Not supported"); the workers are attached for their
+  // traffic and their cache setting.
+  let cacheDisabled = true;
+  const workers = new Set();
+  const configure = async (sessionId) => {
+    await send('Network.enable', {}, sessionId);
+    if (!sessionId) await send('Network.emulateNetworkConditions', THROTTLE);
+    await send('Network.setCacheDisabled', { cacheDisabled }, sessionId);
+  };
+  /** What the page and its workers received in the current run, by kind of resource. */
+  let traffic;
+  const resetTraffic = () => {
+    traffic = { bytes: 0, responses: 0, fromCache: 0, groups: new Map() };
+  };
+  resetTraffic();
+  const urls = new Map();
+  /** `host tiles z<z>` for a tile, else `host .<extension>`. */
+  const groupOf = (href) => {
+    try {
+      const { host, pathname } = new URL(href);
+      const tile = /\/(\d+)\/\d+\/\d+\.(?:pbf|mvt)$/.exec(pathname);
+      return tile ? `${host} tiles z${tile[1]}` : `${host} .${/\.(\w+)$/.exec(pathname)?.[1] ?? '?'}`;
+    } catch {
+      return 'other';
+    }
+  };
+  on('Network.requestWillBeSent', (params, sessionId) => {
+    urls.set(`${sessionId}:${params.requestId}`, params.request.url);
+  });
+  on('Network.loadingFinished', (params, sessionId) => {
+    const bytes = params.encodedDataLength ?? 0;
+    const group = groupOf(urls.get(`${sessionId}:${params.requestId}`) ?? '');
+    const entry = traffic.groups.get(group) ?? { bytes: 0, responses: 0 };
+    entry.bytes += bytes;
+    entry.responses++;
+    traffic.groups.set(group, entry);
+    traffic.bytes += bytes;
+    traffic.responses++;
+  });
+  on('Network.requestServedFromCache', () => {
+    traffic.fromCache++;
+  });
+  on('Network.responseReceived', (params) => {
+    if (params.response.fromDiskCache) traffic.fromCache++;
+  });
+  on('Target.attachedToTarget', (params) => {
+    const { sessionId, targetInfo } = params;
+    const setUp = targetInfo.type === 'worker'
+      ? configure(sessionId).then(() => workers.add(sessionId))
+      : Promise.resolve();
+    // A worker that cannot take the Network domain must still run.
+    void setUp
+      .catch((error) => console.log(`  (worker ${targetInfo.url}: ${error.message})`))
+      .finally(() => send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {}));
+  });
+  on('Target.detachedFromTarget', (params) => workers.delete(params.sessionId));
+  await send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
+  await configure(undefined);
+
+  /** The traffic up to the first paint (read within 100 ms of it). */
+  let atPaint;
+  /** Waits for this document's first paint, then counts the labels it placed. */
+  const measure = async (label) => {
+    const t0 = Date.now();
+    for (;;) {
+      const page = await evaluate(`JSON.stringify({
+        stale: !window.__eqe || !!window.__eqe.stale, ms: window.__eqe?.firstPaintMs ?? null,
+        errors: window.__eqe?.errors ?? [] })`).then(JSON.parse, () => ({ stale: true }));
+      if (!page.stale && page.errors.length) {
+        fail(`${label}: the page reported errors:\n  ${page.errors.join('\n  ')}`);
+      }
+      if (exceptions.length) fail(`${label}: page exception:\n  ${exceptions.join('\n  ')}`);
+      if (!page.stale && page.ms !== null) {
+        atPaint = { ...traffic, groups: new Map(traffic.groups) };
+        break;
+      }
+      if (Date.now() - t0 > 180_000) fail(`${label}: no first paint after 180 s`);
+      await sleep(100);
+    }
+    await sleep(800); // until the labels' placement has settled
+    return evaluate(`(() => {
+      const { map: m, controller, shownBand, transition } = window.__eqe;
+      const band = shownBand();
+      const ofBand = (id) => !controller.active ? true
+        : /__b\\d+$/.test(id) ? id.endsWith('__b' + band) : band === transition.steps;
+      const symbols = m.getStyle().layers.filter((l) => l.type === 'symbol' && ofBand(l.id));
+      const query = (layers) => layers.length
+        ? m.queryRenderedFeatures({ layers: layers.map((l) => l.id) }) : [];
+      const place = query(symbols.filter((l) => l['source-layer'] === 'place'));
+      const names = new Set(place.map((f) => f.properties.name ?? f.properties['name:latin']));
+      const marks = Object.fromEntries(performance.getEntriesByType('mark')
+        .map((e) => [e.name.replace('eqe:', ''), e.startTime]));
+      return { ms: window.__eqe.firstPaintMs, marks, zoom: m.getZoom(), band, place: place.length,
+        distinct: names.size, symbols: query(symbols).length,
+        workerPath: window.__eqe.install.workerPath };
+    })()`);
+  };
+  const report = (label, result) => {
+    const budget = BUDGET_MS[label.startsWith('cold') ? 'cold' : 'warm'];
+    console.log(`${label} ${result.ms.toFixed(0)} (budget ${budget}) ` +
+      `${result.ms <= budget ? 'PASS' : 'MISS'}`);
+    const at = (name) => (result.marks[name] === undefined ? '–'
+      : `${(result.marks[name] - result.marks.start).toFixed(0)} ms`);
+    console.log(`  installed ${at('installed')}, active ${at('active')}, first idle ` +
+      `${at('first-idle')} after the module started`);
+    console.log(`  z${result.zoom.toFixed(2)} b${result.band}, warped on: ${result.workerPath}; ` +
+      `place labels placed ${result.place} ` +
+      `(${result.distinct} distinct names), all symbols ${result.symbols}`);
+    console.log(`  received by the first paint: ${(atPaint.bytes / 1024).toFixed(0)} kB in ` +
+      `${atPaint.responses} responses (${atPaint.fromCache} from the HTTP cache), the largest:`);
+    const largest = [...atPaint.groups].sort((a, b) => b[1].bytes - a[1].bytes).slice(0, 6);
+    for (const [group, { bytes, responses }] of largest) {
+      console.log(`    ${(bytes / 1024).toFixed(0).padStart(6)} kB  ${String(responses).padStart(3)}  ${group}`);
+    }
+  };
+
+  /** Loads `href` (or reloads) with the HTTP cache on or off and measures its first paint. */
+  const load = async (label, href, { disableCache, clearStorage }) => {
+    cacheDisabled = disableCache;
+    for (const sessionId of [undefined, ...workers]) {
+      await send('Network.setCacheDisabled', { cacheDisabled }, sessionId).catch(() => {});
+    }
+    if (clearStorage) {
+      await send('Storage.clearDataForOrigin', { origin: url.origin, storageTypes: 'cache_storage' });
+    }
+    await evaluate('void (window.__eqe && (window.__eqe.stale = true))');
+    resetTraffic();
+    if (href) await send('Page.navigate', { url: href });
+    else await send('Page.reload', { ignoreCache: false });
+    return measure(label);
+  };
+
+  console.log(`first paint: ${url.href}, 1280×800, 50 Mbit/s down, 20 ms latency`);
+  report('cold', await load('cold', url.href, { disableCache: true, clearStorage: true }));
+  report('warm', await load('warm', undefined, { disableCache: false, clearStorage: false }));
+
+  // The cold run fetches the application's code as the dev server serves it: unminified, with
+  // inline source maps, once per worker with the cache off (~23 MB for MapLibre's worker modules
+  // alone). So once more with an empty HTTP cache that holds only that code: the map data (style,
+  // TileJSON, glyphs, sprites, tiles) and the tile cache are cold, as on a first visit to an
+  // application whose code is small and cached, or served from a CDN.
+  await send('Network.clearBrowserCache');
+  const codeOnly = new URL(url);
+  codeOnly.searchParams.set('style', `data:application/json,${JSON.stringify(
+    { version: 8, sources: {}, layers: [] })}`);
+  codeOnly.searchParams.set('projection', 'mercator');
+  await load('code', codeOnly.href, { disableCache: false, clearStorage: true });
+  report('cold, code cached', await load('cold, code cached', url.href,
+    { disableCache: false, clearStorage: true }));
+  return 0;
+}
+
+async function main() {
+  const cdp = await connect();
+  return args['first-paint'] ? firstPaintProbe(cdp) : transitionProbe(cdp);
 }
 
 const watchdog = setTimeout(() => {

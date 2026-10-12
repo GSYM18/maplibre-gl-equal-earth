@@ -86,7 +86,8 @@
  *   (the live style is still ours). Its style arrives and is captured, which supersedes them and,
  *   as natively, drops what was edited on the old style; or the fetch fails or changes nothing, and
  *   they go ahead with the edits. A deactivation restores at once and asks for the URL again, or,
- *   when the live style is not ours (an activation still waiting for the fetch), leaves it alone (R22).
+ *   when the live style is not ours (an activation still waiting for the fetch) and carries no zoom
+ *   bound our rewrite left behind, leaves it alone (R22, R23; {@link #restoreOriginal}).
  * - Edits made while an activation fetches its TileJSON are taken before it commits; edits made
  *   while a re-apply is in flight reach the original it rewrites, and an amend follows the apply
  *   once it has finished (R17).

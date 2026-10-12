@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Equal Earth for MapLibre GL JS — adaptive transition</title>
+    <title>Equal Earth for MapLibre GL JS — any style</title>
     <style>
       .panel {
         position: absolute;
@@ -20,7 +20,9 @@
         pointer-events: none;
       }
       .panel button,
-      .panel pre {
+      .panel pre,
+      .panel a,
+      .panel input {
         pointer-events: auto;
       }
       .panel button {
@@ -33,10 +35,31 @@
         cursor: pointer;
       }
       .panel #cities,
-      .panel #controls {
+      .panel #controls,
+      .panel #presets,
+      .panel form {
         display: flex;
         flex-wrap: wrap;
         gap: 6px;
+      }
+      .panel #presets {
+        align-items: center;
+      }
+      .panel a {
+        padding: 4px 8px;
+        border-radius: 4px;
+        background: rgb(9 18 28 / 85%);
+        color: #9fd3ff;
+      }
+      .panel input {
+        font: inherit;
+        width: 22em;
+        max-width: 55vw;
+        padding: 5px 8px;
+        border: 1px solid #3d7ea6;
+        border-radius: 4px;
+        background: #0b1620;
+        color: #e8eef5;
       }
       .panel pre {
         margin: 0;
@@ -55,6 +78,7 @@
     <div class="panel">
       <div id="cities"></div>
       <div id="controls"></div>
+      <div id="presets"></div>
       <pre id="readout">loading…</pre>
     </div>
     <script type="module" src="./transition.ts"></script>

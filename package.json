@@ -67,6 +67,7 @@
     "preview": "vite preview",
     "check:exports": "node scripts/check-exports.mjs && node scripts/check-worker-bundles.mjs",
     "probe:transition": "node scripts/probe-transition.mjs",
+    "probe:first-paint": "node scripts/probe-transition.mjs --first-paint",
     "verify": "npm run lint && npm run typecheck && npm test && npm run build && npm run check:exports && npm run test:browser",
     "prepublishOnly": "npm run verify"
   },
