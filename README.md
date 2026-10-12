@@ -563,9 +563,9 @@ stays 0; whether to revisit the budget is an open product decision.
   dropped with the old style, as in MapLibre, when it arrives). A layer added while such a
   style is still loading shows unwarped until that style arrives. A deactivation meanwhile
   puts your original style back and requests the URL again, so that MapLibre diffs your style
-  in as it would have without the plugin. Only when the live style is no longer ours (an
-  activation still waiting for your fetch) and nothing of ours is left on it (no zoom bound of
-  the rewrite) does the deactivation leave the live style and the fetch alone.
+  in as it would have without the plugin. When the live style is no longer ours (an activation
+  still waiting for your fetch), the deactivation leaves the live style and the fetch alone; it
+  only takes away, with `setLayerZoomRange`, any zoom bound the rewrite left on its layers.
 - **`minzoom: 0` after deactivation.** MapLibre's style diff cannot take a zoom bound away, so a
   layer the Mercator band bounded under its own id is restored with an explicit `minzoom: 0`.
   It draws exactly as without the bound, but `getStyle()` then reports `minzoom: 0` on layers
