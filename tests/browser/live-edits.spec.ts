@@ -165,3 +165,30 @@ test('under equal at z2, a layer-scoped click listener on a fixture layer fires,
   expect(hits.every((id) => /^places__b\d+$/.test(id)), hits.join()).toBe(true);
   expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
 });
+
+test('under equal at z2, feature state on the fixture source shows in the band drawn, and querySourceFeatures reads that band (I2)', async ({ page, mlv }) => {
+  await openHarness(page, { mlv, projection: 'equal' });
+  await centreOn(page, TOKYO, 2);
+  expect(await page.evaluate(() => window.__h.controller!.blend)).toBe(0); // an Equal Earth band, not Mercator
+  await page.evaluate(() => {
+    const { map } = window.__h;
+    map.setPaintProperty('places', 'circle-color', ['case', ['boolean', ['feature-state', 'hover'], false], '#00ff00', '#cc3333']);
+    map.setPaintProperty('places', 'circle-radius', 8);
+  });
+  await idle(page);
+  expect(await colourIs(page, [0xcc, 0x33, 0x33])).toBe(true);
+
+  const tokyo = { source: 'fixture', sourceLayer: 'places', id: 201 }; // the fixture's Tokyo
+  await page.evaluate((target) => window.__h.map.setFeatureState(target, { hover: true }), tokyo);
+  await idle(page);
+  expect(await colourIs(page, [0, 255, 0])).toBe(true);
+  expect(await page.evaluate((target) => window.__h.map.getFeatureState(target) as Record<string, unknown>, tokyo)).toEqual({ hover: true });
+  // The Mercator band's source under the id itself has no tile at z2: the band shown's copy has.
+  const ids = await page.evaluate(() => window.__h.map.querySourceFeatures('fixture', { sourceLayer: 'places' }).map((f) => f.id));
+  expect(ids).toContain(201);
+
+  await page.evaluate((target) => window.__h.map.removeFeatureState(target, 'hover'), tokyo);
+  await idle(page);
+  expect(await colourIs(page, [0xcc, 0x33, 0x33])).toBe(true);
+  expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
+});

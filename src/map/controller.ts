@@ -45,10 +45,10 @@
  * the source's next wrapped update.
  *
  * **Live style edits** (Task 9). The map's `addSource`, `removeSource`, `addLayer`, `removeLayer`,
- * `setPaintProperty`, `setLayoutProperty` and `setFilter` (and `setStyle`, `fire` and the reads
- * below) are wrapped on the instance when the controller is constructed, and pass straight
- * through while Equal Earth is off. While it is on,
- * an edit addresses the application's ids, which name the original's layers and sources:
+ * `setPaintProperty`, `setLayoutProperty` and `setFilter` (and `setStyle`, `fire`, the reads and
+ * the feature-state methods below) are wrapped on the instance when the controller is
+ * constructed, and pass straight through while Equal Earth is off. While it is on, an edit
+ * addresses the application's ids, which name the original's layers and sources:
  *
  * - A property edit is written to every live copy of the layer and kept in the original. A gated
  *   value (an opacity the switcher fades, a hidden-by-visibility layer's `visibility`) becomes the
@@ -108,6 +108,13 @@
  *   original id to every live layer drawing it (R26): under `equal` the id itself is the Mercator
  *   band's layer, out of range in every Equal Earth band, so it alone would find nothing there and
  *   layer-scoped listeners would stay silent. Their features carry the copy's id (`<id>__b<k>`).
+ * - Feature state follows the bands (I2): `setFeatureState` and `removeFeatureState` on an original
+ *   source, addressed by its id or a copy's (a rendered feature's `source`), reach it and every live
+ *   band copy (once refused, as natively, when MapLibre refuses the first); `getFeatureState` reads
+ *   the band shown, as does `querySourceFeatures` given an original id (its geometry is then that
+ *   band's map space). The features written are indexed, active or not, and a band source a later
+ *   apply or amend creates anew gets their state from the original source, which MapLibre empties
+ *   itself when the application's style replaces it.
  *
  * The plugin's own writes and reads never pass through these wrappers (rule 4): the switcher's
  * gates and every call the controller makes use MapLibre's methods as found before wrapping.
@@ -221,6 +228,11 @@ export interface ControllerHost extends CameraHost, ConstrainHost, SwitcherHost,
   getPaintProperty?(layerId: string, name: string): unknown;
   getLayoutProperty?(layerId: string, name: string): unknown;
   getFilter?(layerId: string): unknown;
+  /** This and the next three reach every band's source while active (I2); both majors have them. */
+  setFeatureState?(feature: unknown, state: unknown): unknown;
+  removeFeatureState?(target: unknown, key?: string): unknown;
+  getFeatureState?(feature: unknown): unknown;
+  querySourceFeatures?(sourceId: string, parameters?: unknown): unknown;
 }
 
 /** MapLibre's own style edits, as found before the controller wrapped them (rule 4). */
@@ -240,6 +252,10 @@ interface RawStyle {
   getLayoutProperty(...args: unknown[]): unknown;
   getFilter(...args: unknown[]): unknown;
   queryRenderedFeatures(...args: unknown[]): unknown;
+  setFeatureState(target: unknown, ...rest: unknown[]): unknown;
+  removeFeatureState(target: unknown, ...rest: unknown[]): unknown;
+  getFeatureState(target: unknown, ...rest: unknown[]): unknown;
+  querySourceFeatures(sourceId: unknown, ...rest: unknown[]): unknown;
 }
 
 /** The style reads that resolve an original id while active (R18), by their id argument. */
@@ -257,6 +273,10 @@ const RAW_METHODS = [
   'setLayerZoomRange',
   ...LAYER_READS,
   'queryRenderedFeatures',
+  'setFeatureState',
+  'removeFeatureState',
+  'getFeatureState',
+  'querySourceFeatures',
 ] as const satisfies readonly (keyof RawStyle)[];
 
 const STYLE_EDITS = [
@@ -1115,6 +1135,7 @@ export class EqualEarthController {
     switcher.start();
     const installed: Installed = { switcher, camera, uninstallConstrain, geojson: new Map() };
     this.#wrapGeoJSONSources(installed, rewritten.geojsonSources);
+    this.#seedFeatureState();
     this.#installed = installed;
     this.#view = undefined;
     this.#settle();
@@ -1418,6 +1439,19 @@ export class EqualEarthController {
     restores.push(
       wrapMethod<Edit>(host, 'queryRenderedFeatures', () => (...args) => raw.queryRenderedFeatures(...this.#resolveQuery(args))),
     );
+    // I2: feature state reaches every band's source, and is read, as `querySourceFeatures` is,
+    // from the band shown.
+    restores.push(
+      wrapMethod<Edit>(host, 'setFeatureState', () => (feature, ...rest) => this.#writeFeatureState('set', feature, rest)),
+      wrapMethod<Edit>(host, 'removeFeatureState', () => (target, ...rest) => this.#writeFeatureState('remove', target, rest)),
+      wrapMethod<Edit>(host, 'getFeatureState', () => (feature, ...rest) => raw.getFeatureState(this.#shownTarget(feature), ...rest)),
+      wrapMethod<Edit>(host, 'querySourceFeatures', () => (sourceId, ...rest) => {
+        // An original id reads the band shown; a copy's id, which the application took from a
+        // rendered feature, reads that copy.
+        const source = this.#originalSource(sourceId) === sourceId ? this.#shownSource(sourceId as string) : sourceId;
+        return raw.querySourceFeatures(source, ...rest);
+      }),
+    );
     // R15, R21: the plugin's own `setStyle` is invisible, as a native `addLayer` or `setProjection`
     // is: the `style.load` it fires (`Style.setState`, bubbling through the Map's `fire`) is
     // counted, not delivered.
@@ -1529,6 +1563,131 @@ export class EqualEarthController {
     const copy = [...args];
     copy[at] = { ...options, layers: layers instanceof Set ? new Set(resolved) : resolved };
     return copy;
+  }
+
+  /**
+   * The original source an application's source id stands for while our style is live (I2): the
+   * id itself when the original has it, else the source a band copy `<id>__b<k>` was made from
+   * (the `source` of a rendered feature). `undefined` while inactive, while the live style is not
+   * ours, and for any other id.
+   */
+  #originalSource(id: unknown): string | undefined {
+    const original = typeof id === 'string' ? this.#following() : undefined;
+    if (!original || typeof id !== 'string') return undefined;
+    if (id in original.sources) return id;
+    const match = /^(.+)__b(\d+)$/.exec(id);
+    const base = match?.[1];
+    const band = Number(match?.[2]);
+    if (base === undefined || !(base in original.sources) || !(band < this.#bands.length)) return undefined;
+    return bandSourceId(base, this.#bands, band) === id ? base : undefined;
+  }
+
+  /** The live sources drawing original source `id`: itself, then each band's copy. */
+  #liveSources(id: string): string[] {
+    const bands = this.#bands;
+    const ids = [id, ...bands.flatMap((band, k) => (band.blend < 1 ? [bandSourceId(id, bands, k)] : []))];
+    return ids.filter((source) => this.#host.getSource(source) !== undefined);
+  }
+
+  /** The source the band shown draws original source `id` from: its copy, else `id` itself. */
+  #shownSource(id: string): string {
+    const shown = this.#installed?.switcher.current();
+    if (shown === undefined || !(shown < this.#bands.length)) return id;
+    const copy = bandSourceId(id, this.#bands, shown);
+    return this.#host.getSource(copy) !== undefined ? copy : id;
+  }
+
+  /** A feature identifier read from the band shown, when its source is an original's or a copy's. */
+  #shownTarget(feature: unknown): unknown {
+    const base = isRecord(feature) ? this.#originalSource(feature['source']) : undefined;
+    if (base === undefined || !isRecord(feature)) return feature;
+    const source = this.#shownSource(base);
+    return source === feature['source'] ? feature : { ...feature, source };
+  }
+
+  /**
+   * The application's `setFeatureState` (`set`) or `removeFeatureState` (`remove`): while our style
+   * is live, the state of an original source (addressed by its id or a copy's) goes to it and to
+   * every live band copy, so a highlight shows in whichever band is drawn and survives a switch.
+   * The first call is made as MapLibre would take it: if MapLibre refuses it (an `error` event, as
+   * for a vector source without `sourceLayer`), nothing else is written, so the refusal comes
+   * once. A write is indexed ({@link #stateIndex}), active or not, for the band sources a later
+   * rewrite creates.
+   */
+  #writeFeatureState(kind: 'set' | 'remove', target: unknown, rest: unknown[]): unknown {
+    const raw = this.#rawStyle;
+    const call = (to: unknown): unknown => (kind === 'set' ? raw.setFeatureState(to, ...rest) : raw.removeFeatureState(to, ...rest));
+    if (!isRecord(target)) return call(target);
+    const given = target['source'];
+    const base = this.#originalSource(given);
+    const sources = base === undefined ? [] : this.#liveSources(base);
+    const to = (source: string): Record<string, unknown> => (source === given ? target : { ...target, source });
+    let result: unknown;
+    const errors = this.#countErrors(() => {
+      result = call(sources[0] === undefined ? target : to(sources[0]));
+    });
+    if (errors > 0) return result;
+    const key = base ?? given;
+    if (kind === 'set' && typeof key === 'string') this.#indexFeature(key, target);
+    for (const source of sources.slice(1)) call(to(source));
+    return result;
+  }
+
+  /**
+   * Original source id → `<sourceLayer>/<id>` → the feature: every feature the application set
+   * state on, for {@link #seedFeatureState}. The state itself is read from the original source then
+   * (MapLibre's own record, which a removal or a replaced source empties), so only keys are kept.
+   */
+  readonly #stateIndex = new Map<string, Map<string, { sourceLayer?: string; id: unknown }>>();
+  /** Band source objects {@link #seedFeatureState} has dealt with. */
+  readonly #seeded = new WeakSet<object>();
+
+  #indexFeature(source: string, target: Record<string, unknown>): void {
+    const sourceLayer = typeof target['sourceLayer'] === 'string' ? target['sourceLayer'] : undefined;
+    let features = this.#stateIndex.get(source);
+    if (!features) {
+      features = new Map();
+      this.#stateIndex.set(source, features);
+    }
+    features.set(`${sourceLayer ?? ''}/${String(target['id'])}`, { ...(sourceLayer === undefined ? {} : { sourceLayer }), id: target['id'] });
+  }
+
+  /**
+   * Give each live band copy that is a new source object (a rewrite added or replaced it) the
+   * feature state the application set (I2): MapLibre keeps state with the source object only. The
+   * state comes from the original source, which every write reached and which MapLibre empties
+   * itself when the application's style replaces it; a feature it holds no state for any more is
+   * forgotten. Runs after each apply and amend.
+   */
+  #seedFeatureState(): void {
+    const original = this.#original;
+    const rewritten = this.#rewritten;
+    if (!original || !rewritten) return;
+    for (const source of this.#stateIndex.keys()) if (!(source in original.sources)) this.#stateIndex.delete(source);
+    const raw = this.#rawStyle;
+    try {
+      for (const source of rewritten.bandedSources) {
+        const fresh = this.#liveSources(source).filter((id) => {
+          const object = this.#host.getSource(id);
+          if (id === source || typeof object !== 'object' || object === null || this.#seeded.has(object)) return false;
+          this.#seeded.add(object);
+          return true;
+        });
+        const features = this.#stateIndex.get(source);
+        if (fresh.length === 0 || !features) continue;
+        for (const [key, feature] of features) {
+          const target = { source, ...(feature.sourceLayer === undefined ? {} : { sourceLayer: feature.sourceLayer }), id: feature.id };
+          const state = raw.getFeatureState(target);
+          if (!isRecord(state) || Object.keys(state).length === 0) {
+            features.delete(key);
+            continue;
+          }
+          for (const id of fresh) raw.setFeatureState({ ...target, source: id }, state);
+        }
+      }
+    } catch (error) {
+      reportError(this.#host, error);
+    }
   }
 
   #addSource(id: unknown, source: unknown, rest: unknown[]): unknown {
@@ -1919,6 +2078,7 @@ export class EqualEarthController {
       }
       this.#lastAccepted = accepted;
       this.#wrapGeoJSONSources(installed, rewritten.geojsonSources);
+      this.#seedFeatureState();
     } catch (error) {
       reportError(this.#host, error);
     }

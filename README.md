@@ -174,8 +174,8 @@ A few rules follow from there being only one world:
   the padding as they do in Mercator. A `cameraForBounds` result is valid for the camera state
   at the time of the call: apply it before the camera moves on.
 
-**Not converted** (map space in and out): `queryRenderedFeatures` geometry and `getStyle()`
-contents (sources' data, layer coordinates), `getMaxBounds`/`setMaxBounds`,
+**Not converted** (map space in and out): `queryRenderedFeatures` and `querySourceFeatures`
+geometry, `getStyle()` contents (sources' data, layer coordinates), `getMaxBounds`/`setMaxBounds`,
 `calculateCameraOptionsFromTo`/`calculateCameraOptionsFromCameraLngLatAltRotation`, and deck.gl
 overlays. For those, convert by hand:
 
@@ -252,6 +252,20 @@ Under pure Equal Earth only the copies exist; `getLayer(id)`, `getPaintProperty`
 usual `if (!map.getLayer(id)) map.addLayer(…)` guard keeps working. The layer `getLayer`
 returns is that copy: its `id` is `<id>__b<k>`. Under `equal` your id itself is the Mercator
 band's layer (when that band draws it), which `getLayer` returns.
+
+**Feature state works in every band.** `setFeatureState` and `removeFeatureState` on one of your
+sources reach it and every band's copy of it, so a hover or selection highlight
+(`['feature-state', 'hover']` in a paint property) shows in whichever band is drawn and survives
+band switches, re-applies and toggling Equal Earth. Address the source by your id or by a
+copy's: the `feature.source` of a rendered feature (`<source>__b<k>`) works as it is, so the
+usual `map.setFeatureState(e.features[0], { hover: true })` keeps working. `getFeatureState`
+reads the band shown. A call MapLibre refuses (a vector source without `sourceLayer`, say) is
+refused once, as without the plugin.
+
+`querySourceFeatures(id)` with one of your source ids reads the band shown, whose tiles are
+loaded (under `equal` the source under your id belongs to the Mercator band, which loads no tiles
+below its zoom range). Its geometry is that band's map space, as `queryRenderedFeatures`' is; a
+copy's id (`<source>__b<k>`) reads that copy.
 
 `setLayerZoomRange` and `moveLayer` are not fanned out: they reach only the layer under your id
 (the Mercator band's), and the next such diff or the deactivation undoes them.
@@ -526,13 +540,16 @@ stays 0; whether to revisit the budget is an open product decision.
 
 ## Limitations
 
-- **Map space where the API is not wrapped.** `queryRenderedFeatures` geometry, `getStyle()`
-  contents, `getMaxBounds`/`setMaxBounds`, `calculateCameraOptionsFrom*` and deck.gl overlays
-  are in the shown band's map space ([Data in, geo out](#data-in-geo-out)). Positions you
-  converted belong to the band shown at the time; re-convert on `onSwitch`. With
+- **Map space where the API is not wrapped.** `queryRenderedFeatures` and `querySourceFeatures`
+  geometry, `getStyle()` contents, `getMaxBounds`/`setMaxBounds`, `calculateCameraOptionsFrom*`
+  and deck.gl overlays are in the shown band's map space ([Data in, geo out](#data-in-geo-out)).
+  Positions you converted belong to the band shown at the time; re-convert on `onSwitch`. With
   `geographicApi: false` this applies to everything. `GeolocateControl` checks a geographic
   position against `getMaxBounds()`, which is map space: with `maxBounds` set, its
   out-of-bounds test is wrong.
+- **Feature state on clusters.** State on your features (by `id` or `promoteId`) reaches every
+  band. A cluster's id is not yours: each band copy of a clustered GeoJSON source clusters on its
+  own, so state set on a cluster id lands on whatever cluster has that id in the other bands.
 - **`fitBounds` and the gate.** `fitBounds` chooses the band its fitted zoom lands in without
   the switcher's hysteresis. Arriving from above at a zoom just under a band boundary, the
   switcher may keep the upper band for that frame, and the fit overshoots the padding by a few

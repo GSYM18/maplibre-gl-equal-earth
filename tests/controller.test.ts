@@ -2142,3 +2142,130 @@ describe('live style edits (Task 9)', () => {
     for (const name of methods) expect(own(b.host, name), name).toBe(false);
   });
 });
+
+describe('feature state and querySourceFeatures (I2, R27)', () => {
+  const BANDED = ['openmaptiles', 'openmaptiles__b0', 'openmaptiles__b1', 'openmaptiles__b2', 'openmaptiles__b3', 'openmaptiles__b4', 'openmaptiles__b5'];
+  const WATER = { source: 'openmaptiles', sourceLayer: 'water', id: 7 };
+  /** MapLibre's own state of one source, read past the controller's wrapper. */
+  const rawState = (host: FakeControllerHost, source: string, target: { sourceLayer?: string; id: number } = WATER) =>
+    FakeControllerHost.prototype.getFeatureState.call(host, { ...target, source });
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+  it('a write fans out to the original source and every live band copy; a read gets the band shown', async () => {
+    const { host, controller } = setup(); // z4.6: band 1 shown
+    host.on('error', () => undefined);
+    await controller.activate('equal');
+    host.setFeatureState(WATER, { hover: true });
+    for (const source of BANDED) expect(rawState(host, source), source).toEqual({ hover: true });
+    // A write addressed to a copy (`feature.source` of a rendered feature) reaches them all too.
+    host.setFeatureState({ ...WATER, source: 'openmaptiles__b3', id: 8 }, { selected: true });
+    for (const source of BANDED) expect(rawState(host, source, { sourceLayer: 'water', id: 8 }), source).toEqual({ selected: true });
+    // Reads come from the band shown.
+    FakeControllerHost.prototype.setFeatureState.call(host, { ...WATER, source: 'openmaptiles__b1' }, { only: 'b1' });
+    expect(host.getFeatureState(WATER)).toEqual({ hover: true, only: 'b1' });
+    expect(host.getFeatureState({ ...WATER, source: 'openmaptiles__b4' })).toEqual({ hover: true, only: 'b1' });
+    host.removeFeatureState(WATER, 'hover');
+    for (const source of BANDED) expect(rawState(host, source)?.['hover'], source).toBeUndefined();
+    host.removeFeatureState({ source: 'openmaptiles', sourceLayer: 'water' });
+    for (const source of BANDED) expect(rawState(host, source, { sourceLayer: 'water', id: 8 }), source).toEqual({});
+    expect(host.errors).toEqual([]);
+    expect(host.styleErrors).toEqual([]);
+  });
+
+  it('a call MapLibre refuses is refused once, as natively, and kept nowhere', async () => {
+    const { host, controller } = setup();
+    host.on('error', () => undefined);
+    await controller.activate('equal');
+    host.setFeatureState({ source: 'openmaptiles', id: 7 }, { hover: true }); // a vector source needs its sourceLayer
+    expect(host.styleErrors).toEqual(['The sourceLayer parameter must be provided for vector source types.']);
+    host.setFeatureState({ source: 'nowhere', sourceLayer: 'water', id: 7 }, { hover: true });
+    expect(host.styleErrors).toHaveLength(2);
+    expect(host.edits.filter((edit) => edit.method === 'setFeatureState')).toHaveLength(2);
+  });
+
+  it('reaches every band under pure Equal Earth, and a GeoJSON source without a sourceLayer', async () => {
+    const style = liberty();
+    style.sources['pts'] = { type: 'geojson', data: { type: 'FeatureCollection', features: [{ type: 'Feature', id: 1, properties: {}, geometry: { type: 'Point', coordinates: TOKYO } }] } };
+    style.layers.push({ id: 'dots', type: 'circle', source: 'pts' });
+    const { host, controller } = setup(2, style);
+    host.on('error', () => undefined);
+    await controller.activate('equal-earth');
+    host.setFeatureState({ source: 'pts', id: 1 }, { hover: true });
+    expect(rawState(host, 'pts__b0', { id: 1 })).toEqual({ hover: true });
+    expect(rawState(host, 'pts', { id: 1 })).toEqual({ hover: true });
+    expect(host.getFeatureState({ source: 'pts', id: 1 })).toEqual({ hover: true });
+    host.setFeatureState(WATER, { hover: true });
+    expect(rawState(host, 'openmaptiles__b0')).toEqual({ hover: true });
+    expect(host.styleErrors).toEqual([]);
+  });
+
+  it('band sources a re-apply or an amend creates anew get the state; one the application replaced does not', async () => {
+    const { host, controller } = setup();
+    host.on('error', () => undefined);
+    host.setFeatureState(WATER, { selected: true }); // while inactive: the application's source alone
+    await controller.activate('equal');
+    for (const source of BANDED) expect(rawState(host, source), source).toEqual({ selected: true });
+    // The application's own style, diffed over ours: the band sources go, the re-apply adds new ones.
+    host.setStyle(liberty(), {});
+    await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+    for (const source of BANDED) expect(rawState(host, source), source).toEqual({ selected: true });
+    // Off and on again: every band source is new.
+    await controller.deactivate();
+    await controller.activate('equal');
+    for (const source of BANDED) expect(rawState(host, source), source).toEqual({ selected: true });
+    // A style that replaces the source: MapLibre drops its state, and so do the copies.
+    const other = liberty();
+    other.sources['openmaptiles']!['url'] = 'https://tiles.example/other';
+    host.setStyle(other, {});
+    await vi.waitFor(() => expect(host._camera.transformCameraUpdate).not.toBeNull());
+    await tick();
+    for (const source of BANDED) expect(rawState(host, source), source).toEqual({});
+    expect(host.styleErrors).toEqual([]);
+  });
+
+  it('an amend that adds a source seeds nothing it was not asked to, and keeps the state of the sources it keeps', async () => {
+    const { host, controller } = setup();
+    host.on('error', () => undefined);
+    await controller.activate('equal');
+    host.setFeatureState(WATER, { hover: true });
+    const writes = host.edits.filter((edit) => edit.method === 'setFeatureState').length;
+    host.addLayer({ id: 'extra', type: 'line', source: 'openmaptiles', 'source-layer': 'transportation' });
+    await tick();
+    expect(host.getLayer('extra__b1')).toBeDefined();
+    for (const source of BANDED) expect(rawState(host, source), source).toEqual({ hover: true });
+    expect(host.edits.filter((edit) => edit.method === 'setFeatureState')).toHaveLength(writes); // nothing re-written
+  });
+
+  it('passes straight through while inactive', async () => {
+    const { host, controller } = setup();
+    host.on('error', () => undefined);
+    host.setFeatureState({ ...WATER, source: 'openmaptiles__b1' }, { hover: true });
+    expect(host.styleErrors).toEqual(["The source 'openmaptiles__b1' does not exist in the map's style."]);
+    await controller.activate('equal');
+    await controller.deactivate();
+    host.setFeatureState(WATER, { hover: true });
+    expect(host.edits.filter((edit) => edit.method === 'setFeatureState').at(-1)!.args[0]).toEqual(WATER);
+    expect(host.querySourceFeatures('openmaptiles')).toEqual([{ source: 'openmaptiles' }]);
+  });
+
+  it('querySourceFeatures reads the band shown for an original source id, and a copy id as asked', async () => {
+    const { host, controller } = setup(); // z4.6: band 1 shown
+    await controller.activate('equal');
+    expect(host.querySourceFeatures('openmaptiles', { sourceLayer: 'water' })).toEqual([{ source: 'openmaptiles__b1', sourceLayer: 'water' }]);
+    expect(host.querySourceFeatures('openmaptiles__b3')).toEqual([{ source: 'openmaptiles__b3' }]);
+    expect(host.querySourceFeatures('nowhere')).toEqual([]);
+    await controller.deactivate();
+    host.queriedSources.length = 0;
+    host.querySourceFeatures('openmaptiles');
+    expect(host.queriedSources).toEqual(['openmaptiles']);
+  });
+
+  it('destroy restores the feature-state methods and querySourceFeatures', async () => {
+    const own = (host: object, name: string): boolean => Object.prototype.hasOwnProperty.call(host, name);
+    const methods = ['setFeatureState', 'removeFeatureState', 'getFeatureState', 'querySourceFeatures'];
+    const { host, controller } = setup();
+    for (const name of methods) expect(own(host, name), name).toBe(true);
+    await controller.destroy();
+    for (const name of methods) expect(own(host, name), name).toBe(false);
+  });
+});
