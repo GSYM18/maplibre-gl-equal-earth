@@ -6,7 +6,8 @@
  * `persistentCache: false` the reload fetches again.
  *
  * The harness runs with `early`: Equal Earth is set before `load`, so the plain Mercator style
- * never fetches its own tiles, which no persistent cache would (or should) serve.
+ * never fetches its own tiles, which no persistent cache would (or should) serve. Every test runs
+ * in a fresh browser context, so Cache Storage starts empty.
  */
 import type { Page } from '@playwright/test';
 
@@ -21,12 +22,11 @@ async function resetTileRequests(page: Page): Promise<void> {
   await page.request.post('/fixture-tiles/__reset');
 }
 
-/** Delete every cache of the origin, from a page of it that is not the harness. */
-async function clearCacheStorage(page: Page): Promise<void> {
-  await page.goto('/fixture-tiles/__count');
-  await page.evaluate(async () => {
-    for (const name of await caches.keys()) await caches.delete(name);
-  });
+/** Fixture land features drawn: the reload must have drawn the world, not merely fetched nothing. */
+async function landDrawn(page: Page): Promise<number> {
+  return page.evaluate(
+    () => window.__h.map.queryRenderedFeatures().filter((feature) => feature.sourceLayer === 'land').length,
+  );
 }
 
 /** Entries in the plugin's caches, read until two reads agree: the stores are fire-and-forget. */
@@ -47,24 +47,27 @@ async function settledEntries(page: Page): Promise<number> {
 }
 
 test('a reload draws the z1 world view from Cache Storage, without one tile request', async ({ page, mlv }) => {
-  await clearCacheStorage(page);
   await resetTileRequests(page);
   await openHarness(page, { mlv, projection: 'equal-earth', early: true });
   expect(await page.evaluate(() => window.__h.install?.workerPath)).toBe('worker');
   expect(await page.evaluate(() => window.__h.map.getZoom())).toBe(1);
   expect(await tileRequests(page)).toBeGreaterThan(0);
   expect(await settledEntries(page)).toBeGreaterThan(0);
+  const drawn = await landDrawn(page);
+  expect(drawn).toBeGreaterThan(0);
 
   await resetTileRequests(page);
   await openHarness(page, { mlv, projection: 'equal-earth', early: true });
   await idle(page);
   expect(await page.evaluate(() => window.__h.controller?.active)).toBe(true);
   expect(await tileRequests(page)).toBe(0);
+  expect(await landDrawn(page)).toBe(drawn);
   expect(await page.evaluate(() => window.__h.errors)).toEqual([]);
 });
 
 test('with persistentCache: false a reload fetches the tiles again', async ({ page, mlv }) => {
-  await clearCacheStorage(page);
+  // The control for the count above; the worker code is the same on both majors.
+  test.skip(mlv !== 6, 'one project suffices for the control');
   await openHarness(page, { mlv, projection: 'equal-earth', early: true, persist: false });
   expect(await settledEntries(page)).toBe(0);
 

@@ -16,6 +16,7 @@ import {
   PROTOCOL_SCHEME,
   type EqualEarthSourceConfig,
 } from '../src/tiles/protocol.js';
+import { eqeVersion } from '../scripts/build-id.ts';
 import { FakeCacheStorage } from './support/fake-cache-storage.js';
 
 const UPSTREAM = 'https://tiles.openfreemap.org/planet/latest/{z}/{x}/{y}.pbf';
@@ -79,6 +80,18 @@ describe('tile URL codec', () => {
       expect(() => encodeSourceUrl({ url: UPSTREAM, sourceZoomOffset })).toThrow(TypeError);
     }
     expect(() => encodeSourceUrl({ url: UPSTREAM, sourceZoomOffset: -1 })).not.toThrow();
+  });
+
+  it('rejects a tile URL whose sourceZoomOffset is not an integer, as for blend', () => {
+    for (const sourceZoomOffset of [0.5, -2.5, '1', null]) {
+      const encoded = btoa(JSON.stringify({ url: UPSTREAM, sourceZoomOffset }))
+        .replace(/\+/g, '-')
+        .replace(/\//g, '_')
+        .replace(/=+$/, '');
+      expect(() => parseTileUrl(`eqearth://${encoded}/0/0/0`), String(sourceZoomOffset)).toThrow(/sourceZoomOffset/);
+    }
+    const ok = encodeSourceUrl({ url: UPSTREAM, sourceZoomOffset: -1 }).replace('{z}/{x}/{y}', '0/0/0');
+    expect(parseTileUrl(ok).config.sourceZoomOffset).toBe(-1);
   });
 
   it('expands templates', () => {
@@ -493,6 +506,7 @@ describe('protocol handler', () => {
         match: () => Promise.resolve(undefined),
         put: () => Promise.reject(new Error('QuotaExceededError')),
         delete: () => Promise.resolve(false),
+        keys: () => Promise.resolve([]),
       };
       const storage = { open: () => Promise.resolve(failing), keys: () => Promise.resolve([]), delete: () => Promise.resolve(false) };
       const warn = vi.spyOn(console, 'warn');
@@ -510,11 +524,62 @@ describe('protocol handler', () => {
       }
     });
 
-    it('names the cache after the package version by default', async () => {
+    it('names the cache after the package version and the build id of the worker sources by default (R25)', async () => {
       const storage = new FakeCacheStorage();
       const handler = createEqualEarthProtocol({ fetchImpl: upstream() as unknown as typeof fetch, cacheStorage: storage });
       await handler({ url: at({ url: UPSTREAM, blend: 0 }, Z2) }, new AbortController());
-      await vi.waitFor(() => expect(storage.names()).toEqual([`equal-earth-${PKG.version}`]));
+      await vi.waitFor(() => expect(storage.names()).toEqual([`equal-earth-${eqeVersion()}`]));
+      expect(storage.names()[0]!.startsWith(`equal-earth-${PKG.version}+`)).toBe(true);
+    });
+
+    it('does not store an output tile whose upstream failed', async () => {
+      const storage = new FakeCacheStorage();
+      const failing = vi.fn(async () => new Response(null, { status: 503 }));
+      const handler = createEqualEarthProtocol({ fetchImpl: failing as unknown as typeof fetch, cacheStorage: storage, version: 't' });
+      await expect(handler({ url: at({ url: UPSTREAM, blend: 0 }, Z2) }, new AbortController())).rejects.toThrow(/returned 503/);
+      await settle();
+      expect(storage.caches.get('equal-earth-t')?.entries.size ?? 0).toBe(0);
+    });
+
+    it('rejects a tile aborted during the persistent lookup, without fetching or storing', async () => {
+      let answer: ((response: Response | undefined) => void) | undefined;
+      const pending = new FakeCacheStorage();
+      const stored = await pending.open('equal-earth-t');
+      stored.match = () => new Promise((resolve) => (answer = resolve));
+      const fetchImpl = upstream();
+      const handler = createEqualEarthProtocol({ fetchImpl: fetchImpl as unknown as typeof fetch, cacheStorage: pending, version: 't' });
+      const abort = new AbortController();
+      const result = handler({ url: at({ url: UPSTREAM, blend: 0 }, Z2) }, abort);
+      await vi.waitFor(() => expect(answer).toBeDefined());
+      abort.abort();
+      answer!(undefined);
+      await expect(result).rejects.toMatchObject({ name: 'AbortError' });
+      await settle();
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(stored.entries.size).toBe(0);
+    });
+
+    it('round-trips a zero-length tile (every source absent) through the cache', async () => {
+      const storage = new FakeCacheStorage();
+      const config = { url: UPSTREAM, blend: 0 };
+      const absent = vi.fn(async () => new Response(null, { status: 404 }));
+      const cold = createEqualEarthProtocol({ fetchImpl: absent as unknown as typeof fetch, cacheStorage: storage, version: 't' });
+      expect((await cold({ url: at(config, Z2) }, new AbortController())).data.byteLength).toBe(0);
+      await vi.waitFor(() => expect(storage.caches.get('equal-earth-t')?.entries.has(persistentKey(config, Z2))).toBe(true));
+      const second = vi.fn(async () => new Response(null, { status: 404 }));
+      const warm = createEqualEarthProtocol({ fetchImpl: second as unknown as typeof fetch, cacheStorage: storage, version: 't' });
+      expect((await warm({ url: at(config, Z2) }, new AbortController())).data.byteLength).toBe(0);
+      expect(second).not.toHaveBeenCalled();
+    });
+
+    it('neither looks up nor stores with ttlDays <= 0', async () => {
+      const storage = new FakeCacheStorage();
+      const handler = createEqualEarthProtocol({ fetchImpl: upstream() as unknown as typeof fetch, cacheStorage: storage, version: 't' });
+      for (const ttlDays of [0, -1]) {
+        await handler({ url: at({ url: UPSTREAM, blend: 0, persistentCache: { ttlDays } }, Z2) }, new AbortController());
+      }
+      await settle();
+      expect(storage.names()).toEqual([]);
     });
 
     it('stores a copy, so transferring the result leaves the stored tile intact', async () => {

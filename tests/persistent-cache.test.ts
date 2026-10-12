@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import {
   CACHE_NAME_PREFIX,
@@ -31,6 +31,12 @@ describe('PersistentTileCache', () => {
     expect(await (await storage.open('equal-earth-1')).match('k')).toBeUndefined();
   });
 
+  it('misses an entry without an expiry, even at time 0', async () => {
+    const storage = new FakeCacheStorage();
+    await (await storage.open('equal-earth-1')).put('k', new Response(new ArrayBuffer(1)));
+    expect(await new PersistentTileCache(storage, '1', () => 0).get('k')).toBeUndefined();
+  });
+
   it("deletes other versions' caches once", async () => {
     const storage = new FakeCacheStorage(['equal-earth-0.9.0', 'someone-else']);
     const cache = new PersistentTileCache(storage, '1.0.0');
@@ -55,16 +61,79 @@ describe('PersistentTileCache', () => {
     expect(await cache.get('k')).toBeUndefined();
   });
 
+  it('skips the put when ttlDays is not positive', async () => {
+    const storage = new FakeCacheStorage();
+    const cache = new PersistentTileCache(storage, '1', () => 0);
+    await cache.put('k', new ArrayBuffer(1), 0);
+    await cache.put('k', new ArrayBuffer(1), -1);
+    await cache.put('k', new ArrayBuffer(1), NaN);
+    expect(storage.caches.get('equal-earth-1')?.entries.size ?? 0).toBe(0);
+  });
+
   it('treats a throwing match or put as a miss', async () => {
     const failing = {
       match: () => Promise.reject(new Error('read')),
       put: () => Promise.reject(new Error('QuotaExceededError')),
       delete: () => Promise.resolve(false),
+      keys: () => Promise.resolve([]),
     };
     const storage = { open: () => Promise.resolve(failing), keys: () => Promise.resolve([]), delete: () => Promise.resolve(false) };
     const cache = new PersistentTileCache(storage, '1');
     await expect(cache.put('k', new ArrayBuffer(1), 7)).resolves.toBeUndefined();
     expect(await cache.get('k')).toBeUndefined();
+  });
+});
+
+describe('the sweep after open (Ruling R25)', () => {
+  /** An entry written straight into the fake, expiring at `expires`. */
+  const entry = (expires: number) =>
+    new Response(new ArrayBuffer(1), { headers: { 'x-eqe-expires': String(expires) } });
+
+  it('deletes expired entries without their being looked up', async () => {
+    const storage = new FakeCacheStorage();
+    const stored = await storage.open('equal-earth-1');
+    await stored.put('expired', entry(1000));
+    await stored.put('unreadable', new Response(new ArrayBuffer(1)));
+    await stored.put('live', entry(5000));
+    const cache = new PersistentTileCache(storage, '1', () => 2000);
+    expect(await cache.get('something-else')).toBeUndefined();
+    await vi.waitFor(() => expect([...stored.entries.keys()]).toEqual(['live']));
+  });
+
+  it('caps the cache at 2000 entries, evicting the earliest-expiring first', async () => {
+    const storage = new FakeCacheStorage();
+    const stored = await storage.open('equal-earth-1');
+    // Inserted latest-expiring first, so that insertion order is not what decides.
+    for (let i = 2004; i >= 1; i--) await stored.put(`k${i}`, entry(10_000 + i));
+    const cache = new PersistentTileCache(storage, '1', () => 0);
+    await cache.get('k2004');
+    await vi.waitFor(() => expect(stored.entries.size).toBe(2000));
+    for (const gone of ['k1', 'k2', 'k3', 'k4']) expect(stored.entries.has(gone)).toBe(false);
+    expect(stored.entries.has('k5')).toBe(true);
+    expect(stored.entries.has('k2004')).toBe(true);
+  });
+
+  it('stays silent when keys() throws, and does not hold up get or put', async () => {
+    const storage = new FakeCacheStorage();
+    const stored = await storage.open('equal-earth-1');
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => (release = resolve));
+    stored.keys = () => blocked.then(() => Promise.reject(new Error('keys')));
+    const warn = vi.spyOn(console, 'warn');
+    const error = vi.spyOn(console, 'error');
+    try {
+      const cache = new PersistentTileCache(storage, '1', () => 0);
+      // The sweep is still waiting on keys(): get and put go ahead regardless.
+      await cache.put('k', new Uint8Array([7]).buffer, 7);
+      expect(new Uint8Array((await cache.get('k'))!)).toEqual(new Uint8Array([7]));
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(warn).not.toHaveBeenCalled();
+      expect(error).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+    }
   });
 });
 

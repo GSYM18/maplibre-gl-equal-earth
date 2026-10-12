@@ -4,18 +4,16 @@
  * `src/` through Vite's transform, the built worker bundles from `/dist/`, both MapLibre majors
  * from `/node_modules/`, and the in-memory fixture tiles.
  */
-import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from 'vite';
 
+import { eqeVersion } from '../../scripts/build-id.ts';
 import { fixtureTilesPlugin } from './fixture-tiles.ts';
-
-const { version } = JSON.parse(readFileSync(new URL('../../package.json', import.meta.url), 'utf8')) as { version: string };
 
 export default defineConfig({
   // The harness compiles src/ through Vite, the main-thread protocol fallback included
   // (src/types/vendor.d.ts).
-  define: { __EQE_VERSION__: JSON.stringify(version) },
+  define: { __EQE_VERSION__: JSON.stringify(eqeVersion()) },
   // The repository root, wherever the command runs from: the harness loads `/src/`, `/dist/` and
   // `/node_modules/` by absolute path.
   root: fileURLToPath(new URL('../..', import.meta.url)),

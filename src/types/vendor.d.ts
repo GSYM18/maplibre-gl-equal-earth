@@ -1,5 +1,6 @@
 /**
- * The package version, inlined by every build that compiles `src/` (`define` in vite.config.ts,
+ * The build id `<package version>+<hash of the worker's sources>` (`scripts/build-id.ts`, Ruling
+ * R25), inlined by every build that compiles `src/` (`define` in vite.config.ts,
  * vite.worker.config.ts, vitest.config.ts and tests/browser/vite.config.ts). It names the
  * persistent tile cache (`src/tiles/persistent-cache.ts`).
  */

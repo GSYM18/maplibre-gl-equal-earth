@@ -12,9 +12,10 @@
  *
  * `--budget` measures the cold world view instead (spec §6, Task 10): every output tile at z1 and
  * z2 inside the Equal Earth rows, blend 0, built by the real protocol handler at
- * `sourceZoomOffset` 0 and −1, one fresh handler per offset. It prints upstream bytes and
- * requests, the decode + warp + encode time with the network excluded (a second fresh handler
- * replays the recorded bytes), and the output features of `place`, `water`, `boundary` and
+ * `sourceZoomOffset` 0 and −1, one fresh handler per offset. It prints upstream bytes (body bytes
+ * after Content-Encoding is undone) and requests, the decode + warp + encode time with the network
+ * excluded (a second fresh handler replays the recorded bytes), and the output features of
+ * `place`, `water`, `boundary` and
  * `transportation`:  npx vite-node scripts/probe-openfreemap.ts -- --budget
  */
 
@@ -333,7 +334,8 @@ async function budget(): Promise<void> {
     const rows = await budgetRun(offset, zooms);
     table.push(...rows, total(rows));
   }
-  const header = ['offset', 'zoom', 'tiles', 'upstream kB', 'requests', 'warp ms', ...BUDGET_LAYERS];
+  // Body bytes after Content-Encoding is undone, not bytes on the wire.
+  const header = ['offset', 'zoom', 'tiles', 'upstream kB (decoded)', 'requests', 'warp ms', ...BUDGET_LAYERS];
   console.log(`| ${header.join(' | ')} |`);
   console.log(`|${header.map(() => '---').join('|')}|`);
   for (const row of table) {

@@ -125,7 +125,10 @@ export interface ProtocolOptions {
    * @defaultValue `globalThis.caches`, when the context has it
    */
   cacheStorage?: CacheStorageLike | undefined;
-  /** Names the persistent cache (`equal-earth-<version>`). @defaultValue this package's version */
+  /**
+   * Names the persistent cache (`equal-earth-<version>`).
+   * @defaultValue this build's id: the package version and a hash of the worker's sources
+   */
   version?: string;
 }
 
@@ -218,8 +221,10 @@ export function createEqualEarthProtocol(options: ProtocolOptions = {}): Protoco
     // Spec §6: low-zoom output tiles are kept across page loads. The Mercator pass-through above
     // is not: its bytes are the upstream's, which the browser's own HTTP cache already keeps.
     const keep = config.persistentCache === false ? undefined : (config.persistentCache ?? {});
+    const ttlDays = keep?.ttlDays ?? DEFAULT_PERSISTENT_TTL_DAYS;
+    // A TTL of 0 or less keeps nothing, so there is nothing to look up either.
     const key =
-      persistent && keep && tile.z <= (keep.maxZoom ?? DEFAULT_PERSISTENT_MAX_ZOOM)
+      persistent && keep && ttlDays > 0 && tile.z <= (keep.maxZoom ?? DEFAULT_PERSISTENT_MAX_ZOOM)
         ? persistentKey(config, tile)
         : undefined;
     if (persistent && key !== undefined) {
@@ -231,7 +236,7 @@ export function createEqualEarthProtocol(options: ProtocolOptions = {}): Protoco
     const data = await build(config, tile, sources, abortController.signal);
     if (persistent && key !== undefined) {
       // A copy: MapLibre transfers the result, which detaches it before the store reads it.
-      void persistent.put(key, data.slice(0), keep?.ttlDays ?? DEFAULT_PERSISTENT_TTL_DAYS);
+      void persistent.put(key, data.slice(0), ttlDays);
     }
     return { data };
   };
@@ -304,6 +309,11 @@ function decodeConfig(encoded: string): EqualEarthSourceConfig {
   const blend = (parsed as { blend?: unknown }).blend;
   if (blend !== undefined && !(typeof blend === 'number' && blend >= 0 && blend <= 1)) {
     throw new Error(`Equal Earth: tile URL carries blend ${JSON.stringify(blend)}; expected a number in [0, 1].`);
+  }
+  // Likewise: a fractional source zoom would address tiles that do not exist.
+  const offset = (parsed as { sourceZoomOffset?: unknown }).sourceZoomOffset;
+  if (offset !== undefined && !Number.isInteger(offset)) {
+    throw new Error(`Equal Earth: tile URL carries sourceZoomOffset ${JSON.stringify(offset)}; expected an integer.`);
   }
   return parsed as EqualEarthSourceConfig;
 }
