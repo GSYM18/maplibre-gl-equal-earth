@@ -22,8 +22,35 @@ Web Mercator, while still looking like a world map rather than a sinusoid.
 npm install @yellowmap/maplibre-gl-equal-earth maplibre-gl
 ```
 
-ESM only. The peer range is `maplibre-gl >=5.24 <7`. The demo runs on v6; the browser test
-suite runs every scenario on MapLibre 5.24 and 6.6.
+ESM (`dist/index.js`) for bundlers and `<script type="module">`, and UMD
+(`dist/maplibre-gl-equal-earth.umd.js`) for a classic `<script>` tag. The peer range is
+`maplibre-gl >=5.24 <7`. The demo runs on v6; the browser test suite runs every scenario on
+MapLibre 5.24 and 6.6.
+
+### Without a bundler
+
+Load MapLibre first, then the UMD file, which defines the global `maplibreglEqualEarth`:
+
+```html
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" />
+<script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+<script src="https://unpkg.com/@yellowmap/maplibre-gl-equal-earth@1.0.0-alpha.1/dist/maplibre-gl-equal-earth.umd.js"></script>
+<script>
+  maplibreglEqualEarth.installEqualEarth(maplibregl).then(() => {
+    const map = new maplibregl.Map({ container: 'map', style: '…', center: [10, 20], zoom: 1.3 });
+    map.setProjection({ type: 'equal' });
+    map.addControl(new maplibreglEqualEarth.EqualEarthControl());
+  });
+</script>
+```
+
+The worker bundles are loaded from next to the script (`dist/worker.iife.js` for v5,
+`dist/worker.mjs` for v6), so self-hosting means copying all of `dist/`. Give the script's full
+`dist/…` URL: a bare package URL such as `https://unpkg.com/@yellowmap/maplibre-gl-equal-earth`
+has no `dist/` to resolve the workers against, and the tiles would be warped on the main thread.
+MapLibre 6 ships no classic-script build: load it as a module and hand it to the same global
+(`installEqualEarth(await import('https://unpkg.com/maplibre-gl@6.6.0/dist/maplibre-gl.mjs'))`),
+or import this package's ESM file the same way.
 
 ## How it works, and what that costs you
 
@@ -456,8 +483,11 @@ decision; judge it on the demo.
 
 ## Demo and probes
 
-Run `npm run build:js` (the demo loads the built `dist/worker.mjs`), then `npm run dev` and
-open <http://localhost:5173/demo/transition.html>. The page starts on the whole world, with the
+Run `npm run demo`: it builds the bundles (the demo loads the built `dist/worker.mjs`) and
+opens <http://localhost:5173/demo/transition.html> on Vite's dev server; `npm run build:js`
+then `npm run dev` does the same by hand. The demo pages are TypeScript compiled by Vite on the
+fly, so another static server (VS Code Live Server, `npx serve`) cannot run them: it sends `.ts`
+as `video/mp2t`, which the browser refuses, and the page says so. The page starts on the whole world, with the
 `EqualEarthControl` top right, buttons that jump to five cities, and presets in the panel. Its
 URL parameters:
 
@@ -642,7 +672,7 @@ npm run verify   # lint, typecheck, unit tests, build, export guards, browser te
 suite in headless Chromium with software WebGL, each spec against MapLibre 6.6 and 5.24 (a few
 are v6 only), on fixture tiles generated in memory: no network. It takes about six and a half
 minutes and needs a fresh build (`verify` builds first). `npm run build:js` refreshes only the
-bundles the demo and the browser tests load.
+bundles (ESM, UMD and the two workers) the demo and the browser tests load.
 
 ## Roadmap
 

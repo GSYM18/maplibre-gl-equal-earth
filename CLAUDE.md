@@ -8,7 +8,8 @@ repository.
 ```
 npm run verify     # lint + typecheck + test + build + check:exports + test:browser: run before claiming done
 npm run dev        # Vite dev server for the demo pages
-npm run build:js   # bundles only, no .d.ts: refreshes dist/worker.mjs, which the demos load
+npm run demo       # build:js, then the dev server opened on demo/transition.html
+npm run build:js   # bundles only (ESM, UMD, both workers), no .d.ts: refreshes dist/worker.mjs, which the demos load
 npm run probe:transition  # headless-Chrome probe of demo/transition.html; not part of verify
 npm run probe:first-paint # the same page's cold/warm first paint at 50 Mbit/s; not part of verify
 npm test           # vitest run
@@ -16,7 +17,7 @@ npm run test:browser  # Playwright on MapLibre 6.6 and 5.24, SwiftShader; ~6.5 m
 npm run test:watch # vitest watch mode
 npm run lint       # eslint (type-aware, .ts only)
 npm run typecheck  # tsc --noEmit over src, tests, demo
-npm run build      # vite build (ESM bundle) + tsc (.d.ts emit) → dist/
+npm run build      # vite builds (ESM, workers, UMD) + tsc (.d.ts emit) → dist/
 ```
 
 Single test file: `npx vitest run tests/camera.test.ts`.
@@ -32,12 +33,14 @@ convert geographic positions only through the helpers in `tests/browser/helpers.
 Chromium revision must match the pinned `@playwright/test` (1.62.1 → `chromium_headless_shell-1234`
 in `%LOCALAPPDATA%\ms-playwright`); `npx playwright install chromium` needs the network.
 
-`npm run build` is two steps because Vite emits the bundle and `tsc -p tsconfig.build.json`
+`npm run build` is two steps because Vite emits the bundles and `tsc -p tsconfig.build.json`
 emits declarations separately. `npm run check:exports` runs two guards over the build.
-`scripts/check-exports.mjs` diffs the built bundle's runtime exports against the value exports
-declared in `src/index.ts` (it exists solely to make the 0.2.1 drift bug impossible to
-reintroduce). `scripts/check-worker-bundles.mjs` asserts both worker bundles are self-contained
-and actually register `eqearth` when loaded the way MapLibre v5 (`importScripts`) and v6
+`scripts/check-exports.mjs` diffs both built bundles' runtime exports (the ESM module, and the
+UMD's `maplibreglEqualEarth` global evaluated as a classic script in a `vm` sandbox) against the
+value exports declared in `src/index.ts` (it exists to make the 0.2.1 drift bug impossible to
+reintroduce), and checks the UMD's default worker URLs resolve next to the loading script.
+`scripts/check-worker-bundles.mjs` asserts both worker bundles are self-contained and actually
+register `eqearth` when loaded the way MapLibre v5 (`importScripts`) and v6
 (`import()`) load them. `prepublishOnly` runs both.
 
 `npm run probe:transition` (`scripts/probe-transition.mjs`; flags `--city`, `--steps`,
@@ -76,7 +79,9 @@ which is why `scripts/*.mjs` needs an explicit `globals.node` block.
 Equal Earth projection support for MapLibre GL JS v6, and v5 from 5.24, published as
 `@yellowmap/maplibre-gl-equal-earth`. It is a rewrite of, and a hard fork from,
 [pka/maplibre-gl-equal-earth](https://github.com/pka/maplibre-gl-equal-earth) (the old `lib/`,
-proj4, and the `0.2.x` line are gone). ESM only — maplibre-gl v6 dropped CJS.
+proj4, and the `0.2.x` line are gone). ESM (`dist/index.js`) plus a UMD file for classic
+`<script>` pages (`dist/maplibre-gl-equal-earth.umd.js`, global `maplibreglEqualEarth`); no CJS
+entry (`require()` of the ESM works from Node 20.19).
 
 **Registry note:** this environment's npm proxy refuses packages published after 2026-08-31.
 maplibre-gl stays at 6.6.0, not 6.7.0 (`package.json` declares `^6.6.0`; the lockfile pins
@@ -225,8 +230,18 @@ affects the absolute metre values from `toEqualEarth`.
 - `scripts/build-id.ts` — `__EQE_VERSION__` = `<version>+<hash>`: SHA-256 over the worker
   bundle's relative-import graph from `worker-entry.ts` (CRLF normalised) plus the bundled
   runtime dependencies' versions. Only the worker graph, so controller or camera edits keep the
-  cache. All four Vite/Vitest configs import it.
+  cache. All five Vite/Vitest configs import it.
 - `vite.worker.config.ts` — builds the two worker bundles (see `worker-entry.ts`).
+- `vite.umd.config.ts` — builds the UMD bundle, a build of its own because Vite 8's Rolldown
+  does not polyfill `import.meta.url` in UMD output (it becomes `{}.url`, breaking the default
+  worker URL): there `import.meta.url` is defined as the loading script's URL, captured from
+  `document.currentScript` in the bundle's intro. The ESM build must keep the literal
+  `new URL('./worker.mjs', import.meta.url)` for applications' bundlers, so the two cannot share
+  a transform. A bare CDN package URL (no `dist/` path) would resolve the workers wrongly, so
+  package.json sets no `unpkg`/`jsdelivr` field.
+- `index.html` and `demo/transition.html` — their module `<script>` has an `onerror` that writes
+  the run instructions into the readout: any non-Vite static server sends `.ts` as
+  `video/mp2t`, which the browser refuses.
 - `demo/` + root `index.html` — Vite demo pages, not part of the published package.
 - `demo/transition.html` + `.ts` — the adaptive transition on any EPSG:3857 vector style
   (`?style=`, default OpenFreeMap Liberty; a SmartMaps URL with its `?key=` works the same way,
@@ -257,6 +272,9 @@ affects the absolute metre values from `toEqualEarth`.
   geographic conversions specs may use. `fixture-tiles.ts` generates the tiles and counts the
   requests it answers (`/fixture-tiles/__count`, `__reset`). The v5 globe pixel-identity case
   in `baseline.spec.ts` flakes now and then despite its three-pair retry; rerun it once.
+  `umd.html` (+ `umd.spec.ts`) is the bundler-free page: the built UMD from a static classic
+  `<script src>` and no `workerUrl`, exposing `window.__umd` and the part of `__h` the helpers'
+  conversions read.
 - `scripts/probe-openfreemap.ts` — runs the real pipeline against live OpenFreeMap tiles.
   `npx vite-node scripts/probe-openfreemap.ts`. Needs network; not part of `npm run verify`.
 

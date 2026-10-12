@@ -23,5 +23,5 @@
     "noUncheckedIndexedAccess": true,
     "noImplicitOverride": true
   },
-  "include": ["src", "tests", "demo", "scripts", "vite.config.ts", "vite.worker.config.ts", "vitest.config.ts"]
+  "include": ["src", "tests", "demo", "scripts", "vite.config.ts", "vite.worker.config.ts", "vite.umd.config.ts", "vitest.config.ts"]
 }

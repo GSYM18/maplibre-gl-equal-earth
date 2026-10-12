@@ -27,7 +27,8 @@
   "homepage": "https://github.com/GSYM18/maplibre-gl-equal-earth#readme",
   "sideEffects": [
     "./dist/worker.mjs",
-    "./dist/worker.iife.js"
+    "./dist/worker.iife.js",
+    "./dist/maplibre-gl-equal-earth.umd.js"
   ],
   "types": "./dist/index.d.ts",
   "main": "./dist/index.js",
@@ -44,6 +45,7 @@
       "default": "./dist/worker.mjs"
     },
     "./worker.iife.js": "./dist/worker.iife.js",
+    "./umd": "./dist/maplibre-gl-equal-earth.umd.js",
     "./package.json": "./package.json"
   },
   "files": [
@@ -56,8 +58,9 @@
   },
   "scripts": {
     "dev": "vite",
+    "demo": "npm run build:js && vite --open /demo/transition.html",
     "build": "npm run build:js && npm run build:types",
-    "build:js": "vite build && vite build --config vite.worker.config.ts",
+    "build:js": "vite build && vite build --config vite.worker.config.ts && vite build --config vite.umd.config.ts",
     "build:types": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
