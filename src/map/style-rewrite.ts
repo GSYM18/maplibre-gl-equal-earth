@@ -52,6 +52,7 @@ import {
   worldOutline,
   worldPolygon,
   type CartographyOptions,
+  type CartographySpace,
 } from './cartography.js';
 
 export interface StyleLayerLike {
@@ -128,6 +129,13 @@ export interface RewriteOptions {
   persistentCache?: PersistentCacheOptions | false;
   /** Every band source's `sourceZoomOffset` (`TileCoverOptions`), written into its tile URL when set. */
   sourceZoomOffset?: number;
+  /**
+   * Native Equal Earth (MapLibre's `addProjection`, spec 2026-11-07 §5): the generated
+   * cartography and, unless {@link warp} is given, the GeoJSON copies stay lng/lat, since
+   * MapLibre projects every position itself. The vector band sources are unchanged: their tiles
+   * are cut in the registered CRS's grid. @defaultValue false
+   */
+  geographic?: boolean;
 }
 
 export interface LayerGate {
@@ -366,6 +374,8 @@ interface GeneratedContext {
   style: StyleLike;
   bands: readonly Band[];
   layerIds: Set<string>;
+  /** Where generated cartography lives: a band's blend, or lng/lat under native Equal Earth. */
+  space: (band: Band) => CartographySpace;
   /** Gate `copy` as band `band`'s copy of `layer` (see {@link gateCopy}). */
   gate: (copy: StyleLayerLike, layer: StyleLayerLike, band: number, hold?: boolean) => LayerGate | null;
   /** `hold`: a base layer, see `LayerGate.holdWhileFading`. */
@@ -410,7 +420,7 @@ function emitBackground(context: GeneratedContext, bg: StyleLayerLike, outsideCo
   bands.forEach((band, k) => {
     if (band.blend >= 1) return;
     const id = `${CARTOGRAPHY_PREFIX}world__b${k}`;
-    addGeoJsonSource(context, id, worldPolygon(band.blend));
+    addGeoJsonSource(context, id, worldPolygon(context.space(band)));
     const paint: Record<string, unknown> = {};
     for (const [from, to] of [
       ['background-color', 'fill-color'],
@@ -455,10 +465,10 @@ function emitLines(
     lines.push(copy);
   };
   const { bands } = context;
-  if (grid) bands.forEach((band, k) => emitLine('graticule', k, graticule(band.blend, grid.step), grid.color, grid.width));
+  if (grid) bands.forEach((band, k) => emitLine('graticule', k, graticule(context.space(band), grid.step), grid.color, grid.width));
   if (outline) {
     bands.forEach((band, k) => {
-      if (band.blend < 1) emitLine('outline', k, worldOutline(band.blend), outline.color, outline.width);
+      if (band.blend < 1) emitLine('outline', k, worldOutline(context.space(band)), outline.color, outline.width);
     });
   }
   const at = layers.findIndex((l) => l.type === 'symbol');
@@ -484,7 +494,10 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
   const symbolFadeMs = options.symbolFadeMs ?? 300;
   const steps = bands.length - 1;
   const initial = options.initialBand ?? bandIndexForZoom(bands, options.initialZoom);
-  const warp = options.warp ?? warpGeoJSON;
+  const geographic = options.geographic === true;
+  const warp =
+    options.warp ??
+    ((data: GeoJSON.GeoJSON, blend: number, zoom: number) => warpGeoJSON(data, blend, zoom, { geographic }));
   const style = structuredClone(original);
 
   const vectorSources = Object.keys(templates).filter(
@@ -561,7 +574,8 @@ export function rewriteStyle(original: StyleLike, options: RewriteOptions): Rewr
   };
 
   const cartography = resolveCartography(options.cartography);
-  const generated: GeneratedContext = { original, style, bands, layerIds, gate, emit };
+  const space = (band: Band): CartographySpace => (geographic ? 'geographic' : band.blend);
+  const generated: GeneratedContext = { original, style, bands, layerIds, space, gate, emit };
   const firstBackground = original.layers.find((l) => l.type === 'background');
   if (firstBackground === undefined && cartography.outsideColor !== 'transparent') {
     emitOutsideBackground(generated, cartography.outsideColor);

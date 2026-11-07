@@ -13,7 +13,7 @@ npm run build:js   # bundles only (ESM, UMD, both workers), no .d.ts: refreshes 
 npm run probe:transition  # headless-Chrome probe of demo/transition.html; not part of verify
 npm run probe:first-paint # the same page's cold/warm first paint at 50 Mbit/s; not part of verify
 npm test           # vitest run
-npm run test:browser  # Playwright on MapLibre 6.6 and 5.24, SwiftShader; ~6.5 min; needs a fresh build
+npm run test:browser  # Playwright on MapLibre 6.6 and 5.24 (+ 6.16 native), SwiftShader; ~7 min; needs a fresh build
 npm run test:watch # vitest watch mode
 npm run lint       # eslint (type-aware, .ts only)
 npm run typecheck  # tsc --noEmit over src, tests, demo
@@ -25,7 +25,10 @@ Single test by name: `npx vitest run tests/camera.test.ts -t "crossing upward"`.
 Single browser spec: `npx playwright test --config tests/browser/playwright.config.ts baseline.spec.ts --project v6`.
 
 `npm run test:browser` (`tests/browser/`) runs every `*.spec.ts` against both majors (projects
-`v6` and `v5`) in headless Chromium through SwiftShader. Its config starts its own Vite server on
+`v6` and `v5`) in headless Chromium through SwiftShader, except `native.spec.ts`, which runs only
+in `v6-native`: MapLibre 6.16.0 imported from unpkg (`mlv=6.16`), the one network dependency of
+the suite, since npm cannot install it here (Ruling N-R4). A spec's first run after a source edit
+can die with "Execution context was destroyed": Vite reloading the page; rerun it. Its config starts its own Vite server on
 port 5179 (`tests/browser/vite.config.ts`, not the demo's 5173) serving the harness page, `src/`
 through Vite, the worker bundles from `/dist/` (hence the build first; `verify` orders it) and
 offline fixture tiles generated in memory (`fixture-tiles.ts`, `Cache-Control: no-store`). Specs
@@ -90,12 +93,22 @@ installed at all — it debuted in deck.gl 9.4.0 (2026-09-05).
 
 ## The central constraint
 
-MapLibre has **no API for registering a custom projection**. `createProjectionFromName` is a
-hard-coded switch over `mercator` / `globe` / `vertical-perspective`; an unknown name hits
-`warnOnce` and silently falls back to Mercator, and `ITransform` is not exported. So Equal
-Earth cannot be added as a projection. It is instead produced by **backprojection**: feed the
-Mercator renderer fabricated lng/lat values chosen so that Mercator's own transform reproduces
-the Equal Earth image.
+Up to 6.14 MapLibre has **no API for registering a custom projection**. `createProjectionFromName`
+is a hard-coded switch over `mercator` / `globe` / `vertical-perspective`; an unknown name hits
+`warnOnce` and silently falls back to Mercator, and `ITransform` is not exported. 6.15 added the
+experimental `addProjection` (planar CRS whose tiles are already cut in its grid; no
+reprojection, no world copies, and **rejected inside projection expressions**, so it can never be
+blended with Mercator). So the adaptive `equal` (and pure Equal Earth before 6.15) cannot be added
+as a projection. It is instead produced by **backprojection**: feed the Mercator renderer
+fabricated lng/lat values chosen so that Mercator's own transform reproduces the Equal Earth
+image. **Native mode** (spec `2026-11-07-native-equal-earth-addprojection-design.md`): on 6.15+
+the install registers `equal-earth:native` (`src/math/crs.ts`), whose grid is exactly the blend-0
+map space, and pure `equal-earth` names it in the rewritten style. Then map space *is* geographic:
+the geographic API reports inactive, `toMapSpace`/`toGeographic` are the identity, no world clamp
+is installed, GeoJSON copies and cartography stay lng/lat (MapLibre's workers project them through
+the worker bundle's `setProjectionHandler`), and `BandCamera`/`BandSwitcher` stay installed as the
+identity (N-R5). A diff of ours across the native boundary re-places the sources it keeps
+unchanged (GeoJSON `setData`, image `setCoordinates`): their placement dates from their load.
 
 ```
 real lng/lat → Equal Earth metres → × GRID_FACTOR → inverse Mercator → "map space" lng/lat
@@ -139,6 +152,9 @@ affects the absolute metre values from `toEqualEarth`.
   main-thread fallback; a dynamic `import()` in that fallback alone would not shrink it while the
   entry re-exports the pipeline.
 - `src/math/backproject.ts` — the warp, `GRID_FACTOR`, and Web Mercator helpers.
+- `src/math/crs.ts` — Equal Earth as a CRS for MapLibre 6.15+'s `addProjection` (origin
+  [−X_MAX, X_MAX], extent 2·X_MAX: the blend-0 tile grid), and the workers' GeoJSON projection
+  handler. Pure; the worker bundle imports it.
 - `src/math/subdivide.ts` — adaptive densification, and `geographicToMapWorld`'s tolerance
   helper.
 - `src/math/antimeridian.ts` — restricts source geometry to longitude ±180° before warping.
@@ -265,7 +281,8 @@ affects the absolute metre values from `toEqualEarth`.
 - `scripts/probe-transition.mjs` — the headless probes of the transition demo: the wheel
   transition and `--first-paint` (see Commands).
 - `tests/browser/` — the Playwright matrix (see Commands). `harness.ts` is one map on the
-  fixture tiles, exposed as `window.__h` and configured by query parameters: `mlv=5|6`,
+  fixture tiles, exposed as `window.__h` and configured by query parameters: `mlv=5|6|6.16`
+  (6.16 from unpkg), `native=0` (`nativeProjection: false`),
   `plugin=0`, `dpr=`, `projection=mercator|globe|equal|equal-earth` (set after `load`),
   `compensation=`, `outside=` (colour), `container=` (the container's CSS background, which a
   transparent outside shows), `outline=1`, `graticule=<step>|1`, `control=1` (plus MapLibre's

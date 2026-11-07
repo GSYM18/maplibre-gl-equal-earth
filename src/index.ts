@@ -1,10 +1,12 @@
 /**
  * Equal Earth projection support for MapLibre GL JS.
  *
- * MapLibre has no API for registering a custom projection, so Equal Earth is produced by
- * feeding the Mercator renderer coordinates that have been pre-warped ("backprojected")
- * such that Mercator's own transform reproduces the Equal Earth image. See
- * `src/math/backproject.ts` for the details and the lineage of the technique.
+ * MapLibre cannot blend a projection of its own with Mercator, so the adaptive `equal` (and pure
+ * Equal Earth before MapLibre 6.15) is produced by feeding the Mercator renderer coordinates that
+ * have been pre-warped ("backprojected") such that Mercator's own transform reproduces the Equal
+ * Earth image. See `src/math/backproject.ts` for the details and the lineage of the technique.
+ * On MapLibre 6.15+, pure `equal-earth` is native: the plugin registers Equal Earth with MapLibre's
+ * experimental `addProjection`, whose tile grid is the warped tiles' own (`src/math/crs.ts`).
  *
  * @packageDocumentation
  */
@@ -18,6 +20,16 @@ export {
   type LngLatTuple,
   type PointTuple,
 } from './math/equal-earth.js';
+
+export {
+  EQUAL_EARTH_CRS_NAME,
+  EQUAL_EARTH_DEFINITION,
+  equalEarthConverter,
+  equalEarthCrs,
+  equalEarthProjectionHandler,
+  type CrsConverter,
+  type CrsDefinition,
+} from './math/crs.js';
 
 export {
   GRID_FACTOR,
@@ -76,6 +88,7 @@ export {
   worldOutline,
   worldPolygon,
   type CartographyOptions,
+  type CartographySpace,
   type GraticuleOptions,
   type OutlineOptions,
 } from './map/cartography.js';
@@ -164,7 +177,7 @@ export {
   type StyleLike,
 } from './map/style-rewrite.js';
 
-export { GEOJSON_MAX_DENSIFY_ZOOM, geojsonZoomForBand, warpGeoJSON } from './map/geojson.js';
+export { GEOJSON_MAX_DENSIFY_ZOOM, geojsonZoomForBand, warpGeoJSON, type WarpGeoJSONOptions } from './map/geojson.js';
 
 export { geographicUnder, mapSpaceOf } from './map/geo-api.js';
 

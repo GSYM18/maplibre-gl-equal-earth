@@ -775,3 +775,52 @@ describe('GeoJSON sources (spec §7)', () => {
     expect(validateStyleMin(rewrite(withPts({ type: 'geojson', data: cities(), cluster: true })).style as never)).toEqual([]);
   });
 });
+
+describe('rewriteStyle with geographic: true (native Equal Earth)', () => {
+  const style = (): StyleLike => ({
+    version: 8,
+    sources: {
+      openmaptiles: { type: 'vector', url: 'https://tiles.example/planet' },
+      geo: {
+        type: 'geojson',
+        data: { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: [[100, -80], [100, 80]] } },
+      },
+    },
+    layers: [
+      { id: 'bg', type: 'background', paint: { 'background-color': '#eee' } },
+      vec('water', 'fill'),
+      { id: 'route', type: 'line', source: 'geo' },
+    ],
+  });
+  const native = () =>
+    rewriteStyle(style(), {
+      bands: EQUAL_EARTH_BANDS,
+      transition: null,
+      templates: TEMPLATES,
+      initialZoom: 2,
+      geographic: true,
+      cartography: { outline: true, graticule: { step: 30 } },
+    }).style;
+
+  it('keeps the world polygon, outline and graticule in lng/lat', () => {
+    const out = native();
+    const world = out.sources['equal-earth:world__b0']!['data'] as GeoJSON.Feature<GeoJSON.Polygon>;
+    expect(world.geometry.coordinates[0]).toContainEqual([180, 0]);
+    const outline = out.sources['equal-earth:outline__b0']!['data'] as GeoJSON.Feature<GeoJSON.LineString>;
+    expect(outline.geometry.coordinates).toContainEqual([-180, 90]);
+    const grid = out.sources['equal-earth:graticule__b0']!['data'] as GeoJSON.FeatureCollection<GeoJSON.LineString>;
+    expect(grid.features[0]!.geometry.coordinates[0]).toEqual([-150, -90]);
+  });
+
+  it('densifies the GeoJSON copy but leaves it geographic', () => {
+    const data = native().sources['geo__b0']!['data'] as GeoJSON.FeatureCollection<GeoJSON.LineString>;
+    const coords = data.features[0]!.geometry.coordinates;
+    expect(coords.length).toBeGreaterThan(2);
+    expect(coords.every(([lng]) => lng === 100)).toBe(true);
+  });
+
+  it('builds the same tiles as the banded pure Equal Earth', () => {
+    const banded = rewriteStyle(style(), { bands: EQUAL_EARTH_BANDS, transition: null, templates: TEMPLATES, initialZoom: 2 }).style;
+    expect(native().sources['openmaptiles__b0']).toEqual(banded.sources['openmaptiles__b0']);
+  });
+});

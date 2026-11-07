@@ -18,15 +18,24 @@
  * warp options travel encoded inside the tile URL itself (see `protocol.ts`).
  */
 
+import { equalEarthProjectionHandler, type CrsConverter } from '../math/crs.js';
 import { createEqualEarthProtocol, PROTOCOL_SCHEME, type ProtocolHandler } from './protocol.js';
 
 /** The slice of MapLibre's worker global that we use. */
 interface WorkerGlobal {
   addProtocol?: (scheme: string, handler: ProtocolHandler) => void;
   removeProtocol?: (scheme: string) => void;
+  /** MapLibre 6.15+: builds a registered CRS's converter for GeoJSON sources in the workers. */
+  setProjectionHandler?: (handler: ((definition: string) => CrsConverter) | null) => void;
 }
 
 const workerSelf = globalThis as unknown as WorkerGlobal;
+
+// Native Equal Earth (spec 2026-11-07 §4): GeoJSON sources on a map in the registered CRS are
+// projected here, from the CRS's `definition`. Absent before 6.15, where nothing asks for it.
+if (typeof workerSelf.setProjectionHandler === 'function') {
+  workerSelf.setProjectionHandler(equalEarthProjectionHandler);
+}
 
 if (typeof workerSelf.addProtocol === 'function') {
   workerSelf.addProtocol(PROTOCOL_SCHEME, createEqualEarthProtocol());

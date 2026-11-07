@@ -66,3 +66,28 @@ describe('geojsonZoomForBand', () => {
     expect(geojsonZoomForBand(null, 0)).toBe(GEOJSON_MAX_DENSIFY_ZOOM);
   });
 });
+
+describe("warpGeoJSON with { geographic: true } (native Equal Earth)", () => {
+  it('clips and densifies but leaves positions geographic', () => {
+    const meridian = { type: 'LineString' as const, coordinates: [[100, -80], [100, 80]] };
+    const out = warpGeoJSON(meridian, 0, 4, { geographic: true });
+    const coords = (out.features[0]!.geometry as GeoJSON.LineString).coordinates;
+    expect(coords.length).toBeGreaterThan(2);
+    expect(coords.every(([lng]) => lng === 100)).toBe(true);
+    expect(coords[0]).toEqual([100, -80]);
+    expect(coords.at(-1)).toEqual([100, 80]);
+  });
+
+  it('keeps a point exactly where it was, and drops one beyond ±180°', () => {
+    const out = warpGeoJSON(
+      { type: 'FeatureCollection', features: [
+        { type: 'Feature', id: 7, properties: { a: 1 }, geometry: { type: 'Point', coordinates: [8.54, 47.37] } },
+        { type: 'Feature', properties: {}, geometry: { type: 'Point', coordinates: [200, 0] } },
+      ] },
+      0,
+      4,
+      { geographic: true },
+    );
+    expect(out.features).toEqual([{ type: 'Feature', id: 7, properties: { a: 1 }, geometry: { type: 'Point', coordinates: [8.54, 47.37] } }]);
+  });
+});

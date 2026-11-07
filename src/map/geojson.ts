@@ -32,25 +32,46 @@ export function geojsonZoomForBand(transition: ResolvedTransition | null, band: 
 }
 
 /** `geometry` clipped, densified and warped, or `null` when nothing of it is left. */
-function warpGeometry(geometry: GeoJSON.Geometry, tolerance: number, blend: number): GeoJSON.Geometry | null {
+function warpGeometry(
+  geometry: GeoJSON.Geometry,
+  tolerance: number,
+  blend: number,
+  geographic: boolean,
+): GeoJSON.Geometry | null {
   if (geometry.type === 'GeometryCollection') {
     const geometries: GeoJSON.Geometry[] = [];
     for (const member of geometry.geometries) {
-      const warped = warpGeometry(member, tolerance, blend);
+      const warped = warpGeometry(member, tolerance, blend, geographic);
       if (warped) geometries.push(warped);
     }
     return geometries.length > 0 ? { type: 'GeometryCollection', geometries } : null;
   }
-  const warped = warpFeature({ type: 'Feature', properties: null, geometry }, tolerance, MAX_DEPTH, blend);
+  const warped = warpFeature({ type: 'Feature', properties: null, geometry }, tolerance, MAX_DEPTH, blend, geographic);
   return warped ? warped.geometry : null;
 }
 
+export interface WarpGeoJSONOptions {
+  /**
+   * Leave positions in lng/lat: clip and densify only (deviation still measured in the band's
+   * world space). For native Equal Earth, where MapLibre's workers project every position.
+   * @defaultValue false
+   */
+  geographic?: boolean;
+}
+
 /**
- * Clip to ±180°, densify for `zoom` and warp into the map space of `blend`. Features that clip
- * away, and features without a geometry, are dropped. A bare geometry becomes a feature with
- * empty properties. Ids and properties are carried; the input is not mutated.
+ * Clip to ±180°, densify for `zoom` and warp into the map space of `blend` (or, with
+ * `geographic`, keep lng/lat). Features that clip away, and features without a geometry, are
+ * dropped. A bare geometry becomes a feature with empty properties. Ids and properties are
+ * carried; the input is not mutated.
  */
-export function warpGeoJSON(data: GeoJSON.GeoJSON, blend: number, zoom: number): GeoJSON.FeatureCollection {
+export function warpGeoJSON(
+  data: GeoJSON.GeoJSON,
+  blend: number,
+  zoom: number,
+  options: WarpGeoJSONOptions = {},
+): GeoJSON.FeatureCollection {
+  const geographic = options.geographic === true;
   const tolerance = toleranceForZoom(zoom);
   const features: GeoJSON.Feature[] =
     data.type === 'FeatureCollection'
@@ -61,7 +82,7 @@ export function warpGeoJSON(data: GeoJSON.GeoJSON, blend: number, zoom: number):
   const out: GeoJSON.Feature[] = [];
   for (const feature of features) {
     if (!feature.geometry) continue;
-    const geometry = warpGeometry(feature.geometry, tolerance, blend);
+    const geometry = warpGeometry(feature.geometry, tolerance, blend, geographic);
     if (!geometry) continue;
     out.push({
       type: 'Feature',

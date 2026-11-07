@@ -20,6 +20,7 @@ import {
   type ControllerOptions,
 } from './map/controller.js';
 import type { Transition } from './map/bands.js';
+import { EQUAL_EARTH_CRS_NAME, equalEarthCrs } from './math/crs.js';
 import type { CompensationMode } from './math/jacobian.js';
 import { PROTOCOL_SCHEME, createEqualEarthProtocol } from './tiles/protocol.js';
 
@@ -30,6 +31,10 @@ export interface MapLibreModule {
   addProtocol(scheme: string, handler: unknown): unknown;
   getWorkerCount(): number;
   setWorkerCount(count: number): void;
+  /** MapLibre 6.15+, experimental: registers a planar CRS as a projection (native Equal Earth). */
+  addProjection?(crs: never): unknown;
+  /** MapLibre 6.15+, experimental. */
+  removeProjection?(name: string): unknown;
   LngLat: new (lng: number, lat: number) => { lng: number; lat: number };
   LngLatBounds: new (sw: [number, number], ne: [number, number]) => unknown;
   Map: { prototype: { setProjection(projection: unknown): unknown; getProjection(): unknown } };
@@ -87,6 +92,15 @@ export interface InstallOptions {
    * fetches about a quarter of the bytes for coarser geometry. @defaultValue 0
    */
   sourceZoomOffset?: number;
+  /**
+   * Draw pure `equal-earth` through MapLibre's own experimental `addProjection` (6.15+): MapLibre
+   * then converts every coordinate itself, exactly, and zooms around the pointer; the plugin's
+   * warped tiles still feed it. Used when MapLibre has `addProjection` and the worker bundle
+   * loaded (its projection handler places GeoJSON). If the registration throws, the install warns
+   * and stays banded. `equal` is banded either way. `false` keeps pure Equal Earth banded too.
+   * @defaultValue 'auto'
+   */
+  nativeProjection?: 'auto' | false;
 }
 
 export interface EqualEarthInstall {
@@ -94,6 +108,11 @@ export interface EqualEarthInstall {
   readonly version: string;
   /** Where tiles are warped: the worker pool, or the main thread if the worker bundle failed to load. */
   readonly workerPath: 'worker' | 'main-thread';
+  /**
+   * The name Equal Earth is registered under with MapLibre's `addProjection`, when pure
+   * `equal-earth` is native (option `nativeProjection`); `undefined` when it is banded.
+   */
+  readonly nativeProjection: string | undefined;
   /** The controller of a map, created on first use. */
   controllerFor(map: ControllerHost): EqualEarthController;
   /** Restore the prototype methods (if still ours) and deactivate every controller. */
@@ -202,6 +221,11 @@ async function install(
     workerPath = 'main-thread';
   }
 
+  // Native Equal Earth (spec 2026-11-07 §3): only with the worker bundle, whose projection handler
+  // places GeoJSON in the workers; the main-thread fallback has none.
+  const nativeProjection =
+    options.nativeProjection !== false && workerPath === 'worker' ? registerNativeProjection(maplibregl) : undefined;
+
   const controllerOptions: ControllerOptions = {
     lngLatFactory: (lng, lat) => new maplibregl.LngLat(lng, lat),
     lngLatBoundsFactory: (sw, ne) => new maplibregl.LngLatBounds(sw, ne),
@@ -215,6 +239,7 @@ async function install(
     ...(options.graticule === undefined ? {} : { graticule: options.graticule }),
     ...(options.persistentCache === undefined ? {} : { persistentCache: options.persistentCache }),
     ...(options.sourceZoomOffset === undefined ? {} : { sourceZoomOffset: options.sourceZoomOffset }),
+    ...(nativeProjection === undefined ? {} : { nativeProjection }),
   };
   const controllers = new WeakMap<object, EqualEarthController>();
   const live = new Set<EqualEarthController>();
@@ -263,9 +288,9 @@ async function install(
     const type = (projection as { type?: unknown } | null | undefined)?.type;
     if (typeof type === 'string' && EQUAL_EARTH_TYPES.has(type)) {
       // Equal Earth is drawn by the Mercator renderer; under globe the warped coordinates would
-      // render as a distorted sphere.
+      // render as a distorted sphere. The registered projection is native Equal Earth's own.
       const current = currentType(this);
-      if (current !== undefined && current !== 'mercator') {
+      if (current !== undefined && current !== 'mercator' && current !== nativeProjection) {
         originalSet.call(this, { type: 'mercator' });
       }
       controllerFor(this)
@@ -316,6 +341,7 @@ async function install(
   return {
     version,
     workerPath,
+    nativeProjection,
     controllerFor,
     uninstall: () => {
       release();
@@ -325,6 +351,41 @@ async function install(
         controller.destroy().catch((error: unknown) => console.error(error));
       }
       live.clear();
+      // After the restores: a map still in the projection keeps working until it changes.
+      if (nativeProjection !== undefined) {
+        try {
+          maplibregl.removeProjection?.(nativeProjection);
+        } catch {
+          // Nothing to undo.
+        }
+      }
     },
   };
+}
+
+/**
+ * Register Equal Earth with MapLibre's experimental `addProjection` (6.15+) and return its name, or
+ * `undefined` where there is none or it refuses. A registration left by an earlier install of this
+ * module (an `uninstall` that could not remove it, a second bundle) is replaced: MapLibre refuses
+ * a name twice.
+ */
+function registerNativeProjection(maplibregl: MapLibreModule): string | undefined {
+  if (typeof maplibregl.addProjection !== 'function') return undefined;
+  const add = (): void => {
+    maplibregl.addProjection!(equalEarthCrs() as never);
+  };
+  try {
+    try {
+      add();
+    } catch (error) {
+      if (typeof maplibregl.removeProjection !== 'function') throw error;
+      maplibregl.removeProjection(EQUAL_EARTH_CRS_NAME);
+      add();
+    }
+    return EQUAL_EARTH_CRS_NAME;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.warn(`[equal-earth] MapLibre's addProjection refused Equal Earth (${reason}); pure Equal Earth stays banded.`);
+    return undefined;
+  }
 }

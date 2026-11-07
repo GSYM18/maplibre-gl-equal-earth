@@ -395,3 +395,82 @@ describe('installEqualEarth', () => {
     expect(install.controllerFor(host).active).toBe(false);
   });
 });
+
+describe('installEqualEarth, native Equal Earth (addProjection, MapLibre 6.15+)', () => {
+  /** A 6.16 module: a registry like MapLibre's (`projection_crud.ts`), which refuses a duplicate name. */
+  function nativeModule(importResult: Promise<unknown> = Promise.resolve()) {
+    const { module, FakeMap } = fakeModule('6.16.0', importResult);
+    const registry = new Map<string, { name: string; projection: { forward(p: number[]): number[] } }>();
+    const addProjection = vi.fn((crs: { name: string; projection: { forward(p: number[]): number[] } }) => {
+      if (registry.has(crs.name)) throw new Error(`A projection called "${crs.name}" already exists.`);
+      registry.set(crs.name, crs);
+    });
+    const removeProjection = vi.fn((name: string) => void registry.delete(name));
+    return { module: { ...module, addProjection, removeProjection }, FakeMap, registry };
+  }
+
+  it('registers the Equal Earth CRS and reports its name', async () => {
+    const { module, registry } = nativeModule();
+    const install = await installEqualEarth(module);
+    expect(install.nativeProjection).toBe('equal-earth:native');
+    expect([...registry.keys()]).toEqual(['equal-earth:native']);
+    expect(registry.get('equal-earth:native')!.projection.forward([0, 0])).toEqual([0, 0]);
+    install.uninstall();
+    expect(module.removeProjection).toHaveBeenCalledWith('equal-earth:native');
+    expect(registry.size).toBe(0);
+  });
+
+  it('registers again after an uninstall, and over a stale registration', async () => {
+    const { module, registry } = nativeModule();
+    registry.set('equal-earth:native', { name: 'equal-earth:native', projection: { forward: () => [NaN, NaN] } });
+    const install = await installEqualEarth(module);
+    expect(install.nativeProjection).toBe('equal-earth:native');
+    expect(registry.get('equal-earth:native')!.projection.forward([0, 0])).toEqual([0, 0]);
+    install.uninstall();
+    const again = await installEqualEarth(module);
+    expect(again.nativeProjection).toBe('equal-earth:native');
+    again.uninstall();
+  });
+
+  it('stays banded when opted out, before 6.15, or on the main-thread fallback', async () => {
+    const optedOut = nativeModule();
+    expect((await installEqualEarth(optedOut.module, { nativeProjection: false })).nativeProjection).toBeUndefined();
+    expect(optedOut.module.addProjection).not.toHaveBeenCalled();
+
+    const old = fakeModule('6.14.0');
+    expect((await installEqualEarth(old.module)).nativeProjection).toBeUndefined();
+
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const fallback = nativeModule(Promise.reject(new Error('404')));
+    const install = await installEqualEarth(fallback.module);
+    expect(install.workerPath).toBe('main-thread');
+    expect(install.nativeProjection).toBeUndefined();
+    expect(fallback.module.addProjection).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+  });
+
+  it('warns once and stays banded when the registration throws', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const { module } = nativeModule();
+    module.addProjection.mockImplementation(() => {
+      throw new Error('changed API');
+    });
+    const install = await installEqualEarth(module);
+    expect(install.nativeProjection).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/addProjection.*changed API/));
+    install.uninstall();
+    warn.mockRestore();
+  });
+
+  it('does not force Mercator under the registered projection, which is its own', async () => {
+    const { module: base } = nativeModule();
+    const { Host } = hostModule();
+    const install = await installEqualEarth({ ...base, Map: Host });
+    const map = new Host([0, 0], 2);
+    map.style = liberty();
+    map.own = { type: 'equal-earth:native' };
+    map.setProjection({ type: 'equal' });
+    expect(map.own).toEqual({ type: 'equal-earth:native' });
+    install.uninstall();
+  });
+});

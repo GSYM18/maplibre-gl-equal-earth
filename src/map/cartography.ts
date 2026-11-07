@@ -1,11 +1,19 @@
 /**
  * The cartographic finish of the Equal Earth world (spec §5): the world's boundary as a
- * polygon and a line, and a graticule, all in map space at a band's blend.
+ * polygon and a line, and a graticule, all in map space at a band's blend, or in lng/lat
+ * (`'geographic'`) for native Equal Earth, where MapLibre projects them itself.
  *
  * Pure functions; `style-rewrite.ts` turns them into generated sources and layers.
  */
 
 import { geographicToMap } from '../math/backproject.js';
+
+/** A band's blend (map space), or `'geographic'`: positions stay lng/lat. */
+export type CartographySpace = number | 'geographic';
+
+function placer(space: CartographySpace): (p: Position) => Position {
+  return space === 'geographic' ? (p) => [p[0], p[1]] : (p) => geographicToMap(p, space);
+}
 
 export interface OutlineOptions {
   /** @defaultValue '#9a9a9a' */
@@ -38,40 +46,42 @@ export const CARTOGRAPHY_PREFIX = 'equal-earth:';
 type Position = [number, number];
 
 /** The ±180° boundary: east meridian pole to pole, then west meridian back, closed. */
-function boundary(blend: number, stepDeg: number): Position[] {
+function boundary(space: CartographySpace, stepDeg: number): Position[] {
   if (!(stepDeg > 0)) throw new TypeError('world: stepDeg must be positive');
   const count = Math.round(180 / stepDeg);
+  const place = placer(space);
   const ring: Position[] = [];
-  for (let i = 0; i <= count; i++) ring.push(geographicToMap([180, -90 + i * stepDeg], blend));
-  for (let i = 0; i <= count; i++) ring.push(geographicToMap([-180, 90 - i * stepDeg], blend));
+  for (let i = 0; i <= count; i++) ring.push(place([180, -90 + i * stepDeg]));
+  for (let i = 0; i <= count; i++) ring.push(place([-180, 90 - i * stepDeg]));
   ring.push([ring[0]![0], ring[0]![1]]);
   return ring;
 }
 
-/** The Equal Earth world at `blend`, in map space: ±180° meridians (sampled every `stepDeg`) closed by the pole lines. */
-export function worldPolygon(blend: number, stepDeg = 0.5): GeoJSON.Feature<GeoJSON.Polygon> {
-  return { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [boundary(blend, stepDeg)] } };
+/** The Equal Earth world in `space`: ±180° meridians (sampled every `stepDeg`) closed by the pole lines. */
+export function worldPolygon(space: CartographySpace, stepDeg = 0.5): GeoJSON.Feature<GeoJSON.Polygon> {
+  return { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [boundary(space, stepDeg)] } };
 }
 
 /** The same boundary as one closed LineString. */
-export function worldOutline(blend: number, stepDeg = 0.5): GeoJSON.Feature<GeoJSON.LineString> {
-  return { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: boundary(blend, stepDeg) } };
+export function worldOutline(space: CartographySpace, stepDeg = 0.5): GeoJSON.Feature<GeoJSON.LineString> {
+  return { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: boundary(space, stepDeg) } };
 }
 
 /**
  * Meridians every `step`° from −180 + step to 180 − step, parallels every `step`° strictly
- * between the poles; sampled every 1°, in map space at `blend`.
+ * between the poles; sampled every 1°, in `space`.
  */
-export function graticule(blend: number, step: number): GeoJSON.FeatureCollection<GeoJSON.LineString> {
+export function graticule(space: CartographySpace, step: number): GeoJSON.FeatureCollection<GeoJSON.LineString> {
   if (!(step > 0) || 180 % step !== 0) {
     throw new TypeError(`graticule: step must be positive and divide 180, got ${step}`);
   }
+  const place = placer(space);
   const features: GeoJSON.Feature<GeoJSON.LineString>[] = [];
   const line = (kind: 'meridian' | 'parallel', value: number, points: Position[]): void => {
     features.push({
       type: 'Feature',
       properties: { kind, value },
-      geometry: { type: 'LineString', coordinates: points.map((p) => geographicToMap(p, blend)) },
+      geometry: { type: 'LineString', coordinates: points.map(place) },
     });
   };
   for (let lng = -180 + step; lng < 180; lng += step) {

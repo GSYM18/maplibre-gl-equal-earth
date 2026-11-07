@@ -3,7 +3,8 @@ import globals from 'globals';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['dist/**', 'node_modules/**'] },
+  // .superpowers/: agent tooling scratch (gitignored), not project code.
+  { ignores: ['dist/**', 'node_modules/**', '.superpowers/**'] },
   js.configs.recommended,
   {
     // Plain ESM run directly by node. TypeScript files do not need this: type-aware

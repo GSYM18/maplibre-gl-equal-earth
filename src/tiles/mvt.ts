@@ -169,24 +169,29 @@ export function mergeLayers(tiles: readonly GeographicLayers[]): GeographicLayer
  * wrong place (see `antimeridian.ts`). Returns `null` when nothing is left.
  *
  * Points are warped without densification — there is nothing between a point and itself.
+ *
+ * With `geographic`, the output stays lng/lat (clipped and densified, deviation still measured
+ * in the band's world space): for native Equal Earth, where MapLibre projects every position.
  */
 export function warpFeature(
   feature: GeoJSON.Feature,
   tolerance: number,
   maxDepth: number,
   blend = 0,
+  geographic = false,
 ): GeoJSON.Feature | null {
   const geometry = feature.geometry;
   if (!geometry || geometry.type === 'GeometryCollection') return null;
 
-  const warpPosition = (p: GeoJSON.Position): GeoJSON.Position =>
-    geographicToMap([p[0]!, p[1]!], blend);
+  const place = (p: LngLatTuple): GeoJSON.Position => (geographic ? p : geographicToMap(p, blend));
+
+  const warpPosition = (p: GeoJSON.Position): GeoJSON.Position => place([p[0]!, p[1]!]);
 
   const warpLine = (line: GeoJSON.Position[]): GeoJSON.Position[] =>
     densify(
       line.map((p) => [p[0]!, p[1]!] as LngLatTuple),
       { tolerance, maxDepth, blend },
-    ).map((p) => geographicToMap(p, blend) as GeoJSON.Position);
+    ).map(place);
 
   let warped: GeoJSON.Geometry;
   switch (geometry.type) {

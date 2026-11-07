@@ -58,3 +58,21 @@ describe('graticule', () => {
     expect(() => graticule(0, 7)).toThrow(TypeError);
   });
 });
+
+describe("the 'geographic' space (native Equal Earth, where MapLibre projects)", () => {
+  it('keeps the world boundary in lng/lat, the ±180° meridians pole to pole', () => {
+    const ring = worldPolygon('geographic').geometry.coordinates[0]!;
+    expect(ring[0]).toEqual([180, -90]);
+    expect(ring).toContainEqual([180, 0]);
+    expect(ring).toContainEqual([-180, 90]);
+    expect(ring.every(([lng, lat]) => Math.abs(lng!) === 180 && Math.abs(lat!) <= 90)).toBe(true);
+    expect(worldOutline('geographic').geometry.coordinates).toEqual(ring);
+  });
+
+  it('keeps graticule lines in lng/lat', () => {
+    const lines = graticule('geographic', 30).features;
+    const meridian = lines.find((f) => f.properties?.kind === 'meridian' && f.properties.value === 30)!;
+    expect(meridian.geometry.coordinates[0]).toEqual([30, -90]);
+    expect(meridian.geometry.coordinates.at(-1)).toEqual([30, 90]);
+  });
+});

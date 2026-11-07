@@ -25,7 +25,7 @@ npm install @yellowmap/maplibre-gl-equal-earth maplibre-gl
 ESM (`dist/index.js`) for bundlers and `<script type="module">`, and UMD
 (`dist/maplibre-gl-equal-earth.umd.min.js`) for a classic `<script>` tag. The peer range is
 `maplibre-gl >=5.24 <7`. The demo runs on v6; the browser test suite runs every scenario on
-MapLibre 5.24 and 6.6.
+MapLibre 5.24 and 6.6, and native Equal Earth on 6.16.
 
 ### Without a bundler
 
@@ -54,9 +54,10 @@ or import this package's ESM file the same way.
 
 ## How it works, and what that costs you
 
-MapLibre has no API for registering a custom projection — `createProjectionFromName` is a
-hard-coded switch, and an unknown projection name silently falls back to Mercator. Equal Earth is
-therefore produced by **backprojection**: the Mercator renderer is fed fabricated longitude and
+Before 6.15 MapLibre has no API for registering a custom projection — `createProjectionFromName`
+is a hard-coded switch, and an unknown projection name silently falls back to Mercator — and no
+version can blend one with Mercator. Equal Earth is therefore produced by **backprojection**
+(except for [native pure Equal Earth on 6.15+](#native-equal-earth-on-maplibre-615)): the Mercator renderer is fed fabricated longitude and
 latitude values chosen so that Mercator's own transform reproduces the Equal Earth image.
 
 ```
@@ -77,6 +78,35 @@ Three consequences you should know about:
   coordinates, so warped values would render as a distorted sphere.
 - **Labels stay upright.** Because MapLibre still believes it is rendering Mercator, text layout
   and collision detection work normally — an advantage no raster-reprojection approach has.
+
+### Native Equal Earth on MapLibre 6.15+
+
+MapLibre 6.15 added an experimental `addProjection`, which registers a planar coordinate system
+whose tiles are already cut in its own grid. The plugin's warped Equal Earth tiles are exactly
+such tiles, so on 6.15 and later `installEqualEarth` registers Equal Earth (as
+`equal-earth:native`) and draws **pure `equal-earth`** through MapLibre's own projection:
+
+- every coordinate the map hands out or takes is geographic natively and exact (no map space, no
+  wrapper): `project`, `unproject`, Marker, Popup, events, `queryRenderedFeatures` geometry;
+- scroll zoom stays anchored under the pointer;
+- GeoJSON is projected by MapLibre in its workers (the plugin's worker bundle sets the
+  projection handler).
+
+`map.getProjection()` still reports `equal-earth`, and nothing in your code changes. `equal`
+stays stepped on every MapLibre version: MapLibre cannot blend a registered projection with
+Mercator. The install's `nativeProjection` says which name was registered (`undefined` when
+pure Equal Earth is stepped). Native mode needs the worker bundle (the main-thread fallback has
+no projection handler); `installEqualEarth(maplibregl, { nativeProjection: false })` opts out.
+
+Limits of native mode: `addProjection` is experimental and may change in a MapLibre minor release
+(if registering throws, the plugin warns and stays stepped); the central meridian is fixed at 0°
+and there are no world copies; raster, hillshade and color-relief layers stay hidden as in stepped
+pure Equal Earth (their tiles are Mercator); `getStyle()` names `equal-earth:native` as the
+projection. MapLibre keeps one GeoJSON projection handler per worker and offers no way to read
+it: the plugin's worker bundle replaces a handler the application set before `installEqualEarth`,
+and one set after replaces the plugin's. An application with its own registered projections
+should set, after the install, a handler that answers both: the plugin's definition
+(`EQUAL_EARTH_DEFINITION`, built by `equalEarthProjectionHandler`) and its own.
 
 ## Usage
 
@@ -643,9 +673,9 @@ stays 0; whether to revisit the budget is an open product decision.
 
 | Export | Description |
 | --- | --- |
-| `installEqualEarth(maplibregl, opts)` | Checks the version, sizes the worker pool, loads the worker bundle, polyfills `setProjection`/`getProjection`. Resolves to `{ version, workerPath, controllerFor(map), uninstall() }`. Options: `workerUrl`, `workerTimeoutMs`, `workers`, `transition`, `compensation`, `onSwitch`, `fetchJson`, `outsideColor`, `outline`, `graticule`, `geographicApi`, `persistentCache`, `sourceZoomOffset`. |
+| `installEqualEarth(maplibregl, opts)` | Checks the version, sizes the worker pool, loads the worker bundle, polyfills `setProjection`/`getProjection`. On MapLibre 6.15+ registers native Equal Earth ([Native Equal Earth](#native-equal-earth-on-maplibre-615)). Resolves to `{ version, workerPath, nativeProjection, controllerFor(map), uninstall() }`. Options: `workerUrl`, `workerTimeoutMs`, `workers`, `transition`, `compensation`, `onSwitch`, `fetchJson`, `outsideColor`, `outline`, `graticule`, `geographicApi`, `persistentCache`, `sourceZoomOffset`, `nativeProjection`. |
 | `EqualEarthControl` | The projection toggle button; options `on`, `off`. |
-| `EqualEarthController` | Per map, from `controllerFor(map)`: `active`, `projection`, `pendingProjection`, `blend`, `requestedZoom`, `toMapSpace(lngLat)`, `toGeographic(lngLat)`. |
+| `EqualEarthController` | Per map, from `controllerFor(map)`: `active`, `projection`, `pendingProjection`, `native`, `blend`, `requestedZoom`, `toMapSpace(lngLat)`, `toGeographic(lngLat)`. |
 | `toEqualEarth(lngLat)` | Geographic degrees → Equal Earth metres (EPSG:8857). |
 | `fromEqualEarth(point)` | Equal Earth metres → geographic degrees. Newton inverse. |
 | `geographicUnder(mapLngLat, blend)` | Map space of a band at `blend` → geographic, clamped to the world's outline. |
@@ -653,8 +683,10 @@ stays 0; whether to revisit the budget is an open product decision.
 | `geographicToMap(lngLat, blend = 0)` | Geographic degrees → the map space of a band at `blend` (0 = pure Equal Earth). |
 | `mapToGeographic(lngLat, blend = 0)` | Map space of a band at `blend` → geographic degrees. |
 | `originalLayerId(id)` | The application's layer id behind a rendered one: `water__b2` → `water`. |
-| `graticule`, `worldOutline`, `worldPolygon` | The cartography's GeoJSON at a blend, in map space. |
-| `warpGeoJSON(data, blend, zoom)` | Clip, densify and warp GeoJSON into a band's map space. |
+| `graticule`, `worldOutline`, `worldPolygon` | The cartography's GeoJSON at a blend, in map space, or `'geographic'` (lng/lat). |
+| `warpGeoJSON(data, blend, zoom, { geographic })` | Clip, densify and warp GeoJSON into a band's map space (`geographic: true` keeps lng/lat). |
+| `equalEarthCrs()` | Equal Earth as a CRS for MapLibre's `addProjection`; its grid is the warped tiles' (`EQUAL_EARTH_CRS_NAME`). |
+| `equalEarthProjectionHandler(definition)` | The workers' GeoJSON projection handler for `EQUAL_EARTH_DEFINITION`. |
 | `BandCamera` | Lower level: the `transformCameraUpdate` hook across zoom bands, with compensation. `installEqualEarth` installs it. |
 | `ThresholdCamera` | Lower level: the two-band form of `BandCamera` (Equal Earth ↔ Mercator). |
 | `installEqualEarthConstrain(map, opts)` | Lower level, installed by `installEqualEarth`: clamps the camera to the Equal Earth world; returns a teardown function. |

@@ -12,8 +12,12 @@ import type { Map as MapLibreMap, StyleSpecification } from 'maplibre-gl';
 
 import type { CompensationMode, EqualEarthController, EqualEarthInstall } from '../../src/index.ts';
 
-/** The MapLibre major a project runs against. */
-export type MapLibreMajor = 5 | 6;
+/**
+ * The MapLibre a project runs against: 5.24 and 6.6 from `node_modules`, or `'6.16'` from unpkg
+ * (the npm registry here refuses releases after 2026-08-31; spec 2026-11-07 N-R4), the first with
+ * `addProjection` for native Equal Earth.
+ */
+export type MapLibreMajor = 5 | 6 | '6.16';
 
 /** The projection the harness sets once the map has loaded. */
 export type HarnessProjection = 'mercator' | 'globe' | 'equal' | 'equal-earth';
@@ -27,6 +31,8 @@ export interface Harness {
   map: MapLibreMap;
   install?: EqualEarthInstall;
   controller?: EqualEarthController;
+  /** The plugin's Equal Earth maths, for specs that check MapLibre's own conversions against it. */
+  math: { toEqualEarth(lngLat: [number, number]): [number, number]; X_MAX: number };
   /** Map `error` events and `[equal-earth]` console warnings, in order. */
   errors: string[];
   /** Whether the plugin runs with its geographic API (`?geoapi=0` turns it off). */
@@ -71,6 +77,8 @@ export interface HarnessOptions {
   persist?: boolean;
   /** `?early=1`: set an Equal Earth `projection` before `load`, so no Mercator tile is fetched. */
   early?: boolean;
+  /** `nativeProjection: false` when `false` (`?native=0`). @defaultValue true */
+  native?: boolean;
 }
 
 /** `test` with the per-project `mlv` option (`playwright.config.ts` sets it). */
@@ -100,6 +108,7 @@ export async function openHarness(page: Page, options: HarnessOptions): Promise<
   if (options.geojson) params.set('geojson', '1');
   if (options.persist === false) params.set('persist', '0');
   if (options.early) params.set('early', '1');
+  if (options.native === false) params.set('native', '0');
   await page.goto(`/tests/browser/harness.html?${params.toString()}`);
   await page.waitForFunction(() => window.__h !== undefined);
   let timer: ReturnType<typeof setTimeout> | undefined;

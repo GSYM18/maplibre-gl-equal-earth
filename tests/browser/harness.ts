@@ -11,14 +11,26 @@
  * places) with a blue `circle` layer `cities` (radius 6) on top of the fixture style.
  * `?persist=0` passes `persistentCache: false`. `?early=1` sets an Equal Earth `projection` right
  * after creating the map instead of after `load`, so the plain Mercator style never fetches tiles.
+ * `?mlv=6.16` loads MapLibre 6.16.0 from unpkg (native Equal Earth); `?native=0` passes
+ * `nativeProjection: false`.
  */
 import type { StyleSpecification } from 'maplibre-gl';
 
-import { EqualEarthControl, installEqualEarth, type CompensationMode } from '../../src/index.ts';
-import type { Harness, HarnessProjection } from './helpers.ts';
+import {
+  EQUAL_EARTH_X_MAX,
+  EqualEarthControl,
+  installEqualEarth,
+  toEqualEarth,
+  type CompensationMode,
+} from '../../src/index.ts';
+import type { Harness, HarnessProjection, MapLibreMajor } from './helpers.ts';
 
 const params = new URLSearchParams(location.search);
-const mlv = params.get('mlv') === '5' ? 5 : 6;
+const mlvParam = params.get('mlv');
+const mlv: MapLibreMajor = mlvParam === '5' ? 5 : mlvParam === '6.16' ? '6.16' : 6;
+/** MapLibre 6.16.0, the newest release, from unpkg: npm cannot install it here (N-R4). */
+const UNPKG_6_16 = 'https://unpkg.com/maplibre-gl@6.16.0/dist/';
+const native = params.get('native') !== '0';
 const plugin = params.get('plugin') !== '0';
 const dprParam = Number(params.get('dpr'));
 const dpr = params.get('dpr') !== null && dprParam > 0 ? dprParam : undefined;
@@ -80,6 +92,7 @@ const h = {
   }),
   errors: [] as string[],
   fixtureStyle,
+  math: { toEqualEarth, X_MAX: EQUAL_EARTH_X_MAX },
   geoApi: plugin && geoApi,
 } as Partial<Harness> as Harness;
 window.__h = h;
@@ -133,6 +146,10 @@ const loadCss = (url: string): Promise<void> => {
 };
 
 async function loadMapLibre(): Promise<typeof import('maplibre-gl')> {
+  if (mlv === '6.16') {
+    await loadCss(`${UNPKG_6_16}maplibre-gl.css`);
+    return (await import(/* @vite-ignore */ `${UNPKG_6_16}maplibre-gl.mjs`)) as typeof import('maplibre-gl');
+  }
   if (mlv === 6) {
     await loadCss('/node_modules/maplibre-gl/dist/maplibre-gl.css');
     return import('maplibre-gl');
@@ -150,7 +167,7 @@ async function start(): Promise<void> {
   h.maplibregl = maplibregl;
   if (plugin) {
     // `?v=`: a reused dev server would otherwise serve its cached transform of an older build.
-    const worker = mlv === 6 ? '/dist/worker.mjs' : '/dist/worker.iife.js';
+    const worker = mlv === 5 ? '/dist/worker.iife.js' : '/dist/worker.mjs';
     h.install = await installEqualEarth(maplibregl, {
       workerUrl: new URL(`${worker}?v=${Date.now()}`, location.href),
       workerTimeoutMs: 15000,
@@ -160,6 +177,7 @@ async function start(): Promise<void> {
       ...(graticule ? { graticule } : {}),
       ...(geoApi ? {} : { geographicApi: false }),
       ...(persist ? {} : { persistentCache: false }),
+      ...(native ? {} : { nativeProjection: false }),
     });
   }
   const map = new maplibregl.Map({
@@ -176,7 +194,7 @@ async function start(): Promise<void> {
   h.map = map;
   if (control) {
     map.addControl(new EqualEarthControl(), 'top-right');
-    if (mlv === 6) map.addControl(new maplibregl.GlobeControl(), 'top-right');
+    if (mlv !== 5) map.addControl(new maplibregl.GlobeControl(), 'top-right');
   }
   if (h.install) h.controller = h.install.controllerFor(map);
   if (early) map.setProjection({ type: projection });

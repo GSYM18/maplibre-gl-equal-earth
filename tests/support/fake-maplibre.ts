@@ -610,6 +610,22 @@ export class FakeGeoJSONSource {
   }
 }
 
+/** An image source as `map.getSource(id)` returns it: its corners are placed when set. */
+export class FakeImageSource {
+  readonly type = 'image';
+  readonly coordinateCalls: unknown[] = [];
+  setCoordinates(coordinates: unknown): this {
+    this.coordinateCalls.push(coordinates);
+    return this;
+  }
+}
+
+/** A style's `projection.type`, `mercator` when it names none (MapLibre's default). */
+function projectionName(style: StyleLike): unknown {
+  const projection = style['projection'] as { type?: unknown } | undefined;
+  return projection?.type ?? 'mercator';
+}
+
 /** Set `target[key]` to `value`, or delete it for `undefined`/`null` (MapLibre's reset). */
 function setOrDelete(target: Record<string, unknown>, key: string, value: unknown): void {
   if (value === undefined || value === null) delete target[key];
@@ -760,7 +776,12 @@ export class FakeControllerHost extends FakeV6Map {
     if (JSON.stringify(this.style) === JSON.stringify(style)) return;
     const before = new Map(this.style.layers.map((layer) => [layer.id, layer]));
     const sourcesBefore = this.style.sources;
+    const projectionBefore = projectionName(this.style);
     this.style = structuredClone(style);
+    // The diff's `setProjection` runs before its source operations (`diffStyles` pushes it with
+    // the root properties); a new projection migrates the map, which fires `projectiontransition`
+    // on the Map (`Style._applyProjection` → `Map.migrateProjection`).
+    if (projectionName(this.style) !== projectionBefore) this.fire({ type: 'projectiontransition' });
     // A source whose only change is its GeoJSON `data` keeps its object and gets `setData`
     // (`diffSources` → `setGeoJSONSourceData`, `style/style_diff.ts`); any other change removes
     // it and adds a new one.
@@ -798,15 +819,20 @@ export class FakeControllerHost extends FakeV6Map {
   }
 
   /** Source objects handed out, by id: kept while the style keeps the source unchanged. */
-  readonly #sources = new Map<string, FakeGeoJSONSource | { type: string }>();
+  readonly #sources = new Map<string, FakeGeoJSONSource | FakeImageSource | { type: string }>();
 
   /** As `Map.getSource`: the style's source object, the same one until the source is replaced. */
-  getSource(id: string): FakeGeoJSONSource | { type: string } | undefined {
+  getSource(id: string): FakeGeoJSONSource | FakeImageSource | { type: string } | undefined {
     const spec = this.style?.sources[id];
     if (!spec) return undefined;
     let source = this.#sources.get(id);
     if (!source) {
-      source = spec['type'] === 'geojson' ? new FakeGeoJSONSource(id, () => this.style?.sources[id]) : { type: String(spec['type']) };
+      source =
+        spec['type'] === 'geojson'
+          ? new FakeGeoJSONSource(id, () => this.style?.sources[id])
+          : spec['type'] === 'image'
+            ? new FakeImageSource()
+            : { type: String(spec['type']) };
       this.#sources.set(id, source);
     }
     return source;

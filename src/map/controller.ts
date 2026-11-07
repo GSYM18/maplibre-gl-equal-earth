@@ -346,6 +346,14 @@ export interface ControllerBaseOptions extends CartographyOptions {
   persistentCache?: PersistentCacheOptions | false;
   /** Read source tiles this many zooms from the output zoom (`TileCoverOptions`). @defaultValue 0 */
   sourceZoomOffset?: number;
+  /**
+   * The name Equal Earth is registered under with MapLibre's `addProjection` (6.15+; spec
+   * 2026-11-07). With it, pure `equal-earth` is native: the rewritten style names this projection,
+   * MapLibre converts lng/lat itself, GeoJSON and cartography stay geographic, and the geographic
+   * API, the conversions and the world clamp stand aside. `equal` is banded either way.
+   * `installEqualEarth` passes it when it registered the projection.
+   */
+  nativeProjection?: string;
 }
 
 /** Builds the bounds the geographic `getBounds()` returns. */
@@ -472,6 +480,16 @@ export class EqualEarthController {
   readonly #dataVersions = new Map<string, number>();
 
   #projection: EqualEarthProjection | undefined;
+  /** The type shown is native Equal Earth (`nativeProjection`): MapLibre's coordinates are geographic. */
+  #native = false;
+  /**
+   * The live style names the registered projection: set by each `setStyle` of ours, unknown
+   * (`undefined`) after the application's. A diff of ours that changes it re-places the sources it
+   * keeps ({@link #setStyle}).
+   */
+  #liveNative: boolean | undefined = false;
+  /** True while a `setStyle` of ours crosses the native boundary: its `projectiontransition` is ours. */
+  #crossing = false;
   #bands: readonly Band[] = EQUAL_EARTH_BANDS;
   #transition: ResolvedTransition | null = null;
   /** The style to restore: the application's, never a rewritten one. */
@@ -580,24 +598,47 @@ export class EqualEarthController {
     return this.#projection;
   }
 
+  /**
+   * Whether the type shown is native Equal Earth: MapLibre's registered projection draws it, so
+   * every coordinate the map hands out or takes is geographic, as under Mercator.
+   */
+  get native(): boolean {
+    return this.#native;
+  }
+
   /** The type an activation still in flight will show; `undefined` when none is. */
   get pendingProjection(): EqualEarthProjection | undefined {
     return this.#pending?.type;
   }
 
-  /** Blend of the band shown now; 1 (Mercator, i.e. geographic) while inactive. */
+  /**
+   * Blend of the map space shown now, what `geographicUnder` and `mapSpaceOf` convert with: the
+   * band's; 1 (Mercator, i.e. geographic) while inactive and under native Equal Earth, whose
+   * coordinates are geographic.
+   */
   get blend(): number {
     if (!this.active) return 1;
-    return this.#installed ? this.#installed.camera.blend : (this.#view?.blend ?? 1);
+    if (this.#installed) return this.#nativeShown() ? 1 : this.#installed.camera.blend;
+    return this.#view?.blend ?? 1;
   }
 
   /**
    * Blend of the band the requested camera state is in (`BandCamera.baselineBand`): what a
-   * camera target converts with. {@link blend} while nothing is installed.
+   * camera target converts with. {@link blend} while nothing is installed or native Equal Earth is.
    */
   get baselineBlend(): number {
     const installed = this.#installed;
-    return installed ? this.#bands[installed.camera.baselineBand]!.blend : this.blend;
+    return installed && !this.#nativeShown() ? this.#bands[installed.camera.baselineBand]!.blend : this.blend;
+  }
+
+  /**
+   * The live style is native Equal Earth's and installed: the map's coordinates are geographic.
+   * Not merely {@link #native}, which turns on when a switch commits, while the old type's style is
+   * still drawn until the native one is set (a wait for the application's `setStyle(url)`, a
+   * rebuild): meanwhile conversions follow the view, as for any re-apply.
+   */
+  #nativeShown(): boolean {
+    return this.#native && this.#installed !== undefined;
   }
 
   /** The offsets the requested camera state carries (`BandCamera.baselineOffsets`); zero while nothing is installed. */
@@ -635,7 +676,7 @@ export class EqualEarthController {
 
   /** A geographic position in the map space of the band shown now. */
   toMapSpace(lngLat: LngLatTuple): LngLatTuple {
-    return this.active ? geographicToMap(lngLat, this.blend) : [lngLat[0], lngLat[1]];
+    return this.active && !this.#nativeShown() ? geographicToMap(lngLat, this.blend) : [lngLat[0], lngLat[1]];
   }
 
   /**
@@ -644,10 +685,11 @@ export class EqualEarthController {
    *
    * With the geographic API on, `project`, `unproject`, `getCenter` and `getBounds` already
    * convert; this and {@link toMapSpace} remain for the map-space values they do not cover,
-   * such as `queryRenderedFeatures` geometry and `getStyle()` contents.
+   * such as `queryRenderedFeatures` geometry and `getStyle()` contents. Both are the identity
+   * under native Equal Earth, where those are geographic already.
    */
   toGeographic(lngLat: LngLatTuple): LngLatTuple {
-    return this.active ? geographicUnder(lngLat, this.blend) : [lngLat[0], lngLat[1]];
+    return this.active && !this.#nativeShown() ? geographicUnder(lngLat, this.blend) : [lngLat[0], lngLat[1]];
   }
 
   /**
@@ -710,6 +752,8 @@ export class EqualEarthController {
       unwrapGeoJSON(installed);
     }
     this.#projection = undefined;
+    this.#native = false;
+    this.#liveNative = false;
     this.#view = undefined;
     this.#appStyle = 'none';
     this.#appRequest = undefined;
@@ -724,7 +768,8 @@ export class EqualEarthController {
   #installGeoApi(): void {
     if (this.#geoApi || this.#options.geographicApi === false) return;
     const read = {
-      active: () => this.active,
+      // Native Equal Earth speaks geographic coordinates itself: nothing to convert.
+      active: () => this.active && !this.#nativeShown(),
       blend: () => this.blend,
       baselineBlend: () => this.baselineBlend,
       bands: () => this.bands,
@@ -779,6 +824,7 @@ export class EqualEarthController {
     const view = this.#detach();
     const original = this.#original;
     this.#projection = undefined;
+    this.#native = false;
     this.#unsubscribe();
     if (original) this.#restoreOriginal(original, this.#readStyle());
     this.#rewritten = undefined;
@@ -861,6 +907,7 @@ export class EqualEarthController {
     }
     this.#original = original;
     this.#projection = type;
+    this.#native = type === 'equal-earth' && this.#options.nativeProjection !== undefined;
     this.#bands = bands;
     this.#transition = transition;
     let applied: boolean;
@@ -981,16 +1028,20 @@ export class EqualEarthController {
       ...(initialBand === undefined ? {} : { initialBand }),
       cartography: this.#cartography(),
       warp: this.#warp,
+      ...(this.#native ? { geographic: true } : {}),
       ...(this.#options.persistentCache === undefined ? {} : { persistentCache: this.#options.persistentCache }),
       ...(this.#options.sourceZoomOffset === undefined ? {} : { sourceZoomOffset: this.#options.sourceZoomOffset }),
     };
   }
 
-  /** {@link rewriteStyle} of `original`, drawn with MapLibre's Mercator (I4). */
+  /**
+   * {@link rewriteStyle} of `original`, drawn with MapLibre's Mercator (I4), or under native Equal
+   * Earth with the registered projection, whose tile grid is the blend-0 map space.
+   */
   #rewrite(original: StyleLike, resolved: ResolvedSources, initialZoom: number, initialBand?: number): RewrittenStyle {
     const rewritten = rewriteStyle(original, this.#rewriteOptions(resolved, initialZoom, initialBand));
     // I4: the warp feeds MapLibre's Mercator renderer; an original globe would bend it.
-    rewritten.style.projection = { type: 'mercator' };
+    rewritten.style.projection = { type: this.#native ? this.#options.nativeProjection! : 'mercator' };
     // R19: a layer only this rewrite has, preferably a cartography layer (`equal-earth:*`, which no
     // application addresses), else a band copy. Every rewrite with something to translate has one:
     // the world polygon whenever there is a background and a band below Mercator (pure Equal Earth
@@ -1013,10 +1064,12 @@ export class EqualEarthController {
       byBand = new Map();
       this.#warped.set(data, byBand);
     }
-    const key = `${blend}/${densifyZoom}`;
+    // Native Equal Earth keeps the copies geographic (MapLibre projects them): another entry.
+    const geographic = this.#native;
+    const key = `${blend}/${densifyZoom}${geographic ? '/geo' : ''}`;
     let warped = byBand.get(key);
     if (!warped) {
-      warped = warpGeoJSON(data, blend, densifyZoom);
+      warped = warpGeoJSON(data, blend, densifyZoom, { geographic });
       byBand.set(key, warped);
     }
     return warped;
@@ -1125,13 +1178,17 @@ export class EqualEarthController {
       ...(transition && mode !== 'none' ? { compensation: { transition, mode } } : {}),
     });
     const installedCamera = camera;
-    const uninstallConstrain = installEqualEarthConstrain(host, {
-      lngLatFactory,
-      bands,
-      baselineBand: () => installedCamera.baselineBand,
-      currentBand: () => installedCamera.shownBand,
-      isActive: () => this.active,
-    });
+    // Native Equal Earth needs no clamp: MapLibre keeps the centre as a geographic `LngLat`, so
+    // it is always on the world, and the band clamp's map-space latitudes would be wrong there.
+    const uninstallConstrain = this.#native
+      ? () => {}
+      : installEqualEarthConstrain(host, {
+          lngLatFactory,
+          bands,
+          baselineBand: () => installedCamera.baselineBand,
+          currentBand: () => installedCamera.shownBand,
+          isActive: () => this.active,
+        });
     switcher.start();
     const installed: Installed = { switcher, camera, uninstallConstrain, geojson: new Map() };
     this.#wrapGeoJSONSources(installed, rewritten.geojsonSources);
@@ -1145,8 +1202,9 @@ export class EqualEarthController {
       host.setRenderWorldCopies(false);
     }
     // C4: one camera update converts the centre into the initial band and settles the first
-    // offsets, since the hook now runs with the baseline the camera was constructed with.
-    const center = geographicToMap(view.geographic, bands[initialBand]!.blend);
+    // offsets, since the hook now runs with the baseline the camera was constructed with. Native
+    // Equal Earth's centre is geographic.
+    const center = this.#native ? view.geographic : geographicToMap(view.geographic, bands[initialBand]!.blend);
     this.#raw.jumpTo({
       center: markMapSpace(lngLatFactory(center[0], center[1])),
       zoom: view.zoom,
@@ -1224,18 +1282,54 @@ export class EqualEarthController {
    * style must not do anyway, and resizes the transform of a map created with a globe style, once.
    */
   #setStyle(style: StyleLike): { loads: number; errors: number } {
+    const name = this.#options.nativeProjection;
+    const toNative = name !== undefined && projectionType(style) === name;
+    // Across the native boundary (spec 2026-11-07 §5) a source the diff keeps unchanged stays
+    // placed in the old projection: read what the live style had, to re-place those after.
+    const before = name !== undefined && toNative !== this.#liveNative ? this.#readStyle() : undefined;
+    if (name !== undefined && this.#liveNative === undefined) {
+      this.#liveNative = before !== undefined && projectionType(before) === name;
+    }
     const loads = { count: 0 };
     const outer = this.#ownLoads;
+    const outerCrossing = this.#crossing;
     this.#ownLoads = loads;
+    this.#crossing = name !== undefined && toNative !== this.#liveNative;
     this.#applying = true;
     let errors: number;
     try {
       errors = this.#countErrors(() => this.#rawStyle.setStyle(style, { diff: true }));
+      if (name !== undefined) this.#afterProjectionChange(name, before);
     } finally {
       this.#applying = false;
       this.#ownLoads = outer;
+      this.#crossing = outerCrossing;
     }
     return { loads: loads.count, errors };
+  }
+
+  /**
+   * After a `setStyle` of ours: record whether the live style is native, and when that changed on
+   * the diff path, place the sources the diff kept unchanged again. MapLibre applies the diff's
+   * `setProjection` before any source operation and reloads every tile manager in the new
+   * projection, so tiled sources (vector, raster, both grids alike) and the sources it added are
+   * right; but a GeoJSON source's index and an image's corners were placed when the source loaded,
+   * in the old projection (the spike's diffed swap left GeoJSON there). `setData` with its own data
+   * and `setCoordinates` with its own corners place them anew. A rebuild (nothing loaded yet)
+   * creates every source afresh.
+   */
+  #afterProjectionChange(name: string, before: StyleLike | undefined): void {
+    const live = this.#readStyle();
+    if (!live) return; // a rebuild: its `style.load` brings a fresh style, re-read on the next of ours
+    const liveNative = projectionType(live) === name;
+    const changed = liveNative !== this.#liveNative;
+    this.#liveNative = liveNative;
+    if (!changed || !before) return;
+    for (const [id, spec] of Object.entries(live.sources)) {
+      const old = before.sources[id];
+      if (old === undefined || JSON.stringify(old) !== JSON.stringify(spec)) continue;
+      replaceSource(this.#host.getSource(id), spec);
+    }
   }
 
   /**
@@ -1335,10 +1429,11 @@ export class EqualEarthController {
     const installed = this.#installed;
     if (!installed) return this.#view!;
     const { camera, switcher } = installed;
-    const blend = camera.blend;
     const center = this.#raw.getCenter();
+    // Native Equal Earth's centre is geographic already (blend 1 is the identity's space).
+    const blend = this.#native ? 1 : camera.blend;
     const view: View = {
-      geographic: geographicUnder([center.lng, center.lat], blend),
+      geographic: this.#native ? [wrapLongitude(center.lng), center.lat] : geographicUnder([center.lng, center.lat], blend),
       zoom: camera.requestedZoom,
       bearing: camera.requestedBearing,
       blend,
@@ -1383,6 +1478,7 @@ export class EqualEarthController {
     this.#settle(error);
     const view = this.#detach();
     this.#projection = undefined;
+    this.#native = false;
     this.#unsubscribe();
     // The same guard as a deactivation's (4c): a live style that is not ours (the application's,
     // diffed over ours before this re-apply failed) only loses our zoom bounds. A style still
@@ -1463,6 +1559,12 @@ export class EqualEarthController {
           loads.count++;
           return host;
         }
+        // A diff of ours into or out of native Equal Earth migrates MapLibre's projection, which
+        // fires `projectiontransition` (into it, with the registered name). The install announces
+        // the type the application set instead (`equal-earth`, or its own on a restore), as for a
+        // banded switch, where MapLibre's projection never changes. Other diffs of ours are as
+        // before.
+        if (loads && this.#crossing && type === 'projectiontransition') return host;
         if (type === 'error' && this.#errorCount) this.#errorCount.count++;
         // A style the application asked for that failed to load (R16 bookkeeping); where MapLibre
         // has `_diffStyleRequest`, a URL's fetch is told by that instead (any `error` may come
@@ -1512,6 +1614,8 @@ export class EqualEarthController {
    */
   #appSetStyle(style: unknown, rest: unknown[]): unknown {
     this.#appStyleCalls++;
+    // Ours is replaced now or once a URL arrives: the next `setStyle` of ours reads the live style.
+    this.#liveNative = undefined;
     if (this.active) this.#appStyle = 'call';
     // Its `style.load` is the application's, even when it sets a style inside one of ours (R21),
     // the deactivation's restore included (R22).
@@ -2388,6 +2492,37 @@ function isSourceError(event: unknown): boolean {
 /** An event's type, as `Evented.fire` takes it: an event object or a type string. */
 function eventType(event: unknown): unknown {
   return typeof event === 'string' ? event : (event as { type?: unknown } | null)?.type;
+}
+
+/** The `projection.type` a style names, if a plain name. */
+function projectionType(style: StyleLike): unknown {
+  const projection = style['projection'];
+  return typeof projection === 'object' && projection !== null ? (projection as { type?: unknown }).type : undefined;
+}
+
+/** The parts of a MapLibre source a re-placement calls (GeoJSON, image, video, canvas; both majors). */
+interface PlacedSourceLike {
+  setData?(data: unknown): unknown;
+  serialize?(): unknown;
+  setCoordinates?(coordinates: unknown): unknown;
+}
+
+const CORNER_SOURCES: ReadonlySet<unknown> = new Set(['image', 'video', 'canvas']);
+
+/**
+ * Place a source again in the map's current projection: a GeoJSON source's index and an image,
+ * video or canvas source's corners are computed when it loads (spec 2026-11-07 §5).
+ */
+function replaceSource(source: unknown, spec: Record<string, unknown>): void {
+  if (typeof source !== 'object' || source === null) return;
+  const placed = source as PlacedSourceLike;
+  if (spec['type'] === 'geojson' && typeof placed.setData === 'function') {
+    const serialized = typeof placed.serialize === 'function' ? (placed.serialize() as { data?: unknown } | undefined) : undefined;
+    const data = serialized?.data ?? spec['data'];
+    if (data !== undefined) placed.setData(data);
+  } else if (CORNER_SOURCES.has(spec['type']) && typeof placed.setCoordinates === 'function' && Array.isArray(spec['coordinates'])) {
+    placed.setCoordinates(structuredClone(spec['coordinates']));
+  }
 }
 
 function unwrapGeoJSON(installed: Installed): void {
