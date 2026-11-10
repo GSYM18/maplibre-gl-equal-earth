@@ -245,6 +245,11 @@ popups in lng/lat needs no plugin when every layer is GeoJSON.
   - the plugin could take a `tiles` option that points the CRS at such a tileset and skips the
     protocol.
 - For GeoJSON-only thematic maps, the example pattern needs no plugin at all.
+- **User ruling (2026-11-10): producing tiles on the SmartMaps side is out of scope.** The
+  server-side step above is therefore not pursued; the client-side warp stays. (Prior art for it
+  exists: bbox-services' equal.bbox.earth serves EPSG:8857 tiles on the same ±17,243,959 m square
+  grid at z0–z2 with the old 0.2 plugin's single z3 switch; its site repository has no licence,
+  so nothing from it may be copied.)
 
 **(ii) Adaptive Equal Earth → Mercator.**
 - *Evidence:* no stock route exists (§2, §3).
@@ -297,8 +302,7 @@ popups in lng/lat needs no plugin when every layer is GeoJSON.
 - When will NLnet decide on #491, and what will MapTiler's PR look like?
 - Will a live-map projection switch to or from a registered CRS become supported, or break the
   plugin's `diff:false` swap?
-- Is server-side warping viable at SmartMaps (cost, cache keys, tile sizes)? It has not been
-  measured.
+- ~~Is server-side warping viable at SmartMaps?~~ Out of scope (user, 2026-11-10).
 - How do native mode and bands compare on frame time and first paint on real hardware? Not
   measured here.
 
