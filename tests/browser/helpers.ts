@@ -13,11 +13,10 @@ import type { Map as MapLibreMap, StyleSpecification } from 'maplibre-gl';
 import type { CompensationMode, EqualEarthController, EqualEarthInstall } from '../../src/index.ts';
 
 /**
- * The MapLibre a project runs against: 5.24 and 6.6 from `node_modules`, or `'6.16'` from unpkg
- * (the npm registry here refuses releases after 2026-08-31; spec 2026-11-07 N-R4), the first with
- * `addProjection` for native Equal Earth.
+ * The MapLibre a project runs against: 6.6 from `node_modules`, or `'6.16'` from unpkg (spec
+ * 2026-11-07 N-R4), the first with `addProjection` for native Equal Earth.
  */
-export type MapLibreMajor = 5 | 6 | '6.16';
+export type MapLibreMajor = 6 | '6.16';
 
 /** The projection the harness sets once the map has loaded. */
 export type HarnessProjection = 'mercator' | 'globe' | 'equal' | 'equal-earth';

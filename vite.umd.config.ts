@@ -9,7 +9,7 @@
  * unlike Rollup, does not polyfill `import.meta.url` in UMD output: it becomes `{}.url`, and
  * the default worker URL would not resolve. So here it is defined as the URL of the script
  * that loaded the bundle, captured in the intro while the script runs (`document.currentScript`
- * is null once it has finished), so the worker bundles are found next to the UMD file, on a CDN
+ * is null once it has finished), so the worker bundle is found next to the UMD file, on a CDN
  * too. `scripts/check-exports.mjs` checks the global's exports and that worker URL.
  *
  * It is `.js`, not `.umd.cjs`, so CDNs serve it as JavaScript; package.json therefore gives it

@@ -10,12 +10,12 @@
       after `npm run build:js` has written dist/.
 
       MapLibre comes from unpkg, the plugin from the local dist/maplibre-gl-equal-earth.umd.min.js,
-      which defines the `maplibreglEqualEarth` global. Its worker bundles are found next to it
-      (dist/worker.iife.js for v5, dist/worker.mjs for v6); the readout says which path warps.
+      which defines the `maplibreglEqualEarth` global. Its worker bundle,
+      dist/worker.mjs, is found next to it; the readout says which path warps. MapLibre 6.6
+      ships no classic-script build, so it is `import()`ed, then handed to the global. (MapLibre 5
+      is no longer supported: 5.24.0 carries GHSA-jrc7-96c5-q579.)
 
       URL parameters:
-      - `?mlv=5|6` (default 5): MapLibre 5.24 from its classic script, or MapLibre 6.6, which
-        ships no classic-script build and is `import()`ed, then handed to the same global.
       - `?style=<url>`: any EPSG:3857 vector style (default OpenFreeMap Liberty).
       - `?projection=equal|equal-earth|mercator` (default `equal`).
     -->
@@ -87,7 +87,6 @@
     <script>
       (async () => {
         const params = new URLSearchParams(location.search);
-        const mlv = params.get('mlv') === '6' ? 6 : 5;
         const style = params.get('style') || 'https://tiles.openfreemap.org/styles/liberty';
         const projection = params.get('projection') || 'equal';
         const readout = document.getElementById('readout');
@@ -106,13 +105,11 @@
             document.head.append(element);
           });
 
-        /** MapLibre 5 defines the `maplibregl` global; MapLibre 6 is an ES module only. */
+        /** MapLibre 6 is an ES module only. */
         async function loadMapLibre() {
-          const base = mlv === 6 ? 'https://unpkg.com/maplibre-gl@6.6.0/dist/' : 'https://unpkg.com/maplibre-gl@5.24.0/dist/';
+          const base = 'https://unpkg.com/maplibre-gl@6.6.0/dist/';
           await load(Object.assign(document.createElement('link'), { rel: 'stylesheet', href: `${base}maplibre-gl.css` }));
-          if (mlv === 6) return import(`${base}maplibre-gl.mjs`);
-          await load(Object.assign(document.createElement('script'), { src: `${base}maplibre-gl.js` }));
-          return window.maplibregl;
+          return import(`${base}maplibre-gl.mjs`);
         }
 
         if (typeof maplibreglEqualEarth === 'undefined') return; // the script tag's onerror said why
@@ -148,7 +145,7 @@
         const render = () => {
           const center = map.getCenter();
           readout.textContent = [
-            `maplibre-gl ${maplibregl.getVersion()} (${mlv === 6 ? 'ES module' : 'classic script'})`,
+            `maplibre-gl ${maplibregl.getVersion()}`,
             `plugin: global maplibreglEqualEarth from ${new URL('../dist/maplibre-gl-equal-earth.umd.min.js', location.href).pathname}`,
             `tiles warped on: ${eqe.workerPath}`,
             `projection ${map.getProjection()?.type ?? '…'}; zoom ${map.getZoom().toFixed(2)}; centre ${fixed(center.lng)}, ${fixed(center.lat)}`,

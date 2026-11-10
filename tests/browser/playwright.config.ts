@@ -1,8 +1,8 @@
 /**
- * The browser matrix: every spec runs against MapLibre 6 (`v6`) and 5.24 (`v5`) in headless
- * Chromium, rendering through SwiftShader. `native.spec.ts` runs only against MapLibre 6.16 from
- * unpkg (`v6-native`, needs the network), the first line with `addProjection`. `npm run build` must have run first: the harness loads
- * the worker bundles from `/dist/`.
+ * The browser matrix: every spec runs against MapLibre 6.6 (`v6`) in headless Chromium,
+ * rendering through SwiftShader. `native.spec.ts` runs only against MapLibre 6.16 from unpkg
+ * (`v6-native`, needs the network), the first line with `addProjection`. `npm run build` must
+ * have run first: the harness loads the worker bundle from `/dist/`.
  */
 import { fileURLToPath } from 'node:url';
 import { defineConfig } from '@playwright/test';
@@ -31,7 +31,6 @@ export default defineConfig<{ mlv: MapLibreMajor }>({
   },
   projects: [
     { name: 'v6', use: { mlv: 6 }, testIgnore: 'native.spec.ts' },
-    { name: 'v5', use: { mlv: 5 }, testIgnore: 'native.spec.ts' },
     { name: 'v6-native', use: { mlv: '6.16' }, testMatch: 'native.spec.ts' },
   ],
 });

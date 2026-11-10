@@ -1,16 +1,14 @@
 /**
- * Builds the worker-side protocol registration as two **self-contained** bundles.
+ * Builds the worker-side protocol registration as one **self-contained** bundle, `worker.mjs`.
  *
- * `importScriptInWorkers` loads a script by URL into MapLibre's worker pool, and the two
- * supported majors load it differently:
+ * `importScriptInWorkers` loads a script by URL into MapLibre's worker pool. MapLibre 6
+ * `import()`s a `.mjs` URL directly; for any other extension it fetches the source, sniffs for
+ * ESM and imports it through a `blob:` URL, where a relative specifier such as
+ * `./protocol-abc.js` cannot resolve.
  *
- * - v5 calls classic `importScripts(url)`, so any top-level `import`/`export` is a SyntaxError.
- * - v6 `import()`s a `.mjs` URL directly. For any other extension it fetches the source,
- *   sniffs for ESM and imports it through a `blob:` URL — where a relative specifier such
- *   as `./protocol-abc.js` cannot resolve.
- *
- * So neither bundle may import anything, which rules out building the worker as a second
- * entry of the library build. `scripts/check-worker-bundles.mjs` guards both outputs.
+ * So the bundle may import nothing, which rules out building the worker as a second entry of
+ * the library build. `scripts/check-worker-bundles.mjs` guards the output. (The classic-script
+ * `worker.iife.js` for MapLibre 5's `importScripts` went with MapLibre 5 support.)
  */
 
 import { fileURLToPath } from 'node:url';
@@ -30,10 +28,8 @@ export default defineConfig({
     emptyOutDir: false,
     lib: {
       entry: resolveFromRoot('src/tiles/worker-entry.ts'),
-      formats: ['es', 'iife'],
-      // Required by the IIFE format. The entry exports nothing, so the global stays empty.
-      name: 'EqualEarthWorker',
-      fileName: (format) => (format === 'es' ? 'worker.mjs' : 'worker.iife.js'),
+      formats: ['es'],
+      fileName: () => 'worker.mjs',
     },
   },
 });

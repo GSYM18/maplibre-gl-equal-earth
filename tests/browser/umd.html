@@ -16,9 +16,9 @@
     </style>
     <!--
       The built UMD bundle as a page without a bundler loads it: a classic script defining the
-      `maplibreglEqualEarth` global, with no `workerUrl`, so the worker bundles must be found next
-      to this script (vite.umd.config.ts). `?mlv=5|6` (default 6). v5 is MapLibre's own classic
-      script; v6 ships no global build, so it comes from `import()` and is handed to the global.
+      `maplibreglEqualEarth` global, with no `workerUrl`, so the worker bundle must be found next
+      to this script (vite.umd.config.ts). MapLibre 6 ships no global build, so it comes from
+      `import()` and is handed to the global.
       Exposes `window.__umd` for umd.spec.ts, and the part of `window.__h` that helpers.ts's
       geographic conversions read.
     -->
@@ -27,7 +27,6 @@
   <body>
     <div id="map"></div>
     <script type="module">
-      const mlv = new URLSearchParams(location.search).get('mlv') === '5' ? 5 : 6;
       const state = { errors: [], workerUrls: [] };
       window.__umd = state;
 
@@ -40,13 +39,8 @@
       const css = (href) => load(Object.assign(document.createElement('link'), { rel: 'stylesheet', href }));
 
       async function loadMapLibre() {
-        if (mlv === 6) {
-          await css('/node_modules/maplibre-gl/dist/maplibre-gl.css');
-          return import('maplibre-gl');
-        }
-        await css('/node_modules/maplibre-gl-v5/dist/maplibre-gl.css');
-        await load(Object.assign(document.createElement('script'), { src: '/node_modules/maplibre-gl-v5/dist/maplibre-gl.js' }));
-        return window.maplibregl;
+        await css('/node_modules/maplibre-gl/dist/maplibre-gl.css');
+        return import('maplibre-gl');
       }
 
       async function start() {

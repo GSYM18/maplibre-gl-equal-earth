@@ -27,7 +27,6 @@
   "homepage": "https://github.com/GSYM18/maplibre-gl-equal-earth#readme",
   "sideEffects": [
     "./dist/worker.mjs",
-    "./dist/worker.iife.js",
     "./dist/maplibre-gl-equal-earth.umd.min.js"
   ],
   "types": "./dist/index.d.ts",
@@ -44,7 +43,6 @@
       "import": "./dist/worker.mjs",
       "default": "./dist/worker.mjs"
     },
-    "./worker.iife.js": "./dist/worker.iife.js",
     "./umd": "./dist/maplibre-gl-equal-earth.umd.min.js",
     "./package.json": "./package.json"
   },
@@ -75,7 +73,7 @@
     "prepublishOnly": "npm run verify"
   },
   "peerDependencies": {
-    "maplibre-gl": ">=5.24 <7"
+    "maplibre-gl": ">=6.6 <7"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -87,7 +85,6 @@
     "globals": "^17.11.0",
     "magic-string": "^0.30.21",
     "maplibre-gl": "^6.6.0",
-    "maplibre-gl-v5": "npm:maplibre-gl@^5.24.0",
     "typescript": "^5.9.0",
     "typescript-eslint": "^8.68.0",
     "vite": "^8.3.5",

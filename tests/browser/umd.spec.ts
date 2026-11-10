@@ -19,8 +19,8 @@ declare global {
   }
 }
 
-test('the UMD bundle installs from a script tag and warps in the worker next to it', async ({ page, mlv }) => {
-  await page.goto(`/tests/browser/umd.html?mlv=${mlv}`);
+test('the UMD bundle installs from a script tag and warps in the worker next to it', async ({ page }) => {
+  await page.goto('/tests/browser/umd.html');
   await page.waitForFunction(() => window.__umd !== undefined);
   await page.evaluate(() => window.__umd.ready);
 
@@ -31,8 +31,7 @@ test('the UMD bundle installs from a script tag and warps in the worker next to 
     active: window.__umd.controller?.active,
   }));
   expect(state.errors).toEqual([]);
-  const worker = mlv === 6 ? 'worker.mjs' : 'worker.iife.js';
-  expect(state.workerUrls).toEqual([`http://localhost:5179/dist/${worker}`]);
+  expect(state.workerUrls).toEqual(['http://localhost:5179/dist/worker.mjs']);
   expect(state.workerPath).toBe('worker');
   expect(state.active).toBe(true);
   // Inside fixture land box 1, through the geographic API the global installed.

@@ -116,13 +116,13 @@ async function umdExports() {
 /**
  * Rolldown leaves `import.meta.url` as `{}.url` in UMD output, so vite.umd.config.ts supplies
  * the loading script's URL. Checks the default worker URL `installEqualEarth` hands MapLibre
- * sits next to that script for each major. The fake stops the install right after: the worker
+ * sits next to that script. The fake stops the install right after: the worker
  * script "fails", and the main-thread fallback's `addProtocol` throws.
  */
 async function umdWorkerUrlsResolve(global, scriptDir) {
   const stop = new Error('check-exports: stop');
   let ok = true;
-  for (const [version, file] of [['5.24.0', 'worker.iife.js'], ['6.6.0', 'worker.mjs']]) {
+  for (const [version, file] of [['6.6.0', 'worker.mjs']]) {
     const requested = [];
     const fake = {
       Map: class {},

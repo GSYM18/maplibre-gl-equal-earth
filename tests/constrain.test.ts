@@ -284,7 +284,7 @@ describe('installEqualEarthConstrain', () => {
     warn.mockRestore();
   });
 
-  it('rejects a map without setTransformConstrain (maplibre-gl < 5.24)', () => {
+  it('rejects a map without setTransformConstrain', () => {
     expect(() => installEqualEarthConstrain({} as never, { lngLatFactory })).toThrow(TypeError);
   });
 });

@@ -1,14 +1,16 @@
 # @yellowmap/maplibre-gl-equal-earth
 
 Equal Earth projection support for [MapLibre GL JS](https://maplibre.org/maplibre-gl-js/docs/)
-v6, and v5 from 5.24.
+v6, from 6.6. MapLibre 5 is no longer supported: its last release, 5.24.0, is affected by
+[GHSA-jrc7-96c5-q579](https://github.com/advisories/GHSA-jrc7-96c5-q579) (attribution XSS,
+fixed only in 6.4.1).
 
 The [Equal Earth projection](https://equal-earth.com/) (Šavrič, Patterson & Jenny, 2018) is an
 equal-area pseudocylindrical projection — countries appear at their true relative size, unlike
 Web Mercator, while still looking like a world map rather than a sinusoid.
 
 > **Status: `1.0.0-alpha.1`.** `installEqualEarth` and `map.setProjection({ type: 'equal' })`
-> work end to end on MapLibre 5.24 and 6.6: the style rewrite, the `eqearth://` tile pipeline
+> work end to end on MapLibre 6.6: the style rewrite, the `eqearth://` tile pipeline
 > in the worker pool, the camera, the [adaptive transition](#adaptive-transition), the
 > [cartographic finish](#cartography), the [projection control](#the-projection-control), a
 > [geographic API](#data-in-geo-out) over the map-space one, [GeoJSON](#geojson) and
@@ -24,33 +26,31 @@ npm install @yellowmap/maplibre-gl-equal-earth maplibre-gl
 
 ESM (`dist/index.js`) for bundlers and `<script type="module">`, and UMD
 (`dist/maplibre-gl-equal-earth.umd.min.js`) for a classic `<script>` tag. The peer range is
-`maplibre-gl >=5.24 <7`. The demo runs on v6; the browser test suite runs every scenario on
-MapLibre 5.24 and 6.6, and native Equal Earth on 6.16.
+`maplibre-gl >=6.6 <7`. The browser test suite runs every scenario on MapLibre 6.6, and native
+Equal Earth on 6.16.
 
 ### Without a bundler
 
-Load MapLibre first, then the UMD file, which defines the global `maplibreglEqualEarth`:
+The UMD file defines the global `maplibreglEqualEarth`. MapLibre 6 ships no classic-script
+build, so load it as a module and hand it to that global:
 
 ```html
-<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css" />
-<script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@6.6.0/dist/maplibre-gl.css" />
 <script src="https://unpkg.com/@yellowmap/maplibre-gl-equal-earth@1.0.0-alpha.1/dist/maplibre-gl-equal-earth.umd.min.js"></script>
-<script>
-  maplibreglEqualEarth.installEqualEarth(maplibregl).then(() => {
-    const map = new maplibregl.Map({ container: 'map', style: '…', center: [10, 20], zoom: 1.3 });
-    map.setProjection({ type: 'equal' });
-    map.addControl(new maplibreglEqualEarth.EqualEarthControl());
-  });
+<script type="module">
+  const maplibregl = await import('https://unpkg.com/maplibre-gl@6.6.0/dist/maplibre-gl.mjs');
+  await maplibreglEqualEarth.installEqualEarth(maplibregl);
+  const map = new maplibregl.Map({ container: 'map', style: '…', center: [10, 20], zoom: 1.3 });
+  map.setProjection({ type: 'equal' });
+  map.addControl(new maplibreglEqualEarth.EqualEarthControl());
 </script>
 ```
 
-The worker bundles are loaded from next to the script (`dist/worker.iife.js` for v5,
-`dist/worker.mjs` for v6), so self-hosting means copying all of `dist/`. Give the script's full
-`dist/…` URL: a bare package URL such as `https://unpkg.com/@yellowmap/maplibre-gl-equal-earth`
-has no `dist/` to resolve the workers against, and the tiles would be warped on the main thread.
-MapLibre 6 ships no classic-script build: load it as a module and hand it to the same global
-(`installEqualEarth(await import('https://unpkg.com/maplibre-gl@6.6.0/dist/maplibre-gl.mjs'))`),
-or import this package's ESM file the same way.
+The worker bundle, `dist/worker.mjs`, is loaded from next to the script, so self-hosting means
+copying all of `dist/`. Give the script's full `dist/…` URL: a bare package URL such as
+`https://unpkg.com/@yellowmap/maplibre-gl-equal-earth` has no `dist/` to resolve the worker
+against, and the tiles would be warped on the main thread. Importing this package's ESM file
+the same way works too.
 
 ## How it works, and what that costs you
 
@@ -150,7 +150,7 @@ first install, its options included; call `uninstall()` first to change them.
 `installEqualEarth` loads its worker bundle from `new URL('./worker.mjs', import.meta.url)`,
 which bundlers (Vite, webpack, Rollup, Parcel) emit as an asset. A plain dev server that serves
 the library from source may have no file there: pass `workerUrl`, pointing at the built
-`dist/worker.mjs` (v6) or `dist/worker.iife.js` (v5). Without the worker bundle the tiles are
+`dist/worker.mjs`. Without the worker bundle the tiles are
 warped on the main thread, 100–450 ms per tile; `eqe.workerPath` says which path is in use.
 A worker bundle that has not loaded after `workerTimeoutMs` (default 10 000; `Infinity` waits
 without a bound) gets the same fallback, so a stalled CDN cannot hold up your first map.
@@ -426,7 +426,8 @@ const camera = new BandCamera(map, {
 });
 ```
 
-Both cameras work on MapLibre v5 and v6: v6 moved the hook behind `setTransformCameraUpdate()`.
+Both cameras use MapLibre 6's `setTransformCameraUpdate()`; a plain `transformCameraUpdate`
+property (MapLibre 5's shape, and test doubles') is still accepted.
 
 ### Keeping the world in view
 
@@ -708,10 +709,10 @@ npm run verify   # lint, typecheck, unit tests, build, export guards, browser te
 ```
 
 `npm test` runs the unit tests (vitest, no browser). `npm run test:browser` runs the Playwright
-suite in headless Chromium with software WebGL, each spec against MapLibre 6.6 and 5.24 (a few
-are v6 only), on fixture tiles generated in memory: no network. It takes about six and a half
+suite in headless Chromium with software WebGL, each spec against MapLibre 6.6 (and the native
+ones against 6.16 from unpkg), on fixture tiles generated in memory. It takes about six and a half
 minutes and needs a fresh build (`verify` builds first). `npm run build:js` refreshes only the
-bundles (ESM, UMD and the two workers) the demo and the browser tests load.
+bundles (ESM, UMD and the worker) the demo and the browser tests load.
 
 ## Roadmap
 

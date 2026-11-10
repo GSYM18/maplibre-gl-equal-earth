@@ -16,7 +16,7 @@ const resolveFromRoot = (path: string) => fileURLToPath(new URL(path, import.met
  * `scripts/check-worker-bundles.mjs` asserts that pattern (Ruling P15).
  */
 function stripWorkerUrlHint(): Plugin {
-  const pattern = /new URL\(\s*\/\* @vite-ignore \*\/\s*("\.\/worker\.(?:mjs|iife\.js)"),\s*import\.meta\.url\s*\)/g;
+  const pattern = /new URL\(\s*\/\* @vite-ignore \*\/\s*("\.\/worker\.mjs"),\s*import\.meta\.url\s*\)/g;
   return {
     name: 'equal-earth:strip-worker-url-hint',
     renderChunk(code) {

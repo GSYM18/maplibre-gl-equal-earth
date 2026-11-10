@@ -181,7 +181,7 @@ export function installEqualEarthConstrain(
   if (!host || typeof host.setTransformConstrain !== 'function') {
     throw new TypeError(
       'installEqualEarthConstrain requires a map exposing setTransformConstrain() ' +
-        '(maplibre-gl >= 5.24).',
+        '(maplibre-gl >= 6.6).',
     );
   }
   let warned = false;

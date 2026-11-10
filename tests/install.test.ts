@@ -49,18 +49,16 @@ describe('parseVersion', () => {
 });
 
 describe('installEqualEarth', () => {
-  it('rejects MapLibre older than 5.24', async () => {
-    await expect(installEqualEarth(fakeModule('5.23.1').module)).rejects.toThrow(/>= 5\.24.*5\.23\.1/);
-    await expect(installEqualEarth(fakeModule('4.7.0').module)).rejects.toThrow(/>= 5\.24/);
+  it('rejects MapLibre older than 6.6, MapLibre 5 included', async () => {
+    await expect(installEqualEarth(fakeModule('6.5.1').module)).rejects.toThrow(/>= 6\.6.*6\.5\.1/);
+    await expect(installEqualEarth(fakeModule('5.24.0').module)).rejects.toThrow(/>= 6\.6.*5\.24\.0/);
+    await expect(installEqualEarth(fakeModule('4.7.0').module)).rejects.toThrow(/>= 6\.6/);
   });
 
-  it('loads the ESM worker on v6 and the classic one on v5', async () => {
+  it('loads the ESM worker', async () => {
     const v6 = fakeModule('6.6.0');
     await installEqualEarth(v6.module);
     expect(String(v6.module.importScriptInWorkers.mock.calls[0]![0])).toMatch(/worker\.mjs$/);
-    const v5 = fakeModule('5.24.0');
-    await installEqualEarth(v5.module);
-    expect(String(v5.module.importScriptInWorkers.mock.calls[0]![0])).toMatch(/worker\.iife\.js$/);
   });
 
   it("raises the worker count from MapLibre's default of 1, but respects an app's own setting", async () => {
@@ -334,8 +332,8 @@ describe('installEqualEarth', () => {
     // eslint-disable-next-line @typescript-eslint/unbound-method -- compared by identity
     expect(FakeMap.prototype.setProjection).toBe(original);
     // A failed install leaves nothing behind.
-    const old = fakeModule('5.0.0');
-    await expect(installEqualEarth(old.module)).rejects.toThrow(/>= 5\.24/);
+    const old = fakeModule('5.24.0');
+    await expect(installEqualEarth(old.module)).rejects.toThrow(/>= 6\.6/);
     old.module.getVersion = () => '6.6.0';
     await expect(installEqualEarth(old.module)).resolves.toMatchObject({ version: '6.6.0' });
   });

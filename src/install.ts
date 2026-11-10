@@ -9,7 +9,8 @@
  * the workers of the shared pool.
  *
  * The module is passed in rather than imported, so this file has no runtime dependency on
- * `maplibre-gl` and works with whichever major (5.24+ or 6) the application loaded.
+ * `maplibre-gl` and works with the MapLibre 6.6+ the application loaded. MapLibre 5 is not supported: its last
+ * release, 5.24.0, carries GHSA-jrc7-96c5-q579 (fixed only in 6.4.1).
  */
 
 import {
@@ -42,9 +43,8 @@ export interface MapLibreModule {
 
 export interface InstallOptions {
   /**
-   * URL of the worker bundle. Defaults to `worker.mjs` (v6, loaded with `import()`) or
-   * `worker.iife.js` (v5, `importScripts`) next to this module; pass it when a bundler moves
-   * the files apart.
+   * URL of the worker bundle. Defaults to `worker.mjs` next to this module (MapLibre loads it
+   * with `import()`); pass it when a bundler moves the files apart.
    */
   workerUrl?: string | URL;
   /**
@@ -185,23 +185,19 @@ async function install(
 ): Promise<EqualEarthInstall> {
   const version = maplibregl.getVersion();
   const { major, minor } = parseVersion(version);
-  if (major < 5 || (major === 5 && minor < 24)) {
-    throw new Error(`Equal Earth needs maplibre-gl >= 5.24; found ${version}.`);
+  if (major < 6 || (major === 6 && minor < 6)) {
+    throw new Error(`Equal Earth needs maplibre-gl >= 6.6; found ${version}.`);
   }
 
   if (options.workers !== false && maplibregl.getWorkerCount() === 1) {
     maplibregl.setWorkerCount(options.workers ?? defaultWorkerCount());
   }
 
-  // v6 loads worker scripts with `import()`, v5 with `importScripts`: each needs its own bundle.
-  // Literal `new URL(…, import.meta.url)` in each branch, so the application's bundler emits
-  // the files (P15). `@vite-ignore` only stops *our* library build from rewriting the second
-  // argument (the files do not exist yet when it runs); `check-worker-bundles.mjs` guards it.
-  const workerUrl =
-    options.workerUrl ??
-    (major >= 6
-      ? new URL(/* @vite-ignore */ './worker.mjs', import.meta.url)
-      : new URL(/* @vite-ignore */ './worker.iife.js', import.meta.url));
+  // MapLibre 6 loads worker scripts with `import()`. A literal `new URL(…, import.meta.url)`, so
+  // the application's bundler emits the file (P15). `@vite-ignore` only stops *our* library
+  // build from rewriting the second argument (the file does not exist yet when it runs);
+  // `check-worker-bundles.mjs` guards it.
+  const workerUrl = options.workerUrl ?? new URL(/* @vite-ignore */ './worker.mjs', import.meta.url);
   let workerPath: EqualEarthInstall['workerPath'] = 'worker';
   try {
     await withTimeout(

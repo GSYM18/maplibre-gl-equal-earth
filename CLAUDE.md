@@ -13,7 +13,7 @@ npm run build:js   # bundles only (ESM, UMD, both workers), no .d.ts: refreshes 
 npm run probe:transition  # headless-Chrome probe of demo/transition.html; not part of verify
 npm run probe:first-paint # the same page's cold/warm first paint at 50 Mbit/s; not part of verify
 npm test           # vitest run
-npm run test:browser  # Playwright on MapLibre 6.6 and 5.24 (+ 6.16 native), SwiftShader; ~7 min; needs a fresh build
+npm run test:browser  # Playwright on MapLibre 6.6 (+ 6.16 native), SwiftShader; ~7 min; needs a fresh build
 npm run test:watch # vitest watch mode
 npm run lint       # eslint (type-aware, .ts only)
 npm run typecheck  # tsc --noEmit over src, tests, demo
@@ -24,13 +24,13 @@ Single test file: `npx vitest run tests/camera.test.ts`.
 Single test by name: `npx vitest run tests/camera.test.ts -t "crossing upward"`.
 Single browser spec: `npx playwright test --config tests/browser/playwright.config.ts baseline.spec.ts --project v6`.
 
-`npm run test:browser` (`tests/browser/`) runs every `*.spec.ts` against both majors (projects
-`v6` and `v5`) in headless Chromium through SwiftShader, except `native.spec.ts`, which runs only
+`npm run test:browser` (`tests/browser/`) runs every `*.spec.ts` against MapLibre 6.6 (project
+`v6`) in headless Chromium through SwiftShader, except `native.spec.ts`, which runs only
 in `v6-native`: MapLibre 6.16.0 imported from unpkg (`mlv=6.16`), the one network dependency of
-the suite, since npm cannot install it here (Ruling N-R4). A spec's first run after a source edit
+the suite (Ruling N-R4). A spec's first run after a source edit
 can die with "Execution context was destroyed": Vite reloading the page; rerun it. Its config starts its own Vite server on
 port 5179 (`tests/browser/vite.config.ts`, not the demo's 5173) serving the harness page, `src/`
-through Vite, the worker bundles from `/dist/` (hence the build first; `verify` orders it) and
+through Vite, the worker bundle from `/dist/` (hence the build first; `verify` orders it) and
 offline fixture tiles generated in memory (`fixture-tiles.ts`, `Cache-Control: no-store`). Specs
 convert geographic positions only through the helpers in `tests/browser/helpers.ts`. The
 Chromium revision must match the pinned `@playwright/test` (1.62.1 → `chromium_headless_shell-1234`
@@ -41,10 +41,10 @@ emits declarations separately. `npm run check:exports` runs two guards over the 
 `scripts/check-exports.mjs` diffs both built bundles' runtime exports (the ESM module, and the
 UMD's `maplibreglEqualEarth` global evaluated as a classic script in a `vm` sandbox) against the
 value exports declared in `src/index.ts` (it exists to make the 0.2.1 drift bug impossible to
-reintroduce), and checks the UMD's default worker URLs resolve next to the loading script.
-`scripts/check-worker-bundles.mjs` asserts both worker bundles are self-contained and actually
-register `eqearth` when loaded the way MapLibre v5 (`importScripts`) and v6
-(`import()`) load them. `prepublishOnly` runs both.
+reintroduce), and checks the UMD's default worker URL resolves next to the loading script.
+`scripts/check-worker-bundles.mjs` asserts the worker bundle is self-contained and actually
+registers `eqearth` when loaded the way MapLibre 6 loads it (`import()`), and that no stale
+`worker.iife.js` is left in `dist/`. `prepublishOnly` runs both.
 
 `npm run probe:transition` (`scripts/probe-transition.mjs`; flags `--city`, `--steps`,
 `--anchor dx,dy`, `--url`, `--chrome`, `--port`, `--timeout`) needs Node ≥ 22 (global
@@ -79,7 +79,7 @@ which is why `scripts/*.mjs` needs an explicit `globals.node` block.
 
 ## What this package is
 
-Equal Earth projection support for MapLibre GL JS v6, and v5 from 5.24, published as
+Equal Earth projection support for MapLibre GL JS v6 from 6.6, published as
 `@yellowmap/maplibre-gl-equal-earth`. It is a rewrite of, and a hard fork from,
 [pka/maplibre-gl-equal-earth](https://github.com/pka/maplibre-gl-equal-earth) (the old `lib/`,
 proj4, and the `0.2.x` line are gone). ESM (`dist/index.js`) plus a UMD file for classic
@@ -93,10 +93,13 @@ check a hand-picked version's publish date before pinning it. The earlier proxy 
 is gone; those versions have not been revisited since. `minimatch` is forced to 11.x through
 `overrides` (CVE GHSA-g3hv-75wg-m249, fixed only in 11.0.1) although eslint and
 typescript-eslint declare `^10`: they only call `new Minimatch(p, opts).match()` and
-`minimatch()`, which 11 kept; drop the override once they move to 11. `npm audit` keeps one
-critical finding by design: `maplibre-gl-v5` (5.24.0, the newest 5.x) is in GHSA-jrc7-96c5-q579's
-range (≤ 6.4.0, attribution XSS) and has no patched 5.x; it is a test-only alias for the v5
-browser matrix and never shipped.
+`minimatch()`, which 11 kept; drop the override once they move to 11. **MapLibre 5 support was
+dropped** (2026-11-10): its last release, 5.24.0, is in GHSA-jrc7-96c5-q579's range (≤ 6.4.0,
+attribution XSS) with no patched 5.x, and SmartMaps GL no longer needs v5. The install rejects
+< 6.6, the peer range is `>=6.6 <7`, and `worker.iife.js` (v5's `importScripts` bundle) is gone.
+The structural fallbacks for a v5-shaped host (a plain `transformCameraUpdate` property, the
+Map as `moveend` source, `map.transform`) remain in `camera`/`constrain`/`geo-api`: the unit
+fakes use that shape. The v5 notes below are history and explain those paths.
 
 ## The central constraint
 
@@ -153,8 +156,8 @@ affects the absolute metre values from `toEqualEarth`.
   Šavrič/Patterson/Jenny. Deliberately **not** proj4: it runs per-vertex per tile in a worker,
   and `proj4.defs` mutates a shared singleton that a host app may also be using. Dropping it
   took the projection maths from ~128 kB (proj4) to 3.4 kB. Measured after the Plan 3 fix wave
-  (Vite's report): `dist/index.js` 142.7 kB (39.8 kB gzip), `dist/worker.mjs` 62.3 kB (16.2 kB),
-  `dist/worker.iife.js` 46.4 kB (14.1 kB). Most of the main entry is the tile pipeline (decode,
+  (Vite's report): `dist/index.js` 142.7 kB (39.8 kB gzip), `dist/worker.mjs` 62.3 kB
+  (16.2 kB). Most of the main entry is the tile pipeline (decode,
   densify, warp, clip, encode), which `index.ts` exports and `install.ts` needs for the
   main-thread fallback; a dynamic `import()` in that fallback alone would not shrink it while the
   entry re-exports the pipeline.
@@ -237,10 +240,9 @@ affects the absolute metre values from `toEqualEarth`.
   Liang–Barsky segments). Replaced geojson-vt, which is now a devDependency kept only as the
   reference in `tests/clip.test.ts`.
 - `src/tiles/protocol.ts` — the `eqearth://` handler and its URL codec.
-- `src/tiles/worker-entry.ts` — built twice by `vite.worker.config.ts`, as `dist/worker.mjs`
-  (v6, dynamic `import()`) and `dist/worker.iife.js` (v5, classic `importScripts`). Both must be
-  self-contained: v5 cannot parse `import`, and v6 imports non-`.mjs` scripts via a `blob:` URL
-  where relative specifiers cannot resolve.
+- `src/tiles/worker-entry.ts` — built by `vite.worker.config.ts` as `dist/worker.mjs`, which
+  MapLibre 6 loads with `import()`. It must be self-contained: MapLibre imports non-`.mjs`
+  scripts via a `blob:` URL where relative specifiers cannot resolve.
 - `src/tiles/cache.ts` — byte-bounded LRU (raw tiles), count-bounded `EntryCache` (decoded
   tiles), in-flight request coalescing. All per worker, so their memory scales with the pool.
 - `src/tiles/persistent-cache.ts` — warped low-zoom output tiles in Cache Storage, in the
@@ -254,7 +256,7 @@ affects the absolute metre values from `toEqualEarth`.
   bundle's relative-import graph from `worker-entry.ts` (CRLF normalised) plus the bundled
   runtime dependencies' versions. Only the worker graph, so controller or camera edits keep the
   cache. All five Vite/Vitest configs import it.
-- `vite.worker.config.ts` — builds the two worker bundles (see `worker-entry.ts`).
+- `vite.worker.config.ts` — builds the worker bundle (see `worker-entry.ts`).
 - `vite.umd.config.ts` — builds the UMD bundle, a build of its own because Vite 8's Rolldown
   does not polyfill `import.meta.url` in UMD output (it becomes `{}.url`, breaking the default
   worker URL): there `import.meta.url` is defined as the loading script's URL, captured from
@@ -267,7 +269,7 @@ affects the absolute metre values from `toEqualEarth`.
   `video/mp2t`, which the browser refuses.
 - `demo/` + root `index.html` — Vite demo pages, not part of the published package.
 - `demo/umd.html` — the one demo without TypeScript: the built UMD from a classic `<script>`,
-  MapLibre 5.24 (or `?mlv=6`, `import()`ed) from unpkg, OpenFreeMap Liberty by default. Any
+  MapLibre 6.6 `import()`ed from unpkg, OpenFreeMap Liberty by default. Any
   static server rooted at the repository runs it once `dist/` is built; needs the network.
   `window.__umdDemo` holds `{ map, eqe }`.
 - `demo/transition.html` + `.ts` — the adaptive transition on any EPSG:3857 vector style
@@ -284,7 +286,7 @@ affects the absolute metre values from `toEqualEarth`.
   cached transform of an older `dist/worker.mjs` (the price: the worker bundle is never
   HTTP-cached, ~0.4 MB per warm load). Exposes `window.__eqe` for the probes.
 - `scripts/check-exports.mjs` — build-artifact drift guard.
-- `scripts/check-worker-bundles.mjs` — the two worker bundles load and register `eqearth`.
+- `scripts/check-worker-bundles.mjs` — the worker bundle loads and registers `eqearth`.
 - `scripts/probe-transition.mjs` — the headless probes of the transition demo: the wheel
   transition and `--first-paint` (see Commands).
 - `tests/browser/` — the Playwright matrix (see Commands). `harness.ts` is one map on the
@@ -298,9 +300,7 @@ affects the absolute metre values from `toEqualEarth`.
   Mercator style never fetches tiles: what makes "no requests after a reload" testable).
   `helpers.ts` types `__h`, opens the harness with these as options and holds the only
   geographic conversions specs may use. `fixture-tiles.ts` generates the tiles and counts the
-  requests it answers (`/fixture-tiles/__count`, `__reset`). The v5 globe pixel-identity case
-  in `baseline.spec.ts` flakes now and then despite its three-pair retry; rerun it once.
-  `umd.html` (+ `umd.spec.ts`) is the bundler-free page: the built UMD from a static classic
+  requests it answers (`/fixture-tiles/__count`, `__reset`). `umd.html` (+ `umd.spec.ts`) is the bundler-free page: the built UMD from a static classic
   `<script src>` and no `workerUrl`, exposing `window.__umd` and the part of `__h` the helpers'
   conversions read.
 - `scripts/probe-openfreemap.ts` — runs the real pipeline against live OpenFreeMap tiles.
@@ -308,8 +308,8 @@ affects the absolute metre values from `toEqualEarth`.
 
 All `map/` modules and `install.ts` type their MapLibre dependency **structurally** rather
 than importing `maplibre-gl`, so they are unit-testable with a plain fake and no WebGL context,
-and work with whichever major the app loaded (`tests/host-types.test.ts` checks real v5 and v6
-maps against the interfaces). Keep that property; it is why `tests/camera.test.ts` can drive
+and work with whichever major the app loaded (`tests/host-types.test.ts` checks real v6 maps
+against the interfaces). Keep that property; it is why `tests/camera.test.ts` can drive
 21 state-machine cases in milliseconds.
 
 `EQUAL_EARTH_X_MAX` is **derived**, not hardcoded. The widely-quoted EPSG:8857 bound
@@ -459,7 +459,7 @@ but hairline seams in fills were a risk. `tests/browser/cartography.spec.ts` mea
 (land layer only, centred on [5, 0] so the scan crosses the source-tile boundaries at lng 0 and
 lat 0 of fixture land box 1) reads every device pixel of a rectangle inside the box's warped
 outline (6 px margin, 126k to 744k pixels per case) at z2/z3/z4, dpr 1 and 2, MapLibre 5.24 and
-6.6, and counts each pixel that is not the land colour within 8/255, so antialiased blends count
+6.6 (when v5 was still supported), and counts each pixel that is not the land colour within 8/255, so antialiased blends count
 too. Result: 0 everywhere, and a self-test that paints a 1 px background row into the scanned
 copy proves the scan sees such a seam. So `fill-antialias: false` is not applied. Polygon
 vertices on Mercator's edge are snapped to ±90° in `decodeToGeographic`.
