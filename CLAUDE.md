@@ -86,10 +86,17 @@ proj4, and the `0.2.x` line are gone). ESM (`dist/index.js`) plus a UMD file for
 `<script>` pages (`dist/maplibre-gl-equal-earth.umd.min.js`, global `maplibreglEqualEarth`); no CJS
 entry (`require()` of the ESM works from Node 20.19).
 
-**Registry note:** this environment's npm proxy refuses packages published after 2026-08-31.
-maplibre-gl stays at 6.6.0, not 6.7.0 (`package.json` declares `^6.6.0`; the lockfile pins
-6.6.0), and vitest at 4.x, not 5.x, for that reason, and `@deck.gl/maplibre` cannot be
-installed at all — it debuted in deck.gl 9.4.0 (2026-09-05).
+**Registry note:** installs come from registry.npmjs.org with `min-release-age=7` (the project
+`.npmrc`; an npm too old to know the setting ignores it): no package version younger than seven days is resolved, CVE fixes included;
+check a hand-picked version's publish date before pinning it. The earlier proxy cutoff
+(2026-08-31) that held maplibre-gl at 6.6.0, vitest at 4.x and kept `@deck.gl/maplibre` out
+is gone; those versions have not been revisited since. `minimatch` is forced to 11.x through
+`overrides` (CVE GHSA-g3hv-75wg-m249, fixed only in 11.0.1) although eslint and
+typescript-eslint declare `^10`: they only call `new Minimatch(p, opts).match()` and
+`minimatch()`, which 11 kept; drop the override once they move to 11. `npm audit` keeps one
+critical finding by design: `maplibre-gl-v5` (5.24.0, the newest 5.x) is in GHSA-jrc7-96c5-q579's
+range (≤ 6.4.0, attribution XSS) and has no patched 5.x; it is a test-only alias for the v5
+browser matrix and never shipped.
 
 ## The central constraint
 
